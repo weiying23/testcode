@@ -24,15 +24,20 @@ _sme_support_8: //加载8个float，做reduce
     smstop sm
     ret
 
-_sme_support_mopa: //向量外积
-    smstart sm
-    //zero {za} //清空za寄存器
-    ptrue p1.s           // 为单精度元素创建全真谓词 (p0)
-    ld1w {z0.s}, p1/z, [x1] // 加载16个单精度数据到 z0
-    ld1w {z1.s}, p1/z, [x1] // 加载16个单精度数据到 z1
+_sme_support_mopa:
+    smstart SM
+    smstart ZA
+    mov w14, #0           // 初始化索引寄存器
+    
+    ptrue p1.s
+    ld1w {z0.s}, p1/z, [x1]
+    ld1w {z1.s}, p1/z, [x1]
     fmopa za0.s, p1/m, p1/m, z0.s, z1.s
-    //mov z2.s, p1/m, za0h.s[w14, #0]
-    mov z2.s, za0.V[2]
+    
+    // 使用正确的立即数范围 [0, 2]
+    mov z2.s, p1/m, za0h.s[w14, #2]   // 立即数必须在 0-3 范围内
+    
     str z2, [x0]
-    smstop sm
-    ret   
+    smstop SM
+    smstop ZA
+    ret
