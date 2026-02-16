@@ -1,0 +1,36 @@
+Apple M4 Chip Cache Architecture Analysis
+==========================================
+
+Based on Apple M4 specifications:
+- L1 Data Cache (per core): 128 KB (performance cores), 64 KB (efficiency cores)
+- L2 Cache: Shared, typically 16 MB
+- Cache Line Size: 128 bytes
+- Memory Bandwidth: Very high on M4
+
+Stencil Computation Analysis:
+- Array: 256 x 256 x 256 floats (each float = 4 bytes)
+- Stencil Radius: 6 (12th-order)
+- For each point, accesses: 13 points in x, 13 in y, 13 in z direction
+
+Tiling Configuration Analysis:
+==============================
+
+TILE_X=16, TILE_Y=16, TILE_Z=256 (Best: 0.059s)
+- Working set per tile: (16+12) x (16+12) x (256+12) = 28 x 28 x 268 floats
+- Memory footprint: 28 * 28 * 268 * 4 = ~830 KB
+- This fits comfortably in L2 cache (16 MB)
+- Z-dimension of 256 provides excellent cache line utilization
+- 256 * 4 bytes = 1024 bytes = 8 cache lines perfectly aligned
+
+Why this is optimal:
+1. Cache line alignment: Z=256 aligns perfectly with 128-byte cache lines
+2. Temporal locality: The full Z-strip stays in cache while processing
+3. Spatial locality: Sequential Z-access maximizes prefetching efficiency
+4. Reduced tile overhead: Fewer tile boundaries = less redundant computation
+5. Working set size: ~830 KB fits in L2 cache with room for other data
+
+Comparison with other configurations:
+- TILE_X=8, TILE_Y=8, TILE_Z=256: Too small, more overhead (0.067s)
+- TILE_X=32, TILE_Y=32, TILE_Z=256: Larger working set, more cache misses (0.067s)
+- TILE_X=16, TILE_Y=16, TILE_Z=128: Breaking Z dimension loses cache benefits (0.096s)
+- TILE_X=64, TILE_Y=64, TILE_Z=256: Too large, cache thrashing (0.074s)

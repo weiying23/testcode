@@ -9,7 +9,7 @@
 #define NZ 256
 #define TILE_X 16
 #define TILE_Y 16
-#define TILE_Z 256
+#define TILE_Z 64
 #define ORDER 12
 #define RADIUS 6
 

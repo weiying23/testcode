@@ -1,0 +1,76 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║         Tiling Configuration Performance Test Results (Apple M4)          ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+Configuration         | Time (s) | Speedup  | Status
+─────────────────────────────────────────────────────────────────────────────
+TILE_X=8   Y=8   Z=256│  0.067   │  1.94x   │ Too small, high overhead
+TILE_X=16  Y=16  Z=256│  0.059   │  2.20x   │ ✓ OPTIMAL - Best performance
+TILE_X=32  Y=32  Z=256│  0.067   │  1.94x   │ Larger footprint
+TILE_X=64  Y=64  Z=256│  0.074   │  1.76x   │ Cache thrashing
+TILE_X=16  Y=16  Z=128│  0.096   │  1.35x   │ Poor Z-dimension usage
+TILE_X=16  Y=16  Z=64 │  0.095   │  1.37x   │ Poor Z-dimension usage
+TILE_X=16  Y=16  Z=32 │  0.095   │  1.37x   │ Poor Z-dimension usage
+TILE_X=32  Y=32  Z=128│  0.076   │  1.71x   │ Moderate performance
+TILE_X=32  Y=32  Z=64 │  0.100   │  1.30x   │ Poor cache utilization
+TILE_X=32  Y=32  Z=32 │  0.079   │  1.65x   │ Poor cache utilization
+TILE_X=64  Y=32  Z=64 │  0.108   │  1.20x   │ Imbalanced dimensions
+TILE_X=64  Y=64  Z=64 │  0.118   │  1.10x   │ Poor cache utilization
+
+Baseline (no tiling):     0.130 seconds
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                        Why 16x16x256 is Optimal                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+1. CACHE LINE ALIGNMENT (128 bytes)
+   • Z=256: 256 floats × 4 bytes = 1024 bytes = 8 cache lines
+   • Perfect alignment with Apple M4's 128-byte cache lines
+   • Maximizes hardware prefetching efficiency
+
+2. WORKING SET SIZE (~830 KB)
+   • Tile with halo: (16+12) × (16+12) × (256+12) = 28×28×268 floats
+   • Total: 28 × 28 × 268 × 4 = ~830 KB
+   • Fits comfortably in L2 cache (16 MB on M4)
+   • Leaves room for output buffer and other data
+
+3. MEMORY ACCESS PATTERN
+   • Z-dimension: Sequential access (stride-1)
+   • Maximizes spatial locality
+   • Hardware prefetcher loves this pattern
+   • Full Z-strip processed before moving to next (X,Y)
+
+4. TEMPORAL LOCALITY
+   • Stencil radius = 6 requires ±6 neighbors
+   • Data reused across adjacent (X,Y) positions
+   • 16×16 X-Y tile provides good reuse without cache eviction
+
+5. REDUCED OVERHEAD
+   • Fewer tiles = fewer boundary conditions
+   • Z=256 means only 1 tile in Z-direction (no Z-boundaries)
+   • Reduced redundant computation at tile edges
+
+6. VECTORIZATION FRIENDLY
+   • 16×16 is power of 2, compiler-friendly
+   • NEON SIMD on M4 can vectorize inner loops effectively
+   • Aligned memory access patterns
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                     Apple M4 Chip Characteristics                         ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+CPU Configuration:
+  • 4 Performance cores + 6 Efficiency cores
+  • L1 Data Cache: 128 KB (P-cores), 64 KB (E-cores)  
+  • L2 Cache: ~16 MB (shared)
+  • Cache Line: 128 bytes
+  • Memory: 24 GB unified memory
+  • SIMD: NEON (128-bit vectors)
+
+Key Observations:
+  • Reducing Z-dimension (Z=128, 64, 32) dramatically hurts performance
+    → Shows importance of keeping full Z-strip in cache
+  • Increasing XY tile size (32×32, 64×64) increases cache misses
+    → Working set exceeds sweet spot for cache utilization
+  • 16×16×256 hits the "Goldilocks zone" for M4 architecture
+
