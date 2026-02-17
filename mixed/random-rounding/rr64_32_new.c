@@ -15,6 +15,44 @@
 
 // 格式名称 (用于输出)
 const char* format_names[] = {"binary32", "binary16", "bfloat16"};
+// ============================================================================
+// 【修复】函数前向声明 (Function Prototypes)
+// 确保编译器在遇到函数调用前已知晓函数签名，解决 implicit declaration 错误
+// ============================================================================
+
+// 舍入函数
+float stochastic_round(float x, int precision_bits);
+float round_to_lowprec_rn(float x, int precision_bits);
+float round_to_float32_rn(float x);
+
+// PDE 1: 1D 热方程
+float heat1d_initial(float x);
+double heat1d_exact(double x, double t);
+double compute_l2_error_1d(float* u, int nx, int ny, double t);
+void solve_heat1d(float* u, int nx, int ny, int nt, float dt, int prec_bits, int use_sr, float* u_ref);
+
+// PDE 2: Burgers 方程
+float burgers_initial(float x);
+double compute_l2_error_burgers(float* u, int nx, int ny, double t);
+void solve_burgers(float* u, int nx, int ny, int nt, float dt, int prec_bits, int use_sr, float* u_ref);
+int init_burgers_test(int nx, int nt, float dt);
+void cleanup_burgers_test(void);
+void run_burgers_comparison(const char* pde_name, int nx, int nt, float dt);
+
+// PDE 3: 2D 热方程
+float heat2d_initial(float x, float y);
+double heat2d_exact(double x, double y, double t);
+double compute_l2_error_2d(float* u, int nx, int ny, double t);
+void solve_heat2d(float* u, int nx, int ny, int nt, float dt, int prec_bits, int use_sr, float* u_ref);
+
+// 验证与测试
+int verify_float32_simulation(void);
+void test_stagnation(void);
+
+// 通用运行器 (必须在 run_burgers_comparison 之前声明)
+void run_pde_comparison(const char* pde_name, int nx, int ny, int nt, float dt, double final_t,
+                        double (*compute_error)(float*, int, int, double),
+                        void (*solve_func)(float*, int, int, int, float, int, int, float*));
 
 // ============================================================================
 // 随机舍入函数 (支持多种精度格式)
@@ -300,103 +338,147 @@ void solve_heat1d(float* u, int nx, int ny, int nt, float dt, int prec_bits,
 }
 
 // ============================================================================
-// PDE 2: 1D Burgers 方程 ∂u/∂t + u∂u/∂x = ν∂²u/∂x² (非线性对流 - 扩散)
+// PDE 2: 1D Burgers 方程 ∂u/∂t + u∂u/∂x = ν∂²u/∂x² (修正版 - 适配通用运行器)
 // 文档 Section 7(e) 扩展：非线性项增加舍入误差传播复杂度
 // ============================================================================
 
 #define NX_BURGERS 200
 #define NT_BURGERS 20000
 #define NU_BURGERS 0.01f   // 粘性系数
-#define L_BURGERS 2.0f     // 空间域 [0, L] 映射到 [-1, 1]
-#define C_BURGERS 1.0f     // 对流速度系数
+#define L_BURGERS 2.0f     // 空间域 [0, L]
+
+// 全局变量：存储 FP32 参考解（用于误差计算）
+static float* burgers_ref_solution = NULL;
+static int burgers_ref_nx = 0;
 
 /**
- * Burgers 方程初始条件：平滑高斯脉冲
- * x ∈ [0, L] 映射到 [-1, 1]
+ * Burgers 方程初始条件：正弦波（适合周期性边界）
  */
 float burgers_initial(float x) {
-    float xi = 2.0f * x / L_BURGERS - 1.0f;
-    return 0.25f + 0.5f * expf(-20.0f * xi * xi);  // 高斯脉冲
+    return 0.5f + 0.25f * sinf(2.0f * M_PI * x / L_BURGERS);
 }
 
 /**
- * Burgers 方程精确解 (Hopf-Cole 变换，小时间近似)
- * 脉冲对流 + 扩散展宽
+ * 计算 FP32 高精度参考解（用于误差对比）
+ * Burgers 方程没有简单闭式精确解，用 FP32 数值解作为"准精确解"
+ * 
+ * @param u_ref 输出参考解数组
+ * @param nx 网格点数
+ * @param nt 时间步数
+ * @param dt 时间步长
  */
-double burgers_exact(double x, double t) {
-    double xi = 2.0 * x / L_BURGERS - 1.0;
-    // 小时间近似：非线性对流速度 ~ u/2
-    double shift = C_BURGERS * 0.25f * t;
-    // 扩散展宽
-    double width = 1.0 + 40.0 * NU_BURGERS * t;
-    return 0.25f + 0.5f / sqrt(width) * exp(-20.0 * (xi - shift) * (xi - shift) / width);
+void compute_burgers_reference(float* u_ref, int nx, int nt, float dt) {
+    float *u = malloc(nx * sizeof(float));
+    float *u_new = malloc(nx * sizeof(float));
+    float *u_temp = malloc(nx * sizeof(float));  // 用于周期性边界
+    float dx = L_BURGERS / (nx - 1);
+    
+    // 1. 初始化 (FP32)
+    for (int i = 0; i < nx; i++) {
+        double x = i * dx;
+        u[i] = (float)(0.5 + 0.25 * sin(2.0 * M_PI * x / L_BURGERS));
+    }
+    
+    // 2. 时间迭代 (FP32)
+    for (int t = 0; t < nt; t++) {
+        // 周期性边界处理
+        u_temp[0] = u[nx-2];
+        for (int i = 1; i < nx-1; i++) u_temp[i] = u[i];
+        u_temp[nx-1] = u[1];
+        
+        for (int i = 1; i < nx - 1; i++) {
+            float u_i = u_temp[i], u_im1 = u_temp[i-1], u_ip1 = u_temp[i+1];
+            // 一阶迎风（与测试代码保持一致，确保公平对比）
+            float du_dx = (u_i >= 0) ? (u_i - u_im1) / dx : (u_ip1 - u_i) / dx;
+            float d2u_dx2 = (u_ip1 - 2.0f*u_i + u_im1) / (dx * dx);
+            u_new[i] = u_i - dt * u_i * du_dx + dt * NU_BURGERS * d2u_dx2;
+        }
+        // 周期性边界
+        u_new[0] = u_new[nx-2];
+        u_new[nx-1] = u_new[1];
+        memcpy(u, u_new, nx * sizeof(float));
+    }
+    
+    // 3. 存储参考解
+    memcpy(u_ref, u, nx * sizeof(float));
+    
+    free(u); free(u_new); free(u_temp);
 }
 
 /**
- * 计算 Burgers 方程 L2 范数误差
+ * 计算 Burgers 方程 L2 范数误差（相对于 FP32 参考解）
  * 
  * 【修复】添加 ny 参数以统一函数签名（1D 忽略）
+ * 【修复】使用全局参考解 burgers_ref_solution 进行误差计算
  */
 double compute_l2_error_burgers(float* u, int nx, int ny, double t) {
-    (void)ny;  // 1D 忽略 ny 参数
+    (void)ny; (void)t;  // 1D 忽略
+    
+    // 使用预先计算的 FP32 参考解
+    if (burgers_ref_solution == NULL || burgers_ref_nx != nx) {
+        fprintf(stderr, "错误：Burgers 参考解未初始化或网格不匹配\n");
+        return -1.0;
+    }
+    
     double dx = L_BURGERS / (nx - 1), err = 0;
     for (int i = 0; i < nx; i++) {
-        double x = i * dx, exact = burgers_exact(x, t);
-        double diff = (double)u[i] - exact;
+        double diff = (double)u[i] - (double)burgers_ref_solution[i];
         err += diff * diff * dx;
     }
     return sqrt(err);
 }
 
 /**
- * Burgers 方程求解器 (显式有限差分)
+ * Burgers 方程求解器 (修正版 - 适配通用运行器)
  * 
  * 空间离散：
- * - 对流项：迎风差分 (upwind) 保证稳定性
+ * - 对流项：一阶迎风差分（保证稳定性）
  * - 扩散项：中心差分
  * 
- * CFL 条件：dt <= min(dx/|u|, dx²/(2ν))
+ * 边界条件：周期性
  * 
  * 【修复】添加 ny 参数以统一函数签名（1D 忽略）
+ * 【修复】与 run_pde_comparison 签名完全匹配
  */
 void solve_burgers(float* u, int nx, int ny, int nt, float dt, int prec_bits, 
                    int use_sr, float* u_ref) {
-    (void)ny;  // 1D 忽略 ny 参数
+    (void)ny; (void)u_ref;  // 1D 忽略，参考解通过全局变量访问
     float *u_new = malloc(nx * sizeof(float));
+    float *u_temp = malloc(nx * sizeof(float));  // 用于周期性边界
     float dx = L_BURGERS / (nx - 1);
     
     // CFL 条件检查
-    float cfl_conv = dx / (C_BURGERS * 0.5f + 0.3f);  // 估计最大速度
+    float max_u = 0.8f;  // 估计最大速度
+    float cfl_conv = dx / max_u;
     float cfl_diff = dx * dx / (2.0f * NU_BURGERS);
-    if (dt > 0.9f * fminf(cfl_conv, cfl_diff)) {
-        printf("  ⚠ 警告：dt=%.4f 可能违反 CFL 条件 (conv=%.4f, diff=%.4f)\n", 
-               dt, cfl_conv, cfl_diff);
+    if (dt > 0.8f * fminf(cfl_conv, cfl_diff)) {
+        printf("  ⚠ 警告：dt=%.4f 可能违反 CFL 条件\n", dt);
     }
     
     // 1. 初始化
     for (int i = 0; i < nx; i++) {
         double x = i * dx; 
         u[i] = burgers_initial((float)x);
-        if (u_ref) u_ref[i] = u[i];
     }
     
     // 2. 时间迭代
     for (int t = 0; t < nt; t++) {
-        // 边界：Dirichlet (u=0 at boundaries)
-        u_new[0] = u_new[nx-1] = 0.0f;
+        // 周期性边界处理
+        u_temp[0] = u[nx-2];  // u[-1] = u[nx-2]
+        for (int i = 1; i < nx-1; i++) u_temp[i] = u[i];
+        u_temp[nx-1] = u[1];  // u[nx] = u[1]
         
         for (int i = 1; i < nx - 1; i++) {
-            float u_i = u[i], u_im1 = u[i-1], u_ip1 = u[i+1];
+            float u_i = u_temp[i], u_im1 = u_temp[i-1], u_ip1 = u_temp[i+1];
             
-            // 迎风差分：sign(u) 决定用左/右差分 (保证稳定性)
+            // 一阶迎风差分
             float du_dx = (u_i >= 0) ? (u_i - u_im1) / dx : (u_ip1 - u_i) / dx;
             
             // 中心差分：二阶导数
             float d2u_dx2 = (u_ip1 - 2.0f*u_i + u_im1) / (dx * dx);
             
-            // 显式更新：u_new = u - dt*(u*u_x) + dt*ν*u_xx
-            float temp = u_i - dt * C_BURGERS * u_i * du_dx 
-                              + dt * NU_BURGERS * d2u_dx2;
+            // 显式更新：标准 Burgers 方程（移除 C_BURGERS）
+            float temp = u_i - dt * u_i * du_dx + dt * NU_BURGERS * d2u_dx2;
             
             // 根据精度要求进行舍入
             if (prec_bits < 24) {
@@ -406,9 +488,85 @@ void solve_burgers(float* u, int nx, int ny, int nt, float dt, int prec_bits,
                 u_new[i] = temp; 
             }
         }
+        
+        // 周期性边界
+        u_new[0] = u_new[nx-2];
+        u_new[nx-1] = u_new[1];
+        
         memcpy(u, u_new, nx * sizeof(float));
     }
     free(u_new);
+    free(u_temp);
+}
+
+/**
+ * Burgers 方程专用初始化函数
+ * 在运行测试前调用，计算 FP32 参考解
+ * 
+ * @param nx 网格点数
+ * @param nt 时间步数
+ * @param dt 时间步长
+ * @return 1 = 成功，0 = 失败
+ */
+int init_burgers_test(int nx, int nt, float dt) {
+    // 释放旧的参考解
+    if (burgers_ref_solution != NULL) {
+        free(burgers_ref_solution);
+    }
+    
+    // 分配并计算新的参考解
+    burgers_ref_solution = (float*)malloc(nx * sizeof(float));
+    if (burgers_ref_solution == NULL) {
+        fprintf(stderr, "错误：无法分配 Burgers 参考解内存\n");
+        return 0;
+    }
+    burgers_ref_nx = nx;
+    
+    compute_burgers_reference(burgers_ref_solution, nx, nt, dt);
+    return 1;
+}
+
+/**
+ * Burgers 方程专用清理函数
+ * 测试完成后调用，释放参考解内存
+ */
+void cleanup_burgers_test(void) {
+    if (burgers_ref_solution != NULL) {
+        free(burgers_ref_solution);
+        burgers_ref_solution = NULL;
+        burgers_ref_nx = 0;
+    }
+}
+
+/**
+ * Burgers 方程专用测试运行器（包装通用运行器）
+ * 
+ * @param pde_name 测试名称
+ * @param nx 网格点数
+ * @param nt 时间步数
+ * @param dt 时间步长
+ */
+void run_burgers_comparison(const char* pde_name, int nx, int nt, float dt) {
+    printf("\n============================================================\n");
+    printf("%s\n", pde_name);
+    printf("============================================================\n");
+    
+    // 1. 初始化：计算 FP32 参考解
+    if (!init_burgers_test(nx, nt, dt)) {
+        fprintf(stderr, "Burgers 测试初始化失败\n");
+        return;
+    }
+    printf("✓ FP32 参考解已计算 (nx=%d, nt=%d, dt=%.5f)\n\n", nx, nt, dt);
+    
+    // 2. 使用通用运行器进行测试
+    // 注意：ny=1 表示 1D 问题
+    run_pde_comparison(pde_name, 
+                       nx, 1, nt, dt, dt * nt,
+                       compute_l2_error_burgers,
+                       solve_burgers);
+    
+    // 3. 清理
+    cleanup_burgers_test();
 }
 
 // ============================================================================
@@ -669,8 +827,8 @@ void run_pde_comparison(const char* pde_name, int nx, int ny, int nt,
     printf("网格：%dx%d, 时间步：%d, dt=%.5f, 总时间：%.3f\n", 
            nx, ny, nt, dt, final_t);
     
-    int prec_configs[][2] = {{24,0}, {11,1}, {11,0}, {8,1}, {8,0}};  // {bits, is_sr}
-    const char* labels[] = {"FP32(RN)", "B16(SR)", "B16(RN)", "BF16(SR)", "BF16(RN)"};
+    int prec_configs[][2] = {{24,0}, {11,0}, {11,1}, {8,0}, {8,1}};  // {bits, is_sr}
+    const char* labels[] = {"FP32(RN)", "B16(RN)", "B16(SR)", "BF16(RN)", "BF16(SR)"};
     
     float *u_fp32 = malloc(nx * ny * sizeof(float));
     float *u_test = malloc(nx * ny * sizeof(float));
@@ -701,7 +859,9 @@ void run_pde_comparison(const char* pde_name, int nx, int ny, int nt,
         double avg_err = total_err / runs;
         double ratio = avg_err / (ref_error + 1e-20);
         
-        // 计算 SR 相对 RN 的改进
+        // =========================================================================
+        // 【修复】计算 SR 相对 RN 的改进（现在 RN 已经在之前执行过了）
+        // =========================================================================
         char improvement[20] = "-";
         if (sr && prev_error_rn_b16 > 0 && prec == 11) {
             double imp = (prev_error_rn_b16 - avg_err) / (prev_error_rn_b16 + 1e-20) * 100;
@@ -760,10 +920,8 @@ int main() {
     // =========================================================================
     // PDE 2: 1D Burgers 方程 (非线性，文档 Section 7(e) 扩展)
     // =========================================================================
-    run_pde_comparison("PDE 2: 1D Burgers Equation (Nonlinear)", 
-                       NX_BURGERS, 1, NT_BURGERS, 0.00005f, 0.00005f * NT_BURGERS,
-                       compute_l2_error_burgers,
-                       solve_burgers);
+    run_burgers_comparison("PDE 2: 1D Burgers Equation (Nonlinear)", 
+                           NX_BURGERS, NT_BURGERS, 0.00005f);
     
     // =========================================================================
     // PDE 3: 2D 热方程 (多维，文档 Figure 7.6)
