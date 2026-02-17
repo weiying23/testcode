@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright 2024,2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+FVP_VERSION="11.29"
+FVP_BUILD="42"
+ATfE_VERSION="21.1.1"
+
+FVP_BASE_URL="https://developer.arm.com/-/cdn-downloads/permalink/FVPs-Architecture/FM-${FVP_VERSION}-${FVP_BUILD}"
+FVP_PACKAGE="FVP_Base_RevC-2xAEMvA_${FVP_VERSION}_${FVP_BUILD}_Linux64"
+
+FVP_PKG_X86="${FVP_PACKAGE}.tgz"
+FVP_PKG_ARM64="${FVP_PACKAGE}_armv8l.tgz"
+
+FVP_MODEL_DIR_X86="Linux64_GCC-9.3"
+FVP_MODEL_DIR_ARM64="Linux64_armv8l_GCC-9.3"
+
+ATfE_BASE_URL="https://github.com/arm/arm-toolchain/releases/download-${ATfE_VERSION}"
+ATfE_PKG_ARM64="ATfE-${ATfE_VERSION}-Linux-AArch64.tar.xz"
+ATfE_PKG_X86="ATfE-${ATfE_VERSION}-Linux-x86_64.tar.xz"
+ATfE_DIR_ARM64=$(basename -s .tar.xz ${ATfE_PKG_ARM64})
+ATfE_DIR_X86=$(basename -s .tar.xz ${ATfE_PKG_X86})

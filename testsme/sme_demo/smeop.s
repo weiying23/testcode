@@ -34,7 +34,7 @@ _sme_support_mopa:
     ld1w {z1.s}, p1/z, [x1]
     fmopa za0.s, p1/m, p1/m, z0.s, z1.s
     
-    // 使用正确的立即数范围 [0, 2]
+    // 使用正确的立即数范围 [0, 3]
     mov z2.s, p1/m, za0h.s[w14, #2]   // 立即数必须在 0-3 范围内
     
     str z2, [x0]

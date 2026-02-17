@@ -43,8 +43,8 @@ int main(){
     cleararraryO(matrixc,mlength*nlength);
 
     gettimeofday(&start,nullptr);
-    gemmkernel(matrixa,matrixb,matrixc,mlength,nlength,klength,1);
-    return 0;
+    test_kernel();
+    //gemmkernel(matrixa,matrixb,matrixc,mlength,nlength,klength,1) ;
     gettimeofday(&end,nullptr);
     double smetime=timeinterval(start, end);
     printf("time is \t %10.6f sec\n", smetime);

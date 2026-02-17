@@ -10,5 +10,10 @@ clang -O3 -arch arm64 -march=armv9-a+sme -lSystem  print_smeop.c smeop.s -o test
 chmod 777 sme*
 ./test
 
+rm sme_test
+clang++ -O3  -arch arm64 -march=armv9-a+sme -lSystem sme_test.cpp -o sme_test
+chmod 777 sme_test
+./sme_test
+
 #./sme_test
 #./smeop

@@ -63,7 +63,7 @@ void init_grid() {
             if (i == N/2 && j == N/2) {
                 grid[i][j] = 100.0;  // 中心点热源
             } else {
-                grid[i][j] = 0.0;
+                grid[i][j] = 10.0;
             }
             new_grid[i][j] = 0.0;
         }
@@ -118,7 +118,7 @@ void barrier_wait(Barrier *b) {
         
         pthread_mutex_unlock(&b->mutex);
         
-        // 关键修复：避免完全空转，稍微让出CPU时间
+        // 避免完全空转，稍微让出CPU时间
         // 这样可以防止线程饥饿，同时保持忙等待的特性
         sched_yield();  // 让出CPU给其他线程
     }

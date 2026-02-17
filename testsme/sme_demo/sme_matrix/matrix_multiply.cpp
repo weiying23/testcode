@@ -4,23 +4,33 @@
 #include <cstdint> 
 #include <arm_sve.h>
 #include <arm_sme.h>
+#include <arm_acle.h>
+
+void test_kernel(){
+    __asm__ volatile(
+        "smstart"
+    );
+
+    printf("In streaming_mode: %d",__arm_in_streaming_mode());
+
+    __asm__ volatile(
+        "smstop"
+    );
+} 
 
 
-//__attribute__((aarch64_sme)) __arm_new("za")  
-__arm_new("za") __arm_locally_streaming
-void gemmkernel(double *mata, double *matb, double *matc, int M, int N, int K, double alpha) __arm_streaming 
+void gemmkernel(double *mata, double *matb, double *matc, int M, int N, int K, double alpha) __arm_streaming
 {
-    printf("set done");
-    return;
+    printf("set done ");
+    //return;
+    //__asm__ volatile("SMSTART SM" ::: "d0","d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11","d12","d13","d14","d15");
+    //__asm__ volatile("SMSTART ZA" ::: "d0","d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11","d12","d13","d14","d15")
+    __asm__ volatile("SMSTART ZA");
+
     uint64_t vscale;
     vscale = svcntd();
     svbool_t pm, pn, pk;
     svfloat64_t src1, src2, ssrc3, src4, src5;
-
-    //__asm__ volatile("SMSTART SM" ::: "d0","d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11","d12","d13","d14","d15");
-    //__asm__ volatile("SMSTART ZA" ::: "d0","d1","d2","d3","d4","d5","d6","d7","d8","d9","d10","d11","d12","d13","d14","d15");
-    __asm__ volatile("smstart SM");
-    __asm__ volatile("smstart ZA");
 
     for(size_t i = 0; i < M; i += vscale){
         pm = svwhilelt_b64_u32(i,M);
@@ -49,5 +59,6 @@ void gemmkernel(double *mata, double *matb, double *matc, int M, int N, int K, d
             }
         }
     }
+    __asm__ volatile("SMSTOP ZA");
 
 }

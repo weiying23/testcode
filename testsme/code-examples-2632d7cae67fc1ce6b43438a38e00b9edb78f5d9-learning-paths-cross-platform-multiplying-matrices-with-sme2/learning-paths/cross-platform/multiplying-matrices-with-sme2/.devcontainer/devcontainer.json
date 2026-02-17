@@ -1,0 +1,14 @@
+{
+  "image": "armswdev/sme2-learning-path:sme2-environment-v3",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-vscode.makefile-tools", "llvm-vs-code-extensions.vscode-clangd"],
+      "settings": {
+        "llvm-vs-code-extensions.vscode-clangd": {
+          "clangd.path": "/usr/bin/clangd"
+        }
+      }
+    }
+  }
+}

@@ -5,9 +5,10 @@
 
 rm -rf testomp
 
-clang -O3 -Xpreprocessor -pthread -DBUSY_WAIT_BARRIER test_omp.c -o testomp
+#clang -O3 -Xpreprocessor -pthread -DBUSY_WAIT_BARRIER test_omp.c -o testomp
 #打开忙等待
-#clang -O3 -Xpreprocessor -pthread test_omp.c -o testomp
+
+clang -O3 -Xpreprocessor -pthread test_omp.c -o testomp
 
 echo 'compile completed'
 
