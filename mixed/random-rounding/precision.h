@@ -44,13 +44,20 @@ double heat2d_exact(double x, double y, double t);
 double compute_l2_error_2d(float* u, int nx, int ny, double t);
 void solve_heat2d(float* u, int nx, int ny, int nt, float dt, int prec_bits, int use_sr, float* u_ref);
 
+
+// 新增：共轭梯度(CG)求解器对比测试
+void test_cg_convergence(void);
+
 // 验证与测试
 int verify_float32_simulation(void);
-void test_stagnation(void);
+void test_training_stagnation(void);   // 原 test_stagnation 已被替换
 
 // 通用运行器 (必须在 run_burgers_comparison 之前声明)
 void run_pde_comparison(const char* pde_name, int nx, int ny, int nt, float dt, double final_t,
                         double (*compute_error)(float*, int, int, double),
                         void (*solve_func)(float*, int, int, int, float, int, int, float*));
+
+
+
 
 #endif // PRECISION_SIMULATION_H

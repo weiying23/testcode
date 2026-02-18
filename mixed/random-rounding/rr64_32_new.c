@@ -504,16 +504,15 @@ void cleanup_burgers_test(void) {
  * @param dt 时间步长
  */
 void run_burgers_comparison(const char* pde_name, int nx, int nt, float dt) {
-    printf("\n============================================================\n");
-    printf("%s\n", pde_name);
-    printf("============================================================\n");
+    //printf("\n============================================================\n");
+    //printf("%s\n", pde_name);
+    //printf("============================================================\n");
     
     // 1. 初始化：计算 FP32 参考解
     if (!init_burgers_test(nx, nt, dt)) {
         fprintf(stderr, "Burgers 测试初始化失败\n");
         return;
     }
-    printf("✓ FP32 参考解已计算 (nx=%d, nt=%d, dt=%.5f)\n\n", nx, nt, dt);
     
     // 2. 使用通用运行器进行测试
     // 注意：ny=1 表示 1D 问题
@@ -521,6 +520,7 @@ void run_burgers_comparison(const char* pde_name, int nx, int nt, float dt) {
                        nx, 1, nt, dt, dt * nt,
                        compute_l2_error_burgers,
                        solve_burgers);
+    printf("✓ FP32 参考解已计算 (nx=%d, nt=%d, dt=%.5f)\n\n", nx, nt, dt);
     
     // 3. 清理
     cleanup_burgers_test();
@@ -710,8 +710,16 @@ int verify_float32_simulation() {
  * - SR: P[fl(φ+h)≠φ] = |h|/(u*|φ|) > 0 (概率性更新)
  * - 期望值：E[SR 结果] = 精确值 (无偏性)
  */
-void test_stagnation() {
+// ============================================================================
+// 停滞现象测试 + AI 训练停滞模拟 (合并版)
+// 验证 SR 避免停滞的理论保证 (Theorem 6.4)
+// ============================================================================
+
+void test_training_stagnation(void) {
+    // -------------------- 第一部分：累加停滞测试 (原 test_stagnation) --------------------
+    printf("============================================================\n");
     printf("\n=== 测试停滞现象 (Stagnation Test) ===\n");
+    printf("============================================================\n");
     printf("模拟小增量累加，展示 16 位精度下 SR 如何避免信息丢失\n\n");
 
     float base = 1.0f;
@@ -725,7 +733,6 @@ void test_stagnation() {
     }
 
     // 2. binary16 RN (模拟：直接截断低位，无随机性)
-    // 预期：增量被吞没，结果停滞在 1.0
     float sum_b16_rn = base;
     for (int i = 0; i < iterations; i++) {
         float temp = sum_b16_rn + small_increment;
@@ -733,7 +740,6 @@ void test_stagnation() {
     }
 
     // 3. binary16 SR (概率性保留增量)
-    // 预期：期望值 = base + iterations * increment
     float sum_b16_sr = base;
     for (int i = 0; i < iterations; i++) {
         float temp = sum_b16_sr + small_increment;
@@ -749,7 +755,6 @@ void test_stagnation() {
 
     double exact = base + iterations * small_increment;
 
-    // 输出结果
     printf("初始值：%.6f\n", base);
     printf("增量：%.2e (重复 %d 次)\n", small_increment, iterations);
     printf("理论精确值：%.6f\n\n", exact);
@@ -769,6 +774,74 @@ void test_stagnation() {
                (fabs(sum_b16_rn - exact) - fabs(sum_b16_sr - exact)) / 
                fabs(sum_b16_rn - exact) * 100.0);
     }
+
+    // -------------------- 第二部分：AI 训练停滞模拟 --------------------
+    printf("\n=== 模拟AI训练中的停滞现象 ===\n");
+    printf("场景：线性模型 y = w * x，目标输出 2.0，学习率很小，使用 binary16 和 bfloat16 精度\n\n");
+
+    // 参数设置
+    float w_rn = 1.0f;          // RN 更新下的权重 (binary16)
+    float w_sr_b16 = 1.0f;      // SR 更新下的权重 (binary16)
+    float w_sr_bf8 = 1.0f;      // SR 更新下的权重 (bfloat16)
+    const float target = 2.0f;
+    const float x = 1.0f;
+    const float lr = 1e-4f;      // 极小的学习率
+    const int train_iters = 100000;
+
+    // 保存当前随机种子
+    unsigned int saved_seed = rand();
+
+    // 精确解 (double)
+    double w_exact = 1.0;
+    for (int i = 0; i < train_iters; i++) {
+        double grad = (w_exact - target) * x;
+        w_exact -= lr * grad;
+    }
+
+    // RN 更新 (binary16)
+    srand(42);
+    for (int i = 0; i < train_iters; i++) {
+        float grad = (w_rn - target) * x;
+        float update = -lr * grad;
+        w_rn += update;
+        w_rn = round_to_lowprec_rn(w_rn, PRECISION_BINARY16);
+    }
+
+    // SR 更新 (binary16)
+    srand(42);
+    for (int i = 0; i < train_iters; i++) {
+        float grad = (w_sr_b16 - target) * x;
+        float update = -lr * grad;
+        w_sr_b16 += update;
+        w_sr_b16 = stochastic_round(w_sr_b16, PRECISION_BINARY16);
+    }
+
+    // SR 更新 (bfloat16)
+    srand(42);
+    for (int i = 0; i < train_iters; i++) {
+        float grad = (w_sr_bf8 - target) * x;
+        float update = -lr * grad;
+        w_sr_bf8 += update;
+        w_sr_bf8 = stochastic_round(w_sr_bf8, PRECISION_BFLOAT16);
+    }
+
+    // 恢复随机种子
+    srand(saved_seed);
+
+    printf("\n精确权重 (double)      : %.10f\n", w_exact);
+    printf("binary16 RN 权重       : %.10f (误差: %.2e)\n", w_rn, fabs(w_rn - w_exact));
+    printf("binary16 SR 权重       : %.10f (误差: %.2e)\n", w_sr_b16, fabs(w_sr_b16 - w_exact));
+    printf("bfloat16 SR 权重       : %.10f (误差: %.2e)\n", w_sr_bf8, fabs(w_sr_bf8 - w_exact));
+
+    if (fabs(w_rn - w_exact) > fabs(w_sr_b16 - w_exact)) {
+        printf("\n✓ binary16 SR 优于 RN：SR 成功避免停滞，权重更新更接近精确值\n");
+    } else {
+        printf("\n✗ 此例中 binary16 SR 未明显优于 RN（可能因随机性波动，可多次运行观察）\n");
+    }
+
+    if (fabs(w_sr_bf8 - w_exact) < fabs(w_rn - w_exact)) {
+        printf("✓ bfloat16 SR 也优于 binary16 RN，尽管精度更低\n");
+    }
 }
 
 // ============================================================================
@@ -780,7 +853,9 @@ void run_pde_comparison(const char* pde_name, int nx, int ny, int nt,
                         double (*compute_error)(float*, int, int, double),
                         void (*solve_func)(float*, int, int, int, float, int, int, float*)) {
     
-    printf("\n=== %s ===\n", pde_name);
+    printf("============================================================\n");
+    printf("=== %s ===\n", pde_name);
+    printf("============================================================\n");
     printf("网格：%dx%d, 时间步：%d, dt=%.5f, 总时间：%.3f\n", 
            nx, ny, nt, dt, final_t);
     
@@ -841,6 +916,277 @@ void run_pde_comparison(const char* pde_name, int nx, int ny, int nt,
 }
 
 // ============================================================================
+// 共轭梯度(CG)求解器 (低精度模拟)
+// 求解 Ax = b，A为对称正定矩阵，这里使用1D泊松矩阵（三对角）
+// ============================================================================
+
+/**
+ * 生成1D泊松矩阵（三对角）：A[i][i]=2, A[i][i+1]=A[i+1][i]=-1 (边界点同样处理)
+ * 矩阵大小 n x n，以行优先存储于数组A中
+ */
+static void generate_poisson_matrix_1d(int n, float* A) {
+    memset(A, 0, n * n * sizeof(float));
+    for (int i = 0; i < n; i++) {
+        A[i * n + i] = 2.0f;
+        if (i > 0) A[i * n + (i-1)] = -1.0f;
+        if (i < n-1) A[i * n + (i+1)] = -1.0f;
+    }
+}
+
+/**
+ * 矩阵向量乘 y = A*x，并对结果应用舍入
+ */
+static void matvec(int n, const float* A, const float* x, float* y, int prec_bits, int use_sr) {
+    for (int i = 0; i < n; i++) {
+        double sum = 0.0;
+        for (int j = 0; j < n; j++) {
+            sum += (double)A[i * n + j] * (double)x[j];
+        }
+        float temp = (float)sum;
+        if (prec_bits < 24) {
+            y[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+        } else {
+            y[i] = temp;
+        }
+    }
+}
+
+/**
+ * 向量点积 dot = x'*y，并对结果应用舍入
+ */
+static float dot_product(int n, const float* x, const float* y, int prec_bits, int use_sr) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += (double)x[i] * (double)y[i];
+    }
+    float temp = (float)sum;
+    if (prec_bits < 24) {
+        return use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+    } else {
+        return temp;
+    }
+}
+
+/**
+ * 向量更新：x = x + alpha * p，并对结果应用舍入
+ */
+static void axpy(int n, float alpha, const float* p, float* x, int prec_bits, int use_sr) {
+    for (int i = 0; i < n; i++) {
+        float temp = x[i] + alpha * p[i];
+        if (prec_bits < 24) {
+            x[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+        } else {
+            x[i] = temp;
+        }
+    }
+}
+
+/**
+ * 向量赋值：y = x，并对结果应用舍入
+ */
+static void vec_copy(int n, const float* x, float* y, int prec_bits, int use_sr) {
+    for (int i = 0; i < n; i++) {
+        float temp = x[i];
+        if (prec_bits < 24) {
+            y[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+        } else {
+            y[i] = temp;
+        }
+    }
+}
+
+/**
+ * 计算向量2范数（先平方累加，再开方，每一步舍入）
+ */
+static float vec_norm(int n, const float* x, int prec_bits, int use_sr) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        double xi = x[i];
+        sum += xi * xi;
+    }
+    float temp = (float)sqrt(sum);
+    if (prec_bits < 24) {
+        return use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+    } else {
+        return temp;
+    }
+}
+
+/**
+ * 共轭梯度法求解 Ax = b
+ * @param n 矩阵维度
+ * @param A 矩阵 (行优先)
+ * @param b 右端项
+ * @param x 初始解（输入时初始猜测，输出时最终解）
+ * @param max_iter 最大迭代次数
+ * @param tol 相对残差容忍度
+ * @param prec_bits 精度位数
+ * @param use_sr 是否使用随机舍入
+ * @param iter_count 输出实际迭代次数
+ * @param final_res 输出最终残差范数
+ */
+void cg_solver(int n, const float* A, const float* b, float* x,
+               int max_iter, float tol, int prec_bits, int use_sr,
+               int* iter_count, float* final_res) {
+    float* r = (float*)malloc(n * sizeof(float));
+    float* p = (float*)malloc(n * sizeof(float));
+    float* Ap = (float*)malloc(n * sizeof(float));
+    if (!r || !p || !Ap) {
+        fprintf(stderr, "CG: 内存分配失败\n");
+        free(r); free(p); free(Ap);
+        *iter_count = -1;
+        *final_res = -1.0f;
+        return;
+    }
+
+    // 初始残差 r = b - A*x
+    matvec(n, A, x, Ap, prec_bits, use_sr);
+    for (int i = 0; i < n; i++) {
+        float temp = b[i] - Ap[i];
+        if (prec_bits < 24) {
+            r[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+        } else {
+            r[i] = temp;
+        }
+    }
+    vec_copy(n, r, p, prec_bits, use_sr);
+
+    float rho = dot_product(n, r, r, prec_bits, use_sr);
+    float normb = vec_norm(n, b, prec_bits, use_sr);
+    if (normb == 0.0f) normb = 1.0f;
+
+    int iter = 0;
+    float residual = sqrtf(rho) / normb;
+    if (residual < tol) {
+        free(r); free(p); free(Ap);
+        *iter_count = 0;
+        *final_res = residual;
+        return;
+    }
+
+    for (iter = 1; iter <= max_iter; iter++) {
+        matvec(n, A, p, Ap, prec_bits, use_sr);
+
+        float pAp = dot_product(n, p, Ap, prec_bits, use_sr);
+        if (pAp == 0.0f) break;
+        float alpha = rho / pAp;
+        if (prec_bits < 24) {
+            alpha = use_sr ? stochastic_round(alpha, prec_bits) : round_to_lowprec_rn(alpha, prec_bits);
+        }
+
+        axpy(n, alpha, p, x, prec_bits, use_sr);
+
+        for (int i = 0; i < n; i++) {
+            float temp = r[i] - alpha * Ap[i];
+            if (prec_bits < 24) {
+                r[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+            } else {
+                r[i] = temp;
+            }
+        }
+
+        float rho_new = dot_product(n, r, r, prec_bits, use_sr);
+        residual = sqrtf(rho_new) / normb;
+
+        if (residual < tol) break;
+
+        float beta = rho_new / rho;
+        if (prec_bits < 24) {
+            beta = use_sr ? stochastic_round(beta, prec_bits) : round_to_lowprec_rn(beta, prec_bits);
+        }
+
+        for (int i = 0; i < n; i++) {
+            float temp = r[i] + beta * p[i];
+            if (prec_bits < 24) {
+                p[i] = use_sr ? stochastic_round(temp, prec_bits) : round_to_lowprec_rn(temp, prec_bits);
+            } else {
+                p[i] = temp;
+            }
+        }
+
+        rho = rho_new;
+    }
+
+    *iter_count = iter;
+    *final_res = residual;
+
+    free(r); free(p); free(Ap);
+}
+
+/**
+ * 测试CG在不同精度下的收敛情况
+ */
+void test_cg_convergence(void) {
+    printf("\n============================================================\n");
+    printf("CG求解器对比：FP32 vs FP16(RN) vs FP16(SR)\n");
+    printf("求解1D泊松方程离散化得到的对称正定线性系统\n");
+    printf("============================================================\n");
+
+    const int n = 500;                // 矩阵维度
+    const int max_iter = 10000;
+    const float tol = 1e-6f;
+
+    float* A = (float*)malloc(n * n * sizeof(float));
+    float* b = (float*)malloc(n * sizeof(float));
+    float* x = (float*)malloc(n * sizeof(float));
+    float* x_ref = (float*)malloc(n * sizeof(float));
+    if (!A || !b || !x || !x_ref) {
+        fprintf(stderr, "内存分配失败\n");
+        free(A); free(b); free(x); free(x_ref);
+        return;
+    }
+
+    generate_poisson_matrix_1d(n, A);
+    for (int i = 0; i < n; i++) b[i] = 1.0f;
+    memset(x, 0, n * sizeof(float));
+    memset(x_ref, 0, n * sizeof(float));
+
+    unsigned int saved_seed = rand();
+
+    // FP32 参考
+    printf("\n--- FP32 (无舍入模拟) ---\n");
+    int iter_fp32; float res_fp32;
+    srand(42);
+    cg_solver(n, A, b, x_ref, max_iter, tol, 24, 0, &iter_fp32, &res_fp32);
+    printf("迭代次数: %d\n", iter_fp32);
+    printf("最终相对残差: %.6e\n", res_fp32);
+
+    // FP16 RN
+    printf("\n--- FP16 (Round-to-Nearest) ---\n");
+    int iter_fp16_rn; float res_fp16_rn;
+    memset(x, 0, n * sizeof(float));
+    srand(42);
+    cg_solver(n, A, b, x, max_iter, tol, PRECISION_BINARY16, 0, &iter_fp16_rn, &res_fp16_rn);
+    printf("迭代次数: %d\n", iter_fp16_rn);
+    printf("最终相对残差: %.6e\n", res_fp16_rn);
+
+    // FP16 SR
+    printf("\n--- FP16 (Stochastic Rounding) ---\n");
+    int iter_fp16_sr; float res_fp16_sr;
+    memset(x, 0, n * sizeof(float));
+    srand(42);
+    cg_solver(n, A, b, x, max_iter, tol, PRECISION_BINARY16, 1, &iter_fp16_sr, &res_fp16_sr);
+    printf("迭代次数: %d\n", iter_fp16_sr);
+    printf("最终相对残差: %.6e\n", res_fp16_sr);
+
+    // 对比总结
+    printf("\n--- 对比总结 ---\n");
+    printf("FP32:      %d iter, res=%.2e\n", iter_fp32, res_fp32);
+    printf("FP16 RN:   %d iter, res=%.2e\n", iter_fp16_rn, res_fp16_rn);
+    printf("FP16 SR:   %d iter, res=%.2e\n", iter_fp16_sr, res_fp16_sr);
+
+    if (iter_fp16_rn >= max_iter && res_fp16_rn > tol) {
+        printf("-> FP16 RN 未收敛（停滞）\n");
+    }
+    if (iter_fp16_sr < max_iter && res_fp16_sr <= tol) {
+        printf("-> FP16 SR 成功收敛，验证了SR在迭代求解中的优势\n");
+    }
+
+    srand(saved_seed);
+    free(A); free(b); free(x); free(x_ref);
+}
+
+// ============================================================================
 // 主函数
 // ============================================================================
 
@@ -887,11 +1233,16 @@ int main() {
                        NX2D, NY2D, NT2D, 0.0001f, 0.0001f * NT2D,
                        compute_l2_error_2d,
                        solve_heat2d);
+
+    // =========================================================================
+    // CG求解器对比测试
+    // =========================================================================
+    test_cg_convergence();
     
     // =========================================================================
     // 停滞现象验证 (文档 Section 6(a) Theorem 6.4)
     // =========================================================================
-    test_stagnation();
+    test_training_stagnation();
     
     // =========================================================================
     // 结论总结
