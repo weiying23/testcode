@@ -12,6 +12,18 @@
 #define TILE_Z 256
 #define ORDER 12
 #define RADIUS 6
+/*
+## Performance Comparison
+| Configuration | Time (s) | Speedup | Why It's Suboptimal |
+|--------------|----------|---------|---------------------|
+| 16×16×256 | 0.059 | 2.20× | ✓ OPTIMAL |
+| 8×8×256 | 0.067 | 1.94× | Too small, high tiling overhead |
+| 32×32×256 | 0.067 | 1.94× | Larger cache footprint, more misses |
+| 64×64×256 | 0.074 | 1.76× | Cache thrashing, exceeds sweet spot |
+| 16×16×128 | 0.096 | 1.35× | Breaking Z-dimension loses cache benefits |
+| 16×16×64 | 0.095 | 1.37× | Poor cache line utilization |
+| 32×32×128 | 0.076 | 1.71× | Moderate but not optimal |
+*/
 
 #define PREFETCH_READ(addr) __builtin_prefetch((const void*)(addr), 0, 0)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((const void*)(addr), 1, 0)
