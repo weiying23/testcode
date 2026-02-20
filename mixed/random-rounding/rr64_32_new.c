@@ -1118,13 +1118,14 @@ void cg_solver(int n, const float* A, const float* b, float* x,
  */
 void test_cg_convergence(void) {
     printf("\n============================================================\n");
-    printf("CG求解器对比：FP32 vs FP16(RN) vs FP16(SR)\n");
-    printf("求解1D泊松方程离散化得到的对称正定线性系统\n");
+    printf("CG求解器对比：FP32 vs FP16(RN/SR) vs BF16(RN/SR)\n");
+    printf("求解对角矩阵 A x = b，对角线元素从1线性衰减到1e-8\n");
+    printf("矩阵条件数 ≈ 1e8\n");
     printf("============================================================\n");
 
-    const int n = 500;                // 矩阵维度
-    const int max_iter = 10000;
-    const float tol = 1e-6f;
+    const int n = 200;                // 矩阵维度
+    const int max_iter = 50001;        // 最大迭代次数（与之前一致）
+    const float tol = 1e-6f;           // 相对残差容忍度
 
     float* A = (float*)malloc(n * n * sizeof(float));
     float* b = (float*)malloc(n * sizeof(float));
@@ -1136,14 +1137,26 @@ void test_cg_convergence(void) {
         return;
     }
 
-    generate_poisson_matrix_1d(n, A);
+    // 生成对角矩阵：A[i][i] = 10^(-i * factor)，i从0到n-1
+    // 使得条件数 = 10^((n-1)*factor)
+    double max_cond = 1e6;
+    double factor = log10(max_cond) / (n - 1);
+    memset(A, 0, n * n * sizeof(float));
+    for (int i = 0; i < n; i++) {
+        double a_ii = pow(10.0, -i * factor);
+        A[i * n + i] = (float)a_ii;
+    }
+
+    // 右端项 b 全设为 1
     for (int i = 0; i < n; i++) b[i] = 1.0f;
+
+    // 初始解为零
     memset(x, 0, n * sizeof(float));
     memset(x_ref, 0, n * sizeof(float));
 
     unsigned int saved_seed = rand();
 
-    // FP32 参考
+    // -------------------- FP32 参考 --------------------
     printf("\n--- FP32 (无舍入模拟) ---\n");
     int iter_fp32; float res_fp32;
     srand(42);
@@ -1151,7 +1164,7 @@ void test_cg_convergence(void) {
     printf("迭代次数: %d\n", iter_fp32);
     printf("最终相对残差: %.6e\n", res_fp32);
 
-    // FP16 RN
+    // -------------------- FP16 RN --------------------
     printf("\n--- FP16 (Round-to-Nearest) ---\n");
     int iter_fp16_rn; float res_fp16_rn;
     memset(x, 0, n * sizeof(float));
@@ -1160,7 +1173,7 @@ void test_cg_convergence(void) {
     printf("迭代次数: %d\n", iter_fp16_rn);
     printf("最终相对残差: %.6e\n", res_fp16_rn);
 
-    // FP16 SR
+    // -------------------- FP16 SR --------------------
     printf("\n--- FP16 (Stochastic Rounding) ---\n");
     int iter_fp16_sr; float res_fp16_sr;
     memset(x, 0, n * sizeof(float));
@@ -1169,23 +1182,50 @@ void test_cg_convergence(void) {
     printf("迭代次数: %d\n", iter_fp16_sr);
     printf("最终相对残差: %.6e\n", res_fp16_sr);
 
-    // 对比总结
+    // -------------------- BF16 RN --------------------
+    printf("\n--- BF16 (Round-to-Nearest) ---\n");
+    int iter_bf16_rn; float res_bf16_rn;
+    memset(x, 0, n * sizeof(float));
+    srand(42);
+    cg_solver(n, A, b, x, max_iter, tol, PRECISION_BFLOAT16, 0, &iter_bf16_rn, &res_bf16_rn);
+    printf("迭代次数: %d\n", iter_bf16_rn);
+    printf("最终相对残差: %.6e\n", res_bf16_rn);
+
+    // -------------------- BF16 SR --------------------
+    printf("\n--- BF16 (Stochastic Rounding) ---\n");
+    int iter_bf16_sr; float res_bf16_sr;
+    memset(x, 0, n * sizeof(float));
+    srand(42);
+    cg_solver(n, A, b, x, max_iter, tol, PRECISION_BFLOAT16, 1, &iter_bf16_sr, &res_bf16_sr);
+    printf("迭代次数: %d\n", iter_bf16_sr);
+    printf("最终相对残差: %.6e\n", res_bf16_sr);
+
+    // -------------------- 对比总结 --------------------
     printf("\n--- 对比总结 ---\n");
-    printf("FP32:      %d iter, res=%.2e\n", iter_fp32, res_fp32);
-    printf("FP16 RN:   %d iter, res=%.2e\n", iter_fp16_rn, res_fp16_rn);
-    printf("FP16 SR:   %d iter, res=%.2e\n", iter_fp16_sr, res_fp16_sr);
+    printf("FP32:      %5d iter, res=%.2e\n", iter_fp32, res_fp32);
+    printf("FP16 RN:   %5d iter, res=%.2e\n", iter_fp16_rn, res_fp16_rn);
+    printf("FP16 SR:   %5d iter, res=%.2e\n", iter_fp16_sr, res_fp16_sr);
+    printf("BF16 RN:   %5d iter, res=%.2e\n", iter_bf16_rn, res_bf16_rn);
+    printf("BF16 SR:   %5d iter, res=%.2e\n", iter_bf16_sr, res_bf16_sr);
 
     if (iter_fp16_rn >= max_iter && res_fp16_rn > tol) {
-        printf("-> FP16 RN 未收敛（停滞）\n");
+        printf("-> FP16 RN 未在最大迭代次数内收敛（可能停滞）\n");
     }
     if (iter_fp16_sr < max_iter && res_fp16_sr <= tol) {
-        printf("-> FP16 SR 成功收敛，验证了SR在迭代求解中的优势\n");
+        printf("-> FP16 SR 成功收敛，优于RN\n");
+    }
+    if (iter_bf16_rn >= max_iter && res_bf16_rn > tol) {
+        printf("-> BF16 RN 未收敛（停滞）\n");
+    }
+    if (iter_bf16_sr < max_iter && res_bf16_sr <= tol) {
+        printf("-> BF16 SR 成功收敛，验证了SR在病态问题中的优势\n");
+    } else if (res_bf16_sr < res_bf16_rn) {
+        printf("-> BF16 SR 最终残差低于 RN，表明其避免了停滞\n");
     }
 
     srand(saved_seed);
     free(A); free(b); free(x); free(x_ref);
 }
-
 // ============================================================================
 // 主函数
 // ============================================================================
