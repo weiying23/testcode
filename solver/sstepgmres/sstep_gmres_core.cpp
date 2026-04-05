@@ -27,7 +27,7 @@ void solve_spd_small(int n, double* A, double* b) {
 }
 
 // Compute Gram matrix W_k: W[i,j] = <V_k^i, V_k^j>
-void compute_gram_matrix(SstepWorkspace& ws, int k, int n, double scale = 1.0) {
+void compute_gram_matrix(SstepWorkspace& ws, int k, int n, double scale) {
     for (int i = 0; i < ws.s; i++) {
         for (int j = 0; j < ws.s; j++) {
             ws.W[k][i * ws.s + j] = vdot(n, &ws.V[k][i * n], &ws.V[k][j * n]) * scale;
