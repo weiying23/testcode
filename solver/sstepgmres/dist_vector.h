@@ -77,7 +77,8 @@ class HaloExchange {
     std::vector<double> recv_buf_left_, recv_buf_right_;
     std::vector<int> send_idx_left_, send_idx_right_;
 
-    MPI_Request req_send_[2], req_recv_[2];
+    MPI_Request req_send_[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
+    MPI_Request req_recv_[2] = {MPI_REQUEST_NULL, MPI_REQUEST_NULL};
     bool exchange_started_;
 
 public:
