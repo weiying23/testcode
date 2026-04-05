@@ -78,6 +78,13 @@ void sstep_gmres_mpi(MPI_Comm comm,
         double beta_sq = init_global[0];
         double beta = std::sqrt(beta_sq);
 
+        // Handle zero initial residual
+        if (beta < 1e-15) {
+            result.final_residual = 0.0;
+            result.converged = true;
+            return;
+        }
+
         if (beta / bnorm_global < cfg.tol) {
             result.final_residual = beta / bnorm_global;
             result.converged = true;
@@ -85,8 +92,10 @@ void sstep_gmres_mpi(MPI_Comm comm,
         }
 
         // Normalize V_0
-        for (int j = 0; j < cfg.s; j++) {
-            vscal(n, 1.0 / beta, &ws.V[0][j * n]);
+        if (beta > 1e-15) {
+            for (int j = 0; j < cfg.s; j++) {
+                vscal(n, 1.0 / beta, &ws.V[0][j * n]);
+            }
         }
 
         // Extract W_0 (normalized)
