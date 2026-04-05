@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <mpi.h>
 #include "dist_vector.h"
 #include "blas_utils.h"
@@ -137,7 +138,7 @@ private:
         send_idx_right_.clear();
 
         // Map: global index -> ghost position
-        std::vector<int> ghost_map(n_global_, -1);
+        std::unordered_map<int, int> ghost_map;
 
         // Scan column indices to find ghost points
         int ghost_counter = 0;
@@ -147,7 +148,7 @@ private:
 
                 // Check if column is outside local range
                 if (j_global < row_start_ || j_global > row_end_) {
-                    if (ghost_map[j_global] == -1) {
+                    if (ghost_map.find(j_global) == ghost_map.end()) {
                         // New ghost point
                         ghost_map[j_global] = ghost_counter;
                         ghost_global_idx_.push_back(j_global);
