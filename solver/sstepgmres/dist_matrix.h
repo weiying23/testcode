@@ -11,6 +11,8 @@
 #include "blas_utils.h"
 
 class DistributedCSRMatrix {
+    friend class DistributedILU0;
+
     MPI_Comm comm_;
     int rank_, nprocs_;
 
@@ -127,6 +129,58 @@ public:
         }
 
         // Identify ghost points and setup halo
+        identifyGhostPoints();
+    }
+
+    // Build anisotropic diffusion matrix for local rows
+    void buildAnisotropic(double eps) {
+        int nx = static_cast<int>(std::sqrt(static_cast<double>(n_global_)));
+
+        rowptr_.resize(n_local_ + 1, 0);
+        std::vector<std::vector<std::pair<int, double>>> rows(n_local_);
+
+        for (int i_local = 0; i_local < n_local_; i_local++) {
+            int i_global = row_start_ + i_local;
+            int ix = i_global % nx;
+            int iy = i_global / nx;
+
+            // Diagonal
+            rows[i_local].push_back({i_global, 2.0 + 2.0 * eps});
+
+            // x-direction neighbors
+            if (ix > 0) {
+                rows[i_local].push_back({i_global - 1, -eps});
+            }
+            if (ix < nx - 1) {
+                rows[i_local].push_back({i_global + 1, -eps});
+            }
+
+            // y-direction neighbors
+            if (iy > 0) {
+                rows[i_local].push_back({i_global - nx, -1.0});
+            }
+            if (iy < nx - 1) {
+                rows[i_local].push_back({i_global + nx, -1.0});
+            }
+
+            std::sort(rows[i_local].begin(), rows[i_local].end());
+            rowptr_[i_local + 1] = rowptr_[i_local] + rows[i_local].size();
+        }
+
+        // Build CSR arrays
+        int nnz = rowptr_[n_local_];
+        colidx_.resize(nnz);
+        values_.resize(nnz);
+
+        int idx = 0;
+        for (int i_local = 0; i_local < n_local_; i_local++) {
+            for (auto& p : rows[i_local]) {
+                colidx_[idx] = p.first;
+                values_[idx++] = p.second;
+            }
+        }
+
+        // Identify ghost points
         identifyGhostPoints();
     }
 
