@@ -79,6 +79,112 @@ public:
                   neighbor_left_, neighbor_right_);
         halo.setSendIndices(send_idx_left_, send_idx_right_);
     }
+
+    // Build five-diagonal matrix for local rows
+    void buildFiveDiagonal(double diag_val, double offdiag_val) {
+        int nx = static_cast<int>(std::sqrt(static_cast<double>(n_global_)));
+
+        rowptr_.resize(n_local_ + 1, 0);
+        std::vector<std::vector<std::pair<int, double>>> rows(n_local_);
+
+        for (int i_local = 0; i_local < n_local_; i_local++) {
+            int i_global = row_start_ + i_local;
+            rows[i_local].push_back({i_global, diag_val});
+
+            // Left neighbor
+            if (i_global > 0) {
+                rows[i_local].push_back({i_global - 1, offdiag_val});
+            }
+            // Right neighbor
+            if (i_global < n_global_ - 1) {
+                rows[i_local].push_back({i_global + 1, offdiag_val});
+            }
+            // Upper neighbor (i - nx)
+            if (i_global >= nx) {
+                rows[i_local].push_back({i_global - nx, offdiag_val});
+            }
+            // Lower neighbor (i + nx)
+            if (i_global + nx < n_global_) {
+                rows[i_local].push_back({i_global + nx, offdiag_val});
+            }
+
+            std::sort(rows[i_local].begin(), rows[i_local].end());
+            rowptr_[i_local + 1] = rowptr_[i_local] + rows[i_local].size();
+        }
+
+        // Build CSR arrays
+        int nnz = rowptr_[n_local_];
+        colidx_.resize(nnz);
+        values_.resize(nnz);
+
+        int idx = 0;
+        for (int i_local = 0; i_local < n_local_; i_local++) {
+            for (auto& p : rows[i_local]) {
+                colidx_[idx] = p.first;
+                values_[idx++] = p.second;
+            }
+        }
+
+        // Identify ghost points and setup halo
+        identifyGhostPoints();
+    }
+
+private:
+    void identifyGhostPoints() {
+        ghost_global_idx_.clear();
+        ghost_local_map_.clear();
+        send_idx_left_.clear();
+        send_idx_right_.clear();
+
+        // Map: global index -> ghost position
+        std::vector<int> ghost_map(n_global_, -1);
+
+        // Scan column indices to find ghost points
+        int ghost_counter = 0;
+        for (int i_local = 0; i_local < n_local_; i_local++) {
+            for (int k = rowptr_[i_local]; k < rowptr_[i_local + 1]; k++) {
+                int j_global = colidx_[k];
+
+                // Check if column is outside local range
+                if (j_global < row_start_ || j_global > row_end_) {
+                    if (ghost_map[j_global] == -1) {
+                        // New ghost point
+                        ghost_map[j_global] = ghost_counter;
+                        ghost_global_idx_.push_back(j_global);
+                        ghost_counter++;
+                    }
+                    ghost_local_map_.push_back(ghost_map[j_global]);
+                } else {
+                    ghost_local_map_.push_back(-1);  // Not a ghost
+                }
+            }
+        }
+
+        // Determine send/recv counts based on ghost locations
+        n_recv_left_ = 0;
+        n_recv_right_ = 0;
+        for (int g : ghost_global_idx_) {
+            if (g < row_start_) n_recv_left_++;
+            else if (g > row_end_) n_recv_right_++;
+        }
+
+        // Determine send indices (boundary rows that neighbors need)
+        if (neighbor_left_ >= 0) {
+            // Left neighbor needs our first row
+            send_idx_left_.push_back(0);
+            n_send_left_ = 1;
+        } else {
+            n_send_left_ = 0;
+        }
+
+        if (neighbor_right_ >= 0) {
+            // Right neighbor needs our last row
+            send_idx_right_.push_back(n_local_ - 1);
+            n_send_right_ = 1;
+        } else {
+            n_send_right_ = 0;
+        }
+    }
 };
 
 #endif // DIST_MATRIX_H
