@@ -132,8 +132,6 @@ public:
 
     // Matrix-vector product: y_local = A * (x_local + x_ghost)
     void mv(const double* x_local, const double* x_ghost, double* y_local) {
-        int ghost_idx = 0;
-
         for (int i_local = 0; i_local < n_local_; i_local++) {
             double sum = 0.0;
             for (int k = rowptr_[i_local]; k < rowptr_[i_local + 1]; k++) {
@@ -144,9 +142,8 @@ public:
                     // Local column
                     x_val = x_local[j_global - row_start_];
                 } else {
-                    // Ghost column
-                    int ghost_pos = ghost_local_map_[ghost_idx];
-                    ghost_idx++;
+                    // Ghost column - use k as index into ghost_local_map_
+                    int ghost_pos = ghost_local_map_[k];
                     x_val = x_ghost[ghost_pos];
                 }
                 sum += values_[k] * x_val;
