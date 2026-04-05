@@ -5,7 +5,6 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
-#include "blas_utils.h"
 
 class CSRMatrix {
     int n_;
@@ -162,7 +161,11 @@ public:
                     diag = lu_[k];
                 }
             }
-            x[i] = sum / diag;
+            if (std::abs(diag) > 1e-14) {
+                x[i] = sum / diag;
+            } else {
+                x[i] = 0.0;  // Protection for near-zero diagonal
+            }
         }
     }
 
