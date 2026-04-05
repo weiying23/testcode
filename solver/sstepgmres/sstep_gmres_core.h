@@ -3,6 +3,7 @@
 #define SSTEP_GMRES_CORE_H
 
 #include <vector>
+#include <cmath>
 #include "blas_utils.h"
 
 // Solver configuration
@@ -77,5 +78,127 @@ struct SstepResult {
     double final_residual; // ||b - Ax|| / ||b||
     bool converged;
 };
+
+// Solve SPD system using Cholesky: A*x = b, where A is s x s
+// A and b are overwritten; solution returned in b
+void solve_spd_small(int n, double* A, double* b);
+
+// Compute Gram matrix W_k: W[i,j] = <V_k^i, V_k^j>
+void compute_gram_matrix(SstepWorkspace& ws, int k, int n, double scale = 1.0);
+
+// Scalar1: Orthogonalize V_{k+1}^1 against all previous blocks V_0..V_k
+// Uses W_i matrices to compute orthogonalization coefficients
+// Returns: projection coefficients h stored in H matrix
+void scalar1(SstepWorkspace& ws, int k, int n,
+             const std::vector<double>& projections);
+
+// Scalar2: Set up power basis structure in H matrix
+// For power basis: H[col_j, col_j + 1] = 1.0 (identity mapping)
+// This is a NO COMMUNICATION operation
+void scalar2(SstepWorkspace& ws, int k);
+
+// Apply Givens rotations to a column of H matrix
+void apply_givens_to_column(SstepWorkspace& ws, int col, int nrots);
+
+// Create new Givens rotation and apply to g vector
+void create_givens_rotation(SstepWorkspace& ws, int row, int col);
+
+// Back-solve the least squares problem using transformed H and g
+void back_solve(SstepWorkspace& ws, std::vector<double>& y);
+
+// Compute solution: x = x0 + sum_k V_k * y_k
+void compute_solution(SstepWorkspace& ws, int n, int num_blocks,
+                      const std::vector<double>& y,
+                      double* x);
+
+// Template function declarations (definitions must be in header)
+template<typename MatVec, typename Precond>
+void build_first_block(SstepWorkspace& ws,
+                       const double* z,
+                       int n,
+                       MatVec mv,
+                       Precond pc);
+
+template<typename MatVec, typename Precond>
+double sstep_arnoldi_block(SstepWorkspace& ws, int k, int n,
+                           const std::vector<double>& projections,
+                           double w_norm_sq,
+                           MatVec mv,
+                           Precond pc);
+
+// Build first block V_0: power basis from initial vector z
+// V_0 = [z, MAz, MA^2z, ..., MA^(s-1)z]
+// Requires: matvec function and preconditioner apply function
+template<typename MatVec, typename Precond>
+void build_first_block(SstepWorkspace& ws,
+                       const double* z,
+                       int n,
+                       MatVec mv,
+                       Precond pc) {
+    // First vector: z (already preconditioned residual)
+    vcopy(n, z, &ws.V[0][0]);
+
+    // Generate power basis: MA^j * z
+    for (int j = 1; j < ws.s; j++) {
+        mv(&ws.V[0][(j - 1) * n], ws.Atmp.data());
+        pc(ws.Atmp.data(), ws.tmp.data());
+        vcopy(n, ws.tmp.data(), &ws.V[0][j * n]);
+    }
+}
+
+// Main s-step Arnoldi procedure (one block iteration)
+// Returns: norm of orthogonalized V_{k+1}^1
+template<typename MatVec, typename Precond>
+double sstep_arnoldi_block(SstepWorkspace& ws, int k, int n,
+                           const std::vector<double>& projections,
+                           double w_norm_sq,
+                           MatVec mv,
+                           Precond pc) {
+    int ms = ws.ms;
+
+    // Scalar1: orthogonalize against previous blocks
+    scalar1(ws, k, n, projections);
+
+    // Compute norm of orthogonalized vector
+    double energy = 0.0;
+    for (int pk = 0; pk <= k; pk++) {
+        for (int j = 0; j < ws.s; j++) {
+            double h = ws.H[(k * ws.s + ws.s - 1) * (ms + 1) + pk * ws.s + j];
+            energy += h * h;
+        }
+    }
+
+    double norm_sq = w_norm_sq - energy;
+    if (norm_sq < 0) norm_sq = vdot(n, &ws.V[k + 1][0], &ws.V[k + 1][0]);
+    double norm = std::sqrt(std::max(norm_sq, 0.0));
+
+    // Store norm in H matrix (subdiagonal)
+    int col_last = k * ws.s + (ws.s - 1);
+    ws.H[col_last * (ms + 1) + (k + 1) * ws.s] = norm;
+
+    // Normalize V_{k+1}^1
+    if (norm > 1e-14) {
+        vscal(n, 1.0 / norm, &ws.V[k + 1][0]);
+    }
+
+    // Rebuild V_{k+1} from normalized first vector
+    for (int j = 1; j < ws.s; j++) {
+        mv(&ws.V[k + 1][(j - 1) * n], ws.Atmp.data());
+        pc(ws.Atmp.data(), ws.tmp.data());
+        vcopy(n, ws.tmp.data(), &ws.V[k + 1][j * n]);
+    }
+
+    // Scalar2: power basis structure (no communication)
+    scalar2(ws, k + 1);
+
+    // Apply Givens rotations to new columns
+    for (int j = 0; j < ws.s; j++) {
+        int col = k * ws.s + j;
+        apply_givens_to_column(ws, col, ws.givens_count);
+        create_givens_rotation(ws, ws.givens_count, col);
+    }
+
+    return std::abs(ws.g[ws.givens_count]);
+}
 
 #endif // SSTEP_GMRES_CORE_H
