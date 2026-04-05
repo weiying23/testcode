@@ -34,8 +34,11 @@ class DistributedCSRMatrix {
     std::vector<int> send_idx_left_, send_idx_right_;
 
 public:
-    DistributedCSRMatrix() : n_global_(0), n_local_(0),
-                              neighbor_left_(-1), neighbor_right_(-1) {}
+    DistributedCSRMatrix() : comm_(MPI_COMM_NULL), rank_(0), nprocs_(0),
+                              n_global_(0), n_local_(0), row_start_(0), row_end_(-1),
+                              neighbor_left_(-1), neighbor_right_(-1),
+                              n_send_left_(0), n_send_right_(0),
+                              n_recv_left_(0), n_recv_right_(0) {}
 
     int n_global() const { return n_global_; }
     int n_local() const { return n_local_; }
