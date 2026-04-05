@@ -51,12 +51,12 @@ struct SstepWorkspace {
 
         V.resize(m + 1);
         for (int k = 0; k <= m; k++) {
-            V[k].resize(s * n);
+            V[k].assign(s * n, 0.0);
         }
 
         W.resize(m + 1);
         for (int k = 0; k <= m; k++) {
-            W[k].resize(s * s);
+            W[k].assign(s * s, 0.0);
         }
 
         H.assign((ms + 1) * ms, 0.0);
@@ -65,8 +65,8 @@ struct SstepWorkspace {
         sn.assign(ms, 0.0);
         givens_count = 0;
 
-        tmp.resize(n);
-        Atmp.resize(n);
+        tmp.assign(n, 0.0);
+        Atmp.assign(n, 0.0);
     }
 };
 
