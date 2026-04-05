@@ -4,6 +4,8 @@
 #include <iomanip>
 #include <vector>
 #include <cstdlib>
+#include <climits>
+#include <cmath>
 
 #include "blas_utils.h"
 #include "sparse_matrix.h"
@@ -57,11 +59,11 @@ void sstep_gmres_mpi(MPI_Comm comm,
             [&](const double* in, double* out) { M.apply(in, out); });
 
         // ONE Allreduce for beta^2 + W_0
-        int init_size = 1 + cfg.s * cfg.s;
+        size_t init_size = 1 + static_cast<size_t>(cfg.s) * cfg.s;
         std::vector<double> init_local(init_size, 0.0);
         init_local[0] = vdot(n, z.data(), z.data());
 
-        int idx = 1;
+        size_t idx = 1;
         for (int i = 0; i < cfg.s; i++) {
             for (int j = 0; j < cfg.s; j++) {
                 init_local[idx++] = vdot(n, &ws.V[0][i * n], &ws.V[0][j * n]);
@@ -69,13 +71,19 @@ void sstep_gmres_mpi(MPI_Comm comm,
         }
 
         std::vector<double> init_global(init_size);
-        MPI_Allreduce(init_local.data(), init_global.data(), init_size,
+        MPI_Allreduce(init_local.data(), init_global.data(), static_cast<int>(init_size),
                        MPI_DOUBLE, MPI_SUM, comm);
         result.communications++;
 
-        for (int i = 0; i < init_size; i++) init_global[i] /= nprocs;
+        for (size_t i = 0; i < init_size; i++) init_global[i] /= nprocs;
 
         double beta_sq = init_global[0];
+
+        // Safety check for beta_sq validity
+        if (std::isnan(beta_sq) || beta_sq < 0) {
+            beta_sq = vdot(n, z.data(), z.data());
+        }
+
         double beta = std::sqrt(beta_sq);
 
         // Handle zero initial residual
@@ -125,10 +133,19 @@ void sstep_gmres_mpi(MPI_Comm comm,
 
             // ONE Allreduce for Scalar1 projections + W_{k+1} + ||w||^2
             int nblk = k + 1;
-            int total_size = nblk * cfg.s + cfg.s * cfg.s + 1;
+            // Use size_t to avoid potential integer overflow for large s or m
+            size_t total_size = static_cast<size_t>(nblk) * cfg.s + static_cast<size_t>(cfg.s) * cfg.s + 1;
+            // Check for overflow - MPI uses int for count
+            if (total_size > INT_MAX) {
+                if (rank == 0) {
+                    std::cerr << "Error: communication buffer too large\n";
+                }
+                MPI_Abort(comm, 1);
+            }
+            int mpi_count = static_cast<int>(total_size);
             std::vector<double> local_data(total_size, 0.0);
 
-            idx = 0;
+            size_t idx = 0;
             for (int pk = 0; pk < nblk; pk++) {
                 for (int j = 0; j < cfg.s; j++) {
                     local_data[idx++] = vdot(n, &ws.V[pk][j * n], &ws.V[k + 1][0]);
@@ -144,12 +161,18 @@ void sstep_gmres_mpi(MPI_Comm comm,
             local_data[idx] = vdot(n, &ws.V[k + 1][0], &ws.V[k + 1][0]);
 
             std::vector<double> global_data(total_size);
-            MPI_Allreduce(local_data.data(), global_data.data(), total_size,
+            MPI_Allreduce(local_data.data(), global_data.data(), mpi_count,
                           MPI_DOUBLE, MPI_SUM, comm);
             result.communications++;
 
-            for (int i = 0; i < total_size; i++) global_data[i] /= nprocs;
+            for (size_t i = 0; i < total_size; i++) global_data[i] /= nprocs;
+
+            // Safety check for w_norm_sq validity
             double w_norm_sq = global_data[total_size - 1];
+            if (std::isnan(w_norm_sq) || w_norm_sq < 0) {
+                // Fallback: compute local norm (should be same in redundant mode)
+                w_norm_sq = vdot(n, &ws.V[k + 1][0], &ws.V[k + 1][0]);
+            }
 
             // Extract projections
             std::vector<double> projections(nblk * cfg.s);

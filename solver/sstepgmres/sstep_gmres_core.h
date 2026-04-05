@@ -169,7 +169,18 @@ double sstep_arnoldi_block(SstepWorkspace& ws, int k, int n,
     }
 
     double norm_sq = w_norm_sq - energy;
-    if (norm_sq < 0) norm_sq = vdot(n, &ws.V[k + 1][0], &ws.V[k + 1][0]);
+    // Safety check: if numerical issues cause negative norm_sq, recompute locally
+    // In redundant computation mode, all processes have same data, so local = global
+    if (norm_sq < 0 || std::isnan(norm_sq)) {
+        norm_sq = vdot(n, &ws.V[k + 1][0], &ws.V[k + 1][0]);
+        // Clear energy contribution since we're using local norm
+        for (int pk = 0; pk <= k; pk++) {
+            for (int j = 0; j < ws.s; j++) {
+                double h = ws.H[(k * ws.s + ws.s - 1) * (ms + 1) + pk * ws.s + j];
+                norm_sq -= h * h;
+            }
+        }
+    }
     double norm = std::sqrt(std::max(norm_sq, 0.0));
 
     // Store norm in H matrix (subdiagonal)
@@ -198,6 +209,8 @@ double sstep_arnoldi_block(SstepWorkspace& ws, int k, int n,
         create_givens_rotation(ws, ws.givens_count, col);
     }
 
+    // Return residual estimate from the last g vector element
+    // After s Givens rotations, residual estimate is at g[givens_count]
     return std::abs(ws.g[ws.givens_count]);
 }
 
