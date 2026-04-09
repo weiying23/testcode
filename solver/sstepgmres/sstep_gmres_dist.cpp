@@ -687,12 +687,13 @@ int main(int argc, char** argv) {
     //--------------------------------------------------------------------------
     if (argc < 5) {
         if (rank == 0) {
-            std::cout << "Usage: " << argv[0] << " <n_global> <s> <m> <type> [tol]\n";
+            std::cout << "Usage: " << argv[0] << " <n_global> <s> <m> <type> [tol] [max_restarts]\n";
             std::cout << "  n_global: global matrix dimension\n";
             std::cout << "  s: s-step parameter (2-3)\n";
             std::cout << "  m: number of blocks\n";
             std::cout << "  type: 0=five-diagonal, 1=anisotropic\n";
             std::cout << "  tol: convergence tolerance (default 1e-8)\n";
+            std::cout << "  max_restarts: maximum restart iterations (default 25)\n";
         }
         MPI_Finalize();
         return 1;
@@ -703,6 +704,7 @@ int main(int argc, char** argv) {
     int m = std::atoi(argv[3]);
     int type = std::atoi(argv[4]);
     double tol = (argc > 5) ? std::atof(argv[5]) : 1e-8;
+    int max_restarts = (argc > 6) ? std::atoi(argv[6]) : 25;
 
     // 参数约束: s 建议 2-3
     if (s < 2) s = 2;
@@ -760,7 +762,7 @@ int main(int argc, char** argv) {
         std::cout << "==============================================\n";
         std::cout << "Matrix: " << mat_name << ", n_global=" << n_global << "\n";
         std::cout << "np=" << nprocs << ", s=" << s << ", m=" << m << "\n";
-        std::cout << "tol=" << tol << "\n";
+        std::cout << "tol=" << tol << ", max_restarts=" << max_restarts << "\n";
         std::cout << "==============================================\n\n";
     }
 
@@ -799,7 +801,7 @@ int main(int argc, char** argv) {
     // 调用 GMRES 求解器
     //--------------------------------------------------------------------------
     std::vector<double> x_local(n_local);
-    GMRESParams params(s, m, tol);
+    GMRESParams params(s, m, tol, max_restarts);
     GMRESResult result;
 
     sstepGMRES(
