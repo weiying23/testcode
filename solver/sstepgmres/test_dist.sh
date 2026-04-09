@@ -79,6 +79,21 @@ echo ""
 mpirun -np 10 ./sstep_gmres_dist 100000 3 30 0 1e-8
 
 echo ""
+echo "=== Phase 4: Restart functionality ==="
+echo "测试 1: 五对角矩阵 (快速收敛)"
+echo "命令: mpirun -np 4 ./sstep_gmres_dist 10000 3 10 0 1e-8 25"
+echo "  max_restarts=25: 允许多次重启"
+echo ""
+mpirun -np 4 ./sstep_gmres_dist 10000 3 10 0 1e-8 25
+
+echo ""
+echo "测试 2: max_restarts=1 (等价于无重启)"
+echo "命令: mpirun -np 4 ./sstep_gmres_dist 10000 3 10 0 1e-8 1"
+echo "  max_restarts=1: 仅一轮, 与原版本行为一致"
+echo ""
+mpirun -np 4 ./sstep_gmres_dist 10000 3 10 0 1e-8 1
+
+echo ""
 echo "=============================================="
 echo "Tests complete!"
 echo "=============================================="
@@ -94,5 +109,5 @@ echo ""
 echo "# 大规模 (推荐 np=2-4)"
 echo "mpirun -np 4 ./sstep_gmres_dist 1000000 3 50 0 1e-4"
 echo ""
-echo "# 各向异性矩阵 (更难收敛)"
-echo "mpirun -np 4 ./sstep_gmres_dist 10000 3 30 1 1e-6"
+echo "# 各向异性矩阵 (更难收敛, 需要重启)"
+echo "mpirun -np 4 ./sstep_gmres_dist 10000 3 30 1 1e-6 25"
