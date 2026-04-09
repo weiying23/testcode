@@ -472,8 +472,15 @@ void sstepGMRES(
             // Step 2.5: 计算正交化后的范数
             //==================================================================
             double norm_sq = w_norm_sq - energy;
+            double norm_sq_local = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
+
+            // 重要: 当 norm_sq < 0 时, 需要使用全局一致的值, 否则各进程会有不同的 V 向量
+            // 导致 Givens 旋转不一致, 最终引起 MPI 死锁
             if (norm_sq < 0) {
-                norm_sq = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
+                double norm_sq_global;
+                MPI_Allreduce(&norm_sq_local, &norm_sq_global, 1, MPI_DOUBLE, MPI_SUM, comm);
+                norm_sq = norm_sq_global / nprocs;
+                ncomm++;
             }
             double norm = std::sqrt(std::max(norm_sq, 0.0));
 
