@@ -201,7 +201,7 @@ void sstepGMRES(
     int ms = m * s;        // 总 Krylov 维度
 
     //--------------------------------------------------------------------------
-    // 工作向量初始化
+    // 工作向量初始化 (在 restart 循环外部，复用内存)
     //--------------------------------------------------------------------------
     std::vector<double> r_local(n_local);      // 残差向量 (本地部分)
     std::vector<double> z_local(n_local);      // 预处理后的残差 M^{-1}*r
@@ -212,15 +212,12 @@ void sstepGMRES(
     // 解向量初始化为零 (初始猜测 x₀ = 0)
     std::fill(x_local, x_local + n_local, 0.0);
 
-    // 初始残差: r = b - A*x₀ = b (因为 x₀=0)
-    std::copy(b_local, b_local + n_local, r_local.begin());
-
     // 计算 ||b|| 用于相对残差判断
     // 相对残差 = ||b - Ax|| / ||b||
     double bnorm = globalNorm(comm, nprocs, b_local, n_local);
 
     //--------------------------------------------------------------------------
-    // Krylov 子空间存储结构
+    // Krylov 子空间存储结构 (在 restart 循环外部，复用内存)
     //
     // V[k]: 第 k 个块的 s 个 Power basis 向量
     //       存储: [V_k^0 | V_k^1 | ... | V_k^{s-1}]
@@ -232,15 +229,10 @@ void sstepGMRES(
     }
 
     //--------------------------------------------------------------------------
-    // Gram 矩阵 W
+    // Gram 矩阵 W (在 restart 循环外部，复用内存)
     //
     // Power basis 向量之间不正交，W 矩阵描述它们的"夹角"
     // W[k][i*s + j] = <V_k^i, V_k^j>
-    //
-    // 数学意义:
-    //   若 V_k^i, V_k^j 正交，则 W[k][i*s+j] = 0 (i≠j)
-    //   实际上 Power basis 不正交，W[k] 是稠密的
-    //   正交化时需要解 W * h = projections
     //--------------------------------------------------------------------------
     std::vector<std::vector<double>> W(m + 1);
     for (int k = 0; k <= m; k++) {
@@ -248,507 +240,422 @@ void sstepGMRES(
     }
 
     //--------------------------------------------------------------------------
-    // Hessenberg 矩阵 H
+    // Hessenberg 矩阵 H (在 restart 循环外部，复用内存)
     //
     // H 是 (ms+1) × ms 的上 Hessenberg 矩阵
     // H(col, row) 存储在 H[col*(ms+1) + row]
-    //
-    // 数学意义:
-    //   描述 Krylov 基的递推关系: A*V_j = Σ H(i,j)*V_i + H(j+1,j)*V_{j+1}
-    //
-    // Givens 旋转后:
-    //   H 变为上三角 R
-    //   最小二乘问题变为解 R*y = g
     //--------------------------------------------------------------------------
     std::vector<double> H((ms + 1) * ms, 0.0);
     std::vector<double> g(ms + 1, 0.0);        // 最小二乘右端项
     std::vector<double> cs(ms), sn(ms);        // Givens 旋转参数 (cos, sin)
-    int givens_count = 0;                      // 已执行的 Givens 旋转次数
 
-    int ncomm = 0;  // 全局通信计数器
+    //--------------------------------------------------------------------------
+    // 累积统计量 (跨 restart 轮次)
+    //--------------------------------------------------------------------------
+    int total_iterations = 0;
+    int total_communications = 0;
 
     //==========================================================================
-    // Phase 1: 初始化 - 构建第一个 Krylov 块 V_0
+    // Restart 循环
     //==========================================================================
+    for (int rst = 0; rst < params.max_restarts; rst++) {
 
-    //--------------------------------------------------------------------------
-    // Step 1.1: 计算初始预处理残差
-    //
-    // z = M^{-1} * r = M^{-1} * b
-    //
-    // 数学意义:
-    //   预处理改变了 Krylov 子空间
-    //   原始: K_m(A, b)
-    //   预处理后: K_m(M^{-1}A, M^{-1}b)
-    //--------------------------------------------------------------------------
-    precond(b_local, z_local.data());
+        //----------------------------------------------------------------------
+        // 每轮重置数据结构
+        //----------------------------------------------------------------------
+        std::fill(H.begin(), H.end(), 0.0);
+        std::fill(g.begin(), g.end(), 0.0);
+        std::fill(cs.begin(), cs.end(), 0.0);
+        std::fill(sn.begin(), sn.end(), 0.0);
+        int givens_count = 0;
+        int ncomm = 0;
 
-    //--------------------------------------------------------------------------
-    // Step 1.2: 构建 V_0 的 Power basis
-    //
-    // V_0^0 = z = M^{-1}*b
-    // V_0^1 = M^{-1}*A*z
-    // V_0^2 = M^{-1}*A*V_0^1 = M^{-1}*A²*z
-    // ...
-    // V_0^{s-1} = M^{-1}*A^(s-1)*z
-    //
-    // 注意: 这些向量之间不正交！
-    //       需要 Gram 矩阵 W_0 来处理正交化
-    //--------------------------------------------------------------------------
-    // V_0^0 = z
-    for (int i = 0; i < n_local; i++) {
-        V[0][i] = z_local[i];
-    }
-
-    // 生成剩余的 Power basis 向量 (本地计算，无需全局通信)
-    // 循环: V_0^j = M^{-1} * A * V_0^{j-1}
-    for (int j = 1; j < s; j++) {
-        // 取出 V_0^{j-1}
-        std::copy(&V[0][(j - 1) * n_local], &V[0][j * n_local], tmp_local.begin());
-        // 计算 A * V_0^{j-1} (包含幽灵层交换)
-        matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
-        // 应用预处理器: V_0^j = M^{-1} * A * V_0^{j-1}
-        precond(Atmp_local.data(), tmp_local.data());
-        // 存入 V_0^j
-        std::copy(tmp_local.begin(), tmp_local.end(), &V[0][j * n_local]);
-    }
-
-    //==========================================================================
-    // Step 1.3: 第一次全局通信
-    //
-    // 打包发送内容:
-    //   [0]:     beta² = ||z||² (初始残差范数)
-    //   [1..s²]: W_0 矩阵元素
-    //
-    // 关键技巧: 将所有需要的信息打包到一个 Allreduce
-    //           避免多次小消息传输
-    //==========================================================================
-    int init_size = 1 + s * s;
-    std::vector<double> init_loc(init_size, 0.0);
-
-    // beta² = ||z||² = <z, z>
-    init_loc[0] = vdot(n_local, z_local.data(), z_local.data());
-
-    // 计算 W_0[i,j] = <V_0^i, V_0^j>
-    int idx = 1;
-    for (int i = 0; i < s; i++) {
-        for (int j = 0; j < s; j++) {
-            init_loc[idx++] = vdot(n_local, &V[0][i * n_local], &V[0][j * n_local]);
-        }
-    }
-
-    // 一次 Allreduce 获取所有全局值
-    std::vector<double> init_glb(init_size);
-    MPI_Allreduce(init_loc.data(), init_glb.data(), init_size, MPI_DOUBLE, MPI_SUM, comm);
-    ncomm++;
-
-    // beta = ||z|| (初始预处理残差范数)
-    // 注意: init_glb[0] 是各进程本地平方和，除以 nprocs 得到平均值
-    //       然后开方得到全局范数
-    double beta_sq = init_glb[0] / nprocs;
-    double beta = std::sqrt(beta_sq);
-
-    //--------------------------------------------------------------------------
-    // Step 1.4: 检查初始残差是否已满足收敛条件
-    //--------------------------------------------------------------------------
-    if (beta < tol * bnorm) {
-        result.converged = true;
-        result.final_residual = beta / bnorm;
-        result.iterations = 0;
-        result.communications = ncomm;
-        return;  // 无需迭代，直接返回
-    }
-
-    //--------------------------------------------------------------------------
-    // Step 1.5: 归一化 V_0
-    //
-    // 将所有 V_0 的向量除以 beta
-    // 使得 ||V_0^0|| = 1 (Arnoldi 基的起点)
-    //--------------------------------------------------------------------------
-    for (int j = 0; j < s; j++) {
-        vscal(n_local, 1.0 / beta, &V[0][j * n_local]);
-    }
-
-    //--------------------------------------------------------------------------
-    // Step 1.6: 提取归一化后的 W_0
-    //
-    // 归一化后: W_0[i,j] = <V_0^i/beta, V_0^j/beta> = 原值 / beta²
-    //--------------------------------------------------------------------------
-    idx = 1;
-    for (int i = 0; i < s; i++) {
-        for (int j = 0; j < s; j++) {
-            W[0][i * s + j] = init_glb[idx++] / (beta_sq * nprocs);
-        }
-    }
-
-    //--------------------------------------------------------------------------
-    // Step 1.7: 初始化最小二乘问题
-    //
-    // g 向量初始化: g[0] = beta
-    // 这是 ||b||/||b|| * beta 的简化形式
-    // 经过 Givens 旋转后，g[m] 将是残差估计
-    //--------------------------------------------------------------------------
-    g[0] = beta;
-
-    //--------------------------------------------------------------------------
-    // Step 1.8: Scalar2 设置 - 幂基结构
-    //
-    // 对于 Power basis，H 矩阵有固定的结构:
-    //   H[j, j+1] = 1.0 (表示 V_{j+1} = A * V_j 的关系)
-    //
-    // 数学意义:
-    //   Power basis: V^j = A^j * V^0
-    //   递推关系: V^{j+1} = A * V^j
-    //   在 H 矩阵中表示为 H[j, j+1] = 1.0
-    //--------------------------------------------------------------------------
-    for (int j = 0; j < s - 1; j++) {
-        H[j * (ms + 1) + j + 1] = 1.0;
-    }
-
-    //==========================================================================
-    // Phase 2: 主循环 - 每次迭代生成一个 Krylov 块
-    //==========================================================================
-    for (int k = 0; k < m; k++) {
-        int nblk = k + 1;  // 当前已有的块数
-
-        //======================================================================
-        // Step 2.1: 计算新块的起点
+        //----------------------------------------------------------------------
+        // 计算当前残差
         //
-        // w = M^{-1} * A * V_k^{s-1}
-        //
-        // 这是新块 V_{k+1}^0 的初始值 (正交化前)
-        //
-        // 数学意义:
-        //   V_k^{s-1} 是第 k 块的最后一个向量
-        //   A * V_k^{s-1} 扩展 Krylov 子空间到下一个"维度"
-        //   M^{-1} 应用预处理器
-        //======================================================================
-        // 取出 V_k^{s-1} (第 k 块的最后一个向量)
-        std::copy(&V[k][(s - 1) * n_local], &V[k][s * n_local], tmp_local.begin());
-        // 计算 A * V_k^{s-1}
-        matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
-        // 应用预处理器
-        precond(Atmp_local.data(), tmp_local.data());
-        // 存入 V_{k+1}^0
-        std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][0]);
-
-        //======================================================================
-        // Step 2.2: 构建 V_{k+1} 的完整 Power basis
-        //
-        // 从 V_{k+1}^0 生成 V_{k+1}^1, V_{k+1}^2, ..., V_{k+1}^{s-1}
-        //
-        // V_{k+1}^j = M^{-1} * A * V_{k+1}^{j-1}
-        //
-        // 注意: 这是本地计算，不涉及全局通信
-        //       mat-vec 的幽灵层交换是点对点通信，不是 Allreduce
-        //======================================================================
-        for (int j = 1; j < s; j++) {
-            std::copy(&V[k + 1][(j - 1) * n_local], &V[k + 1][j * n_local], tmp_local.begin());
-            matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
-            precond(Atmp_local.data(), tmp_local.data());
-            std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][j * n_local]);
-        }
-
-        //======================================================================
-        // Step 2.3: 一次性计算所有内积 (核心通信优化)
-        //
-        // 打包内容:
-        //   [0 .. nblk*s-1]:     Scalar1 投影 (V_{k+1}^0 在之前所有块的投影)
-        //   [nblk*s .. nblk*s+s²-1]: W_{k+1} 矩阵元素
-        //   [nblk*s+s²]:         ||V_{k+1}^0||² (正交化前的范数)
-        //
-        // 关键技巧:
-        //   - 这些内积的输入向量都已固定，没有依赖关系
-        //   - 可以全部打包到一个 Allreduce
-        //   - 传统 GMRES 需要逐步等待，这里一次搞定
-        //======================================================================
-        int total_size = nblk * s + s * s + 1;
-        std::vector<double> local_data(total_size, 0.0);
-        idx = 0;
-
-        // Scalar1 投影: <V_p^j, V_{k+1}^0> for all p <= k, all j < s
-        // 这些用于正交化 V_{k+1}^0 到之前所有块
-        for (int pk = 0; pk < nblk; pk++) {
-            for (int j = 0; j < s; j++) {
-                local_data[idx++] = vdot(n_local, &V[pk][j * n_local], &V[k + 1][0]);
-            }
-        }
-
-        // W_{k+1} 矩阵: <V_{k+1}^i, V_{k+1}^j>
-        for (int i = 0; i < s; i++) {
-            for (int j = 0; j < s; j++) {
-                local_data[idx++] = vdot(n_local, &V[k + 1][i * n_local], &V[k + 1][j * n_local]);
-            }
-        }
-
-        // ||V_{k+1}^0||² (正交化前的范数平方)
-        local_data[idx] = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
-
-        // 一次 Allreduce 获取所有全局值
-        std::vector<double> global_data(total_size);
-        MPI_Allreduce(local_data.data(), global_data.data(), total_size, MPI_DOUBLE, MPI_SUM, comm);
-        ncomm++;
-
-        // 归一化 (除以 nprocs)
-        for (int i = 0; i < total_size; i++) global_data[i] /= nprocs;
-        double w_norm_sq = global_data[total_size - 1];
-
-        //======================================================================
-        // Step 2.4: Scalar1 正交化
-        //
-        // 目标: 将 V_{k+1}^0 正交化到之前所有块 V_0, V_1, ..., V_k
-        //
-        // 数学推导:
-        //   设投影 p_j = <V_{k+1}^0, V_k^j> (已通过 Allreduce 获取)
-        //   正交化系数 h_j 满足: W_k * h = p
-        //   (因为 Power basis 向量不正交，需要通过 W 矩阵修正)
-        //
-        // 正交化过程:
-        //   V_{k+1}^0 = V_{k+1}^0 - Σ h_j * V_k^j
-        //======================================================================
-        idx = 0;
-        double energy = 0;  // 正交化消耗的"能量" Σ h_j²
-        int col_last = k * s + (s - 1);  // H 矩阵中当前处理的列索引
-
-        // 对每个之前的块执行正交化
-        for (int pk = 0; pk < nblk; pk++) {
-            // 提取投影向量 h_raw (未修正的投影系数)
-            std::vector<double> h_raw(s), h_ortho(s);
-            for (int j = 0; j < s; j++) h_raw[j] = global_data[idx++];
-
-            // 解 SPD 系统: W[pk] * h_ortho = h_raw
-            // 得到正确的正交化系数
-            solveSPD(s, W[pk].data(), h_raw.data(), h_ortho.data());
-
-            // 更新 H 矩阵和 V_{k+1}^0
-            for (int j = 0; j < s; j++) {
-                // 存入 H 矩阵
-                H[col_last * (ms + 1) + pk * s + j] = h_ortho[j];
-                // 正交化: V_{k+1}^0 -= h_ortho[j] * V_pk^j
-                vaxpy(n_local, -h_ortho[j], &V[pk][j * n_local], &V[k + 1][0]);
-                // 记录能量贡献
-                energy += h_ortho[j] * h_ortho[j];
-            }
-        }
-
-        //======================================================================
-        // Step 2.5: 计算正交化后的范数
-        //
-        // 数学推导:
-        //   正交化前: ||V_{k+1}^0||² = w_norm_sq
-        //   正交化后: ||V_{k+1}^0||² = w_norm_sq - Σ h_j²
-        //   (因为 V_{k+1}^0 -= Σ h_j * V_j，且 V_j 正交)
-        //======================================================================
-        double norm_sq = w_norm_sq - energy;
-        // 数值稳定性检查: 如果 norm_sq < 0，重新计算
-        if (norm_sq < 0) {
-            norm_sq = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
-        }
-        double norm = std::sqrt(std::max(norm_sq, 0.0));
-
-        // 存入 H 矩阵的最后一个元素 (H(col_last, col_last+1))
-        H[col_last * (ms + 1) + (k + 1) * s] = norm;
-
-        //--------------------------------------------------------------------------
-        // Step 2.6: 归一化 V_{k+1}^0
-        //--------------------------------------------------------------------------
-        if (norm > 1e-14) {
-            vscal(n_local, 1.0 / norm, &V[k + 1][0]);
-        }
-
-        //======================================================================
-        // Step 2.7: 提取 Gram 矩阵 W_{k+1}
-        //
-        // W_{k+1}[i,j] = <V_{k+1}^i, V_{k+1}^j>
-        // 用于下一轮正交化
-        //======================================================================
-        idx = nblk * s;
-        for (int i = 0; i < s; i++) {
-            for (int j = 0; j < s; j++) {
-                W[k + 1][i * s + j] = global_data[idx++];
-            }
-        }
-
-        //======================================================================
-        // Step 2.8: 从归一化的 V_{k+1}^0 重建整个块
-        //
-        // 为什么需要重建？
-        //   - V_{k+1}^0 已被正交化和归一化
-        //   - 但 V_{k+1}^1, V_{k+1}^2, ... 还是原始的 Power basis
-        //   - 需要从新的 V_{k+1}^0 重新生成它们
-        //
-        // 数学意义:
-        //   新的 Power basis: V_{k+1}^j = M^{-1}*A^j*V_{k+1}^0 (归一化后)
-        //======================================================================
-        for (int j = 1; j < s; j++) {
-            std::copy(&V[k + 1][(j - 1) * n_local], &V[k + 1][j * n_local], tmp_local.begin());
-            matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
-            precond(Atmp_local.data(), tmp_local.data());
-            std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][j * n_local]);
-        }
-
-        //======================================================================
-        // Step 2.9: Scalar2 设置 - 幂基结构
-        //
-        // 对于新块 V_{k+1}，设置 H 矩阵的固定结构:
-        //   H[(k+1)*s+j, (k+1)*s+j+1] = 1.0
-        //======================================================================
-        for (int j = 0; j < s - 1; j++) {
-            int col_j = (k + 1) * s + j;
-            H[col_j * (ms + 1) + (k + 1) * s + j + 1] = 1.0;
-        }
-
-        //======================================================================
-        // Step 2.10: Givens 旋转
-        //
-        // 目标: 将 H 矩阵转换为上三角形式
-        //
-        // 数学推导:
-        //   H 是上 Hessenberg 矩阵 (只有下三角有一行非零)
-        //   通过 Givens 旋转逐行消去下三角元素
-        //   每次旋转同时更新 g 向量
-        //
-        // Givens 旋转:
-        //   G(i,j) = [c  s; -s  c]
-        //   作用: 消去 H(i+1,i)，使 H(i,i) 变为 r = sqrt(a²+b²)
-        //
-        // g 向量更新:
-        //   g[i] = c*g[i] + s*g[i+1]
-        //   g[i+1] = -s*g[i] + c*g[i+1]
-        //   g[m] 保持为残差估计
-        //======================================================================
-        for (int j = 0; j < s; j++) {
-            int col = k * s + j;
-
-            // 应用之前的 Givens 旋转到新列
-            for (int i = 0; i < givens_count; i++) {
-                double t1 = H[col * (ms + 1) + i];
-                double t2 = H[col * (ms + 1) + i + 1];
-                H[col * (ms + 1) + i] = cs[i] * t1 + sn[i] * t2;
-                H[col * (ms + 1) + i + 1] = -sn[i] * t1 + cs[i] * t2;
-            }
-
-            // 创建新的 Givens 旋转
-            int row = givens_count;
-            double a = H[col * (ms + 1) + row];
-            double b_val = H[col * (ms + 1) + row + 1];
-
-            if (std::abs(a) < 1e-14 && std::abs(b_val) < 1e-14) {
-                // 数值特殊情况: 设为单位旋转
-                cs[givens_count] = 1.0;
-                sn[givens_count] = 0.0;
-            } else {
-                // 正常情况: 计算 cos, sin
-                double r = std::sqrt(a * a + b_val * b_val);
-                cs[givens_count] = a / r;
-                sn[givens_count] = b_val / r;
-                // 更新 H 矩阵元素
-                H[col * (ms + 1) + row] = r;
-                H[col * (ms + 1) + row + 1] = 0.0;
-            }
-
-            // 更新 g 向量
-            double gt = g[givens_count];
-            g[givens_count] = cs[givens_count] * gt + sn[givens_count] * g[givens_count + 1];
-            g[givens_count + 1] = -sn[givens_count] * gt + cs[givens_count] * g[givens_count + 1];
-            givens_count++;
-        }
-
-        //======================================================================
-        // Step 2.11: 收敛检查
-        //
-        // 残差估计 = |g[givens_count]| / bnorm
-        //
-        // 数学推导:
-        //   经过 Givens 旋转后，最小二乘问题变为:
-        //     min ||R*y - g||
-        //   其中 R 是上三角，g 经过旋转
-        //   残差 = g[m] (未被消去的最后一个元素)
-        //======================================================================
-        double res_est = std::abs(g[givens_count]) / bnorm;
-
-        // 输出迭代信息 (仅 rank 0)
-        if (rank == 0) {
-            std::cout << "Block " << (k + 1) << " (Krylov=" << ((k + 1) * s)
-                      << "): residual=" << std::scientific << res_est << "\n";
-        }
-
-        //======================================================================
-        // Step 2.12: 收敛后计算解
-        //======================================================================
-        if (res_est < tol) {
-            //--------------------------------------------------------------
-            // 解上三角系统: R * y = g
-            //
-            // 从最后一个元素开始回代
-            // y[i] = (g[i] - Σ_{j>i} R[i,j]*y[j]) / R[i,i]
-            //--------------------------------------------------------------
-            std::vector<double> y(ms, 0.0);
-            for (int i = givens_count - 1; i >= 0; i--) {
-                y[i] = g[i];
-                for (int j = i + 1; j < givens_count; j++) {
-                    y[i] -= H[j * (ms + 1) + i] * y[j];
-                }
-                if (std::abs(H[i * (ms + 1) + i]) > 1e-14) {
-                    y[i] /= H[i * (ms + 1) + i];
-                }
-            }
-
-            //--------------------------------------------------------------
-            // 计算解向量: x = Σ V_k * y_k
-            //
-            // x = x₀ + Σ_{k=0}^{nblk-1} Σ_{j=0}^{s-1} y[k*s+j] * V_k^j
-            //--------------------------------------------------------------
-            for (int kk = 0; kk <= k; kk++) {
-                for (int j = 0; j < s; j++) {
-                    vaxpy(n_local, y[kk * s + j], &V[kk][j * n_local], x_local);
-                }
-            }
-
-            //--------------------------------------------------------------
-            // 计算真实残差 ||b - Ax||
-            //
-            // 验证: 比较 Givens 残差估计与真实残差
-            //--------------------------------------------------------------
-            std::vector<double> Ax_local(n_local), res_local(n_local);
+        // 第一轮: r = b (因为 x = 0)
+        // 后续轮: r = b - A*x
+        //----------------------------------------------------------------------
+        if (rst == 0) {
+            // 初始残差: r = b - A*x₀ = b (因为 x₀=0)
+            std::copy(b_local, b_local + n_local, r_local.begin());
+        } else {
+            // 后续轮次: r = b - A*x
+            std::vector<double> Ax_local(n_local);
             matVec(x_local, ghost_data.data(), Ax_local.data());
             for (int i = 0; i < n_local; i++) {
-                res_local[i] = b_local[i] - Ax_local[i];
+                r_local[i] = b_local[i] - Ax_local[i];
             }
-            result.final_residual = globalNorm(comm, nprocs, res_local.data(), n_local) / bnorm;
+        }
 
+        //======================================================================
+        // Phase 1: 初始化 - 构建第一个 Krylov 块 V_0
+        //======================================================================
+
+        //----------------------------------------------------------------------
+        // Step 1.1: 计算初始预处理残差
+        //
+        // z = M^{-1} * r
+        //----------------------------------------------------------------------
+        precond(r_local.data(), z_local.data());
+
+        //----------------------------------------------------------------------
+        // Step 1.2: 构建 V_0 的 Power basis
+        //
+        // V_0^0 = z = M^{-1}*r
+        // V_0^1 = M^{-1}*A*z
+        // V_0^2 = M^{-1}*A*V_0^1 = M^{-1}*A²*z
+        // ...
+        // V_0^{s-1} = M^{-1}*A^(s-1)*z
+        //----------------------------------------------------------------------
+        // V_0^0 = z
+        for (int i = 0; i < n_local; i++) {
+            V[0][i] = z_local[i];
+        }
+
+        // 生成剩余的 Power basis 向量 (本地计算，无需全局通信)
+        for (int j = 1; j < s; j++) {
+            std::copy(&V[0][(j - 1) * n_local], &V[0][j * n_local], tmp_local.begin());
+            matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
+            precond(Atmp_local.data(), tmp_local.data());
+            std::copy(tmp_local.begin(), tmp_local.end(), &V[0][j * n_local]);
+        }
+
+        //======================================================================
+        // Step 1.3: 第一次全局通信
+        //======================================================================
+        int init_size = 1 + s * s;
+        std::vector<double> init_loc(init_size, 0.0);
+
+        // beta² = ||z||² = <z, z>
+        init_loc[0] = vdot(n_local, z_local.data(), z_local.data());
+
+        // 计算 W_0[i,j] = <V_0^i, V_0^j>
+        int idx = 1;
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                init_loc[idx++] = vdot(n_local, &V[0][i * n_local], &V[0][j * n_local]);
+            }
+        }
+
+        // 一次 Allreduce 获取所有全局值
+        std::vector<double> init_glb(init_size);
+        MPI_Allreduce(init_loc.data(), init_glb.data(), init_size, MPI_DOUBLE, MPI_SUM, comm);
+        ncomm++;
+
+        // beta = ||z|| (初始预处理残差范数)
+        double beta_sq = init_glb[0] / nprocs;
+        double beta = std::sqrt(beta_sq);
+
+        //----------------------------------------------------------------------
+        // Step 1.4: 检查初始残差是否已满足收敛条件
+        //----------------------------------------------------------------------
+        if (beta < tol * bnorm) {
             result.converged = true;
-            result.iterations = k + 1;
-            result.communications = ncomm;
-            return;
+            result.final_residual = beta / bnorm;
+            result.iterations = total_iterations;
+            result.communications = total_communications + ncomm;
+            result.restarts_used = rst + 1;
+            return;  // 无需迭代，直接返回
         }
-    }
 
-    //==========================================================================
-    // Phase 3: 未收敛 - 计算当前最优解
-    //
-    // 使用全部 m 个块的 Krylov 子空间
-    // 计算 x = Σ V_k * y_k 使得 ||b - Ax|| 最小
-    //==========================================================================
-    std::vector<double> y(ms, 0.0);
-    for (int i = ms - 1; i >= 0; i--) {
-        y[i] = g[i];
-        for (int j = i + 1; j < ms; j++) {
-            y[i] -= H[j * (ms + 1) + i] * y[j];
-        }
-        if (std::abs(H[i * (ms + 1) + i]) > 1e-14) {
-            y[i] /= H[i * (ms + 1) + i];
-        }
-    }
-
-    // 组合解向量
-    for (int k_iter = 0; k_iter < m; k_iter++) {
+        //----------------------------------------------------------------------
+        // Step 1.5: 归一化 V_0
+        //----------------------------------------------------------------------
         for (int j = 0; j < s; j++) {
-            vaxpy(n_local, y[k_iter * s + j], &V[k_iter][j * n_local], x_local);
+            vscal(n_local, 1.0 / beta, &V[0][j * n_local]);
+        }
+
+        //----------------------------------------------------------------------
+        // Step 1.6: 提取归一化后的 W_0
+        //----------------------------------------------------------------------
+        idx = 1;
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                W[0][i * s + j] = init_glb[idx++] / (beta_sq * nprocs);
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // Step 1.7: 初始化最小二乘问题
+        //----------------------------------------------------------------------
+        g[0] = beta;
+
+        //----------------------------------------------------------------------
+        // Step 1.8: Scalar2 设置 - 幂基结构
+        //----------------------------------------------------------------------
+        for (int j = 0; j < s - 1; j++) {
+            H[j * (ms + 1) + j + 1] = 1.0;
+        }
+
+        //======================================================================
+        // Phase 2: 主循环 - 每次迭代生成一个 Krylov 块
+        //======================================================================
+        bool converged_this_restart = false;
+        double res_est = 0.0;
+
+        for (int k = 0; k < m; k++) {
+            int nblk = k + 1;  // 当前已有的块数
+
+            //==================================================================
+            // Step 2.1: 计算新块的起点
+            //==================================================================
+            std::copy(&V[k][(s - 1) * n_local], &V[k][s * n_local], tmp_local.begin());
+            matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
+            precond(Atmp_local.data(), tmp_local.data());
+            std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][0]);
+
+            //==================================================================
+            // Step 2.2: 构建 V_{k+1} 的完整 Power basis
+            //==================================================================
+            for (int j = 1; j < s; j++) {
+                std::copy(&V[k + 1][(j - 1) * n_local], &V[k + 1][j * n_local], tmp_local.begin());
+                matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
+                precond(Atmp_local.data(), tmp_local.data());
+                std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][j * n_local]);
+            }
+
+            //==================================================================
+            // Step 2.3: 一次性计算所有内积
+            //==================================================================
+            int total_size = nblk * s + s * s + 1;
+            std::vector<double> local_data(total_size, 0.0);
+            idx = 0;
+
+            // Scalar1 投影
+            for (int pk = 0; pk < nblk; pk++) {
+                for (int j = 0; j < s; j++) {
+                    local_data[idx++] = vdot(n_local, &V[pk][j * n_local], &V[k + 1][0]);
+                }
+            }
+
+            // W_{k+1} 矩阵
+            for (int i = 0; i < s; i++) {
+                for (int j = 0; j < s; j++) {
+                    local_data[idx++] = vdot(n_local, &V[k + 1][i * n_local], &V[k + 1][j * n_local]);
+                }
+            }
+
+            // ||V_{k+1}^0||²
+            local_data[idx] = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
+
+            // Allreduce
+            std::vector<double> global_data(total_size);
+            MPI_Allreduce(local_data.data(), global_data.data(), total_size, MPI_DOUBLE, MPI_SUM, comm);
+            ncomm++;
+
+            // 归一化
+            for (int i = 0; i < total_size; i++) global_data[i] /= nprocs;
+            double w_norm_sq = global_data[total_size - 1];
+
+            //==================================================================
+            // Step 2.4: Scalar1 正交化
+            //==================================================================
+            idx = 0;
+            double energy = 0;
+            int col_last = k * s + (s - 1);
+
+            for (int pk = 0; pk < nblk; pk++) {
+                std::vector<double> h_raw(s), h_ortho(s);
+                for (int j = 0; j < s; j++) h_raw[j] = global_data[idx++];
+
+                solveSPD(s, W[pk].data(), h_raw.data(), h_ortho.data());
+
+                for (int j = 0; j < s; j++) {
+                    H[col_last * (ms + 1) + pk * s + j] = h_ortho[j];
+                    vaxpy(n_local, -h_ortho[j], &V[pk][j * n_local], &V[k + 1][0]);
+                    energy += h_ortho[j] * h_ortho[j];
+                }
+            }
+
+            //==================================================================
+            // Step 2.5: 计算正交化后的范数
+            //==================================================================
+            double norm_sq = w_norm_sq - energy;
+            if (norm_sq < 0) {
+                norm_sq = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
+            }
+            double norm = std::sqrt(std::max(norm_sq, 0.0));
+
+            H[col_last * (ms + 1) + (k + 1) * s] = norm;
+
+            //------------------------------------------------------------------
+            // Step 2.6: 归一化 V_{k+1}^0
+            //------------------------------------------------------------------
+            if (norm > 1e-14) {
+                vscal(n_local, 1.0 / norm, &V[k + 1][0]);
+            }
+
+            //==================================================================
+            // Step 2.7: 提取 Gram 矩阵 W_{k+1}
+            //==================================================================
+            idx = nblk * s;
+            for (int i = 0; i < s; i++) {
+                for (int j = 0; j < s; j++) {
+                    W[k + 1][i * s + j] = global_data[idx++];
+                }
+            }
+
+            //==================================================================
+            // Step 2.8: 从归一化的 V_{k+1}^0 重建整个块
+            //==================================================================
+            for (int j = 1; j < s; j++) {
+                std::copy(&V[k + 1][(j - 1) * n_local], &V[k + 1][j * n_local], tmp_local.begin());
+                matVec(tmp_local.data(), ghost_data.data(), Atmp_local.data());
+                precond(Atmp_local.data(), tmp_local.data());
+                std::copy(tmp_local.begin(), tmp_local.end(), &V[k + 1][j * n_local]);
+            }
+
+            //==================================================================
+            // Step 2.9: Scalar2 设置
+            //==================================================================
+            for (int j = 0; j < s - 1; j++) {
+                int col_j = (k + 1) * s + j;
+                H[col_j * (ms + 1) + (k + 1) * s + j + 1] = 1.0;
+            }
+
+            //==================================================================
+            // Step 2.10: Givens 旋转
+            //==================================================================
+            for (int j = 0; j < s; j++) {
+                int col = k * s + j;
+
+                // 应用之前的 Givens 旋转到新列
+                for (int i = 0; i < givens_count; i++) {
+                    double t1 = H[col * (ms + 1) + i];
+                    double t2 = H[col * (ms + 1) + i + 1];
+                    H[col * (ms + 1) + i] = cs[i] * t1 + sn[i] * t2;
+                    H[col * (ms + 1) + i + 1] = -sn[i] * t1 + cs[i] * t2;
+                }
+
+                // 创建新的 Givens 旋转
+                int row = givens_count;
+                double a = H[col * (ms + 1) + row];
+                double b_val = H[col * (ms + 1) + row + 1];
+
+                if (std::abs(a) < 1e-14 && std::abs(b_val) < 1e-14) {
+                    cs[givens_count] = 1.0;
+                    sn[givens_count] = 0.0;
+                } else {
+                    double r = std::sqrt(a * a + b_val * b_val);
+                    cs[givens_count] = a / r;
+                    sn[givens_count] = b_val / r;
+                    H[col * (ms + 1) + row] = r;
+                    H[col * (ms + 1) + row + 1] = 0.0;
+                }
+
+                // 更新 g 向量
+                double gt = g[givens_count];
+                g[givens_count] = cs[givens_count] * gt + sn[givens_count] * g[givens_count + 1];
+                g[givens_count + 1] = -sn[givens_count] * gt + cs[givens_count] * g[givens_count + 1];
+                givens_count++;
+            }
+
+            //==================================================================
+            // Step 2.11: 收敛检查
+            //==================================================================
+            res_est = std::abs(g[givens_count]) / bnorm;
+
+            // 输出迭代信息 (仅 rank 0)
+            if (rank == 0) {
+                std::cout << "Restart " << (rst + 1)
+                          << ", Block " << (k + 1) << " (Krylov=" << ((k + 1) * s)
+                          << "): residual=" << std::scientific << res_est << "\n";
+            }
+
+            //==================================================================
+            // Step 2.12: 收敛后计算解
+            //==================================================================
+            if (res_est < tol) {
+                //--------------------------------------------------------------
+                // 解上三角系统: R * y = g
+                //--------------------------------------------------------------
+                std::vector<double> y(ms, 0.0);
+                for (int i = givens_count - 1; i >= 0; i--) {
+                    y[i] = g[i];
+                    for (int j = i + 1; j < givens_count; j++) {
+                        y[i] -= H[j * (ms + 1) + i] * y[j];
+                    }
+                    if (std::abs(H[i * (ms + 1) + i]) > 1e-14) {
+                        y[i] /= H[i * (ms + 1) + i];
+                    }
+                }
+
+                //--------------------------------------------------------------
+                // 更新解向量: x = x + Σ V_k * y_k
+                //--------------------------------------------------------------
+                for (int kk = 0; kk <= k; kk++) {
+                    for (int j = 0; j < s; j++) {
+                        vaxpy(n_local, y[kk * s + j], &V[kk][j * n_local], x_local);
+                    }
+                }
+
+                //--------------------------------------------------------------
+                // 计算真实残差 ||b - Ax||
+                //--------------------------------------------------------------
+                std::vector<double> Ax_local(n_local), res_local(n_local);
+                matVec(x_local, ghost_data.data(), Ax_local.data());
+                for (int i = 0; i < n_local; i++) {
+                    res_local[i] = b_local[i] - Ax_local[i];
+                }
+                result.final_residual = globalNorm(comm, nprocs, res_local.data(), n_local) / bnorm;
+
+                result.converged = true;
+                result.iterations = total_iterations + k + 1;
+                result.communications = total_communications + ncomm;
+                result.restarts_used = rst + 1;
+                return;
+            }
+        }
+
+        //======================================================================
+        // 未收敛: 更新解并累积统计
+        //======================================================================
+
+        //----------------------------------------------------------------------
+        // 解上三角系统: R * y = g
+        //----------------------------------------------------------------------
+        std::vector<double> y(ms, 0.0);
+        for (int i = ms - 1; i >= 0; i--) {
+            y[i] = g[i];
+            for (int j = i + 1; j < ms; j++) {
+                y[i] -= H[j * (ms + 1) + i] * y[j];
+            }
+            if (std::abs(H[i * (ms + 1) + i]) > 1e-14) {
+                y[i] /= H[i * (ms + 1) + i];
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // 更新解向量: x = x + Σ V_k * y_k
+        //----------------------------------------------------------------------
+        for (int k_iter = 0; k_iter < m; k_iter++) {
+            for (int j = 0; j < s; j++) {
+                vaxpy(n_local, y[k_iter * s + j], &V[k_iter][j * n_local], x_local);
+            }
+        }
+
+        //----------------------------------------------------------------------
+        // 累积统计
+        //----------------------------------------------------------------------
+        total_iterations += m;
+        total_communications += ncomm;
+
+        //----------------------------------------------------------------------
+        // 输出本轮信息
+        //----------------------------------------------------------------------
+        if (rank == 0) {
+            std::cout << "Restart " << (rst + 1)
+                      << " completed: Krylov=" << (m * s)
+                      << ", residual=" << std::scientific << res_est << "\n";
         }
     }
 
-    // 计算真实残差
+    //==========================================================================
+    // 达到最大 restart 次数仍未收敛
+    //==========================================================================
+
+    // 计算最终残差
     std::vector<double> Ax_local(n_local), res_local(n_local);
     matVec(x_local, ghost_data.data(), Ax_local.data());
     for (int i = 0; i < n_local; i++) {
@@ -757,8 +664,9 @@ void sstepGMRES(
     result.final_residual = globalNorm(comm, nprocs, res_local.data(), n_local) / bnorm;
 
     result.converged = false;
-    result.iterations = m;
-    result.communications = ncomm;
+    result.iterations = total_iterations;
+    result.communications = total_communications;
+    result.restarts_used = params.max_restarts;
 }
 
 //==============================================================================
@@ -919,8 +827,8 @@ int main(int argc, char** argv) {
         std::cout << "||b-Ax||/||b|| = " << std::scientific << result.final_residual << "\n";
         std::cout << "Iterations (blocks): " << result.iterations << "\n";
         std::cout << "Krylov vectors: " << result.iterations * s << "\n";
-        std::cout << "Global communications: " << result.communications
-                  << " (expected max: " << (m + 1) << ")\n";
+        std::cout << "Global communications: " << result.communications << "\n";
+        std::cout << "Restarts used: " << result.restarts_used << "\n";
         std::cout << "==============================================\n";
     }
 
