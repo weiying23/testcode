@@ -476,27 +476,9 @@ void sstepGMRES(
             }
 
             //==================================================================
-            // Step 2.4b: MGS 重正交化 (改进数值稳定性)
-            //
-            // 当 norm_sq_theory < 0 时，说明 Scalar1 正交化的能量估计不准确
-            // 使用 Modified Gram-Schmidt 风格的重正交化进一步净化向量
-            //
-            // 优点：
-            //   - 只需要局部计算（vdot, vaxpy），不增加通信
-            //   - 改善向量正交性，加速收敛
+            // Step 2.4b: MGS 重正交化 (暂时禁用以验证)
             //==================================================================
             double norm_sq_theory = w_norm_sq - energy;
-            if (norm_sq_theory < 0) {
-                // MGS 重正交化：再次投影掉剩余分量
-                for (int pk = 0; pk < nblk; pk++) {
-                    for (int j = 0; j < s; j++) {
-                        double h_extra = vdot(n_local, &V[k + 1][0], &V[pk][j * n_local]);
-                        if (std::abs(h_extra) > 1e-14) {
-                            vaxpy(n_local, -h_extra, &V[pk][j * n_local], &V[k + 1][0]);
-                        }
-                    }
-                }
-            }
 
             //==================================================================
             // Step 2.5: 计算正交化后的范数
