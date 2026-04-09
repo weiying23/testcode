@@ -705,6 +705,7 @@ int main(int argc, char** argv) {
     int type = std::atoi(argv[4]);
     double tol = (argc > 5) ? std::atof(argv[5]) : 1e-8;
     int max_restarts = (argc > 6) ? std::atoi(argv[6]) : 25;
+    if (max_restarts < 1) max_restarts = 1;  // Ensure at least 1 restart
 
     // 参数约束: s 建议 2-3
     if (s < 2) s = 2;
