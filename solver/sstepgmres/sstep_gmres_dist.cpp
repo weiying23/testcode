@@ -464,23 +464,54 @@ void sstepGMRES(
                 for (int j = 0; j < s; j++) {
                     H[col_last * (ms + 1) + pk * s + j] = h_ortho[j];
                     vaxpy(n_local, -h_ortho[j], &V[pk][j * n_local], &V[k + 1][0]);
-                    energy += h_ortho[j] * h_ortho[j];
+                }
+
+                // 正确的投影能量: energy = h_ortho^T * W * h_ortho
+                // 这是因为 Power basis 向量不正交，W 描述了它们的内积
+                for (int i = 0; i < s; i++) {
+                    for (int j = 0; j < s; j++) {
+                        energy += h_ortho[i] * W[pk][i * s + j] * h_ortho[j];
+                    }
+                }
+            }
+
+            //==================================================================
+            // Step 2.4b: MGS 重正交化 (改进数值稳定性)
+            //
+            // 当 norm_sq_theory < 0 时，说明 Scalar1 正交化的能量估计不准确
+            // 使用 Modified Gram-Schmidt 风格的重正交化进一步净化向量
+            //
+            // 优点：
+            //   - 只需要局部计算（vdot, vaxpy），不增加通信
+            //   - 改善向量正交性，加速收敛
+            //==================================================================
+            double norm_sq_theory = w_norm_sq - energy;
+            if (norm_sq_theory < 0) {
+                // MGS 重正交化：再次投影掉剩余分量
+                for (int pk = 0; pk < nblk; pk++) {
+                    for (int j = 0; j < s; j++) {
+                        double h_extra = vdot(n_local, &V[k + 1][0], &V[pk][j * n_local]);
+                        if (std::abs(h_extra) > 1e-14) {
+                            vaxpy(n_local, -h_extra, &V[pk][j * n_local], &V[k + 1][0]);
+                        }
+                    }
                 }
             }
 
             //==================================================================
             // Step 2.5: 计算正交化后的范数
             //==================================================================
-            double norm_sq = w_norm_sq - energy;
             double norm_sq_local = vdot(n_local, &V[k + 1][0], &V[k + 1][0]);
 
-            // 重要: 当 norm_sq < 0 时, 需要使用全局一致的值, 否则各进程会有不同的 V 向量
-            // 导致 Givens 旋转不一致, 最终引起 MPI 死锁
-            if (norm_sq < 0) {
+            // 当理论范数为负时，使用全局计算确保一致性
+            double norm_sq;
+            if (norm_sq_theory < 0) {
                 double norm_sq_global;
                 MPI_Allreduce(&norm_sq_local, &norm_sq_global, 1, MPI_DOUBLE, MPI_SUM, comm);
                 norm_sq = norm_sq_global / nprocs;
                 ncomm++;
+            } else {
+                norm_sq = norm_sq_theory;
             }
             double norm = std::sqrt(std::max(norm_sq, 0.0));
 
