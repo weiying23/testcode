@@ -25,20 +25,26 @@ clang++ -O3 -mcpu=apple-m4 \
 ### 输出示例
 
 ```
-LAPACK vs Eigen vs Blockwise (2x2) 性能对比 (40x40 矩阵)
+LAPACK vs Eigen vs Blockwise 性能对比
+每矩阵重复测试 1000 次
 
-| 文件 | 方法 | 平均时间 (s) | 平均残差 |
-|------|------|--------------|----------|
-| benchmark1_1.mtx | LAPACK   | 0.000031 | 1.32e-13 |
-| benchmark1_1.mtx | Eigen    | 0.000037 | 6.73e-14 |
-| benchmark1_1.mtx | Blockwise| 0.000020 | 1.82e-13 |
-| benchmark10_1.mtx | LAPACK   | 0.000021 | 1.39e-13 |
-| benchmark10_1.mtx | Eigen    | 0.000017 | 7.12e-14 |
-| benchmark10_1.mtx | Blockwise| 0.000015 | 1.55e-13 |
-| benchmark1000_1.mtx | LAPACK   | 0.000020 | 1.41e-13 |
-| benchmark1000_1.mtx | Eigen    | 0.000016 | 6.93e-14 |
-| benchmark1000_1.mtx | Blockwise| 0.000015 | 1.80e-13 |
+| 文件 | 方法 | 时间 (s) | 残差 |
+|------|------|---------|------|
+| benchmark1_1.mtx | LAPACK    | 0.000021 | 1.32e-13 |
+| benchmark1_1.mtx | Eigen     | 0.000016 | 6.73e-14 |
+| benchmark1_1.mtx | Blockwise | 0.000015 | 1.82e-13 |
+| benchmark10_1.mtx | LAPACK    | 0.000021 | 1.39e-13 |
+| benchmark10_1.mtx | Eigen     | 0.000016 | 7.12e-14 |
+| benchmark10_1.mtx | Blockwise | 0.000015 | 1.55e-13 |
+| benchmark1000_1.mtx | LAPACK    | 0.000021 | 1.41e-13 |
+| benchmark1000_1.mtx | Eigen     | 0.000016 | 6.93e-14 |
+| benchmark1000_1.mtx | Blockwise | 0.000015 | 1.80e-13 |
 ```
+
+**性能总结** (40×40 矩阵，288 个样本，每矩阵 1000 次迭代):
+- **Eigen**: 0.000016s (精度最高 ~7e-14)
+- **Blockwise**: 0.000015s (比 Eigen 快 7%，残差 ~1e-13)
+- **LAPACK**: 0.000021s (残差 ~1e-13)
 
 ---
 
@@ -57,8 +63,8 @@ LAPACK vs Eigen vs Blockwise (2x2) 性能对比 (40x40 矩阵)
 ```
 LU-inverse/
 ├── final_compare.cpp           # 三种方法对比 (LAPACK/Eigen/Blockwise)
-├── advanced_methods.c          # 高级求逆算法 (Newton-Schulz, Hyperpower)
-├── main.c                      # 主测试程序
+├── invertible_perf_test.c      # LAPACK vs Blockwise 对比
+├── check_invertible.c          # 矩阵可逆性检测
 ├── run.sh                      # 编译和运行脚本
 ├── benchmark*_1.mtx            # 测试矩阵文件 (3 文件 × 96 矩阵)
 │
@@ -86,23 +92,6 @@ LU-inverse/
 ```bash
 ./run.sh   # 或手动编译 final_compare.cpp
 ./final_compare
-```
-
-### 2. advanced_methods.c - 高级算法对比
-
-**功能**: 对比多种迭代求逆算法
-
-**测试算法**:
-| 算法 | 描述 | 收敛阶 |
-|------|------|--------|
-| LAPACK | LU 分解 + 求逆 | 直接法 |
-| Newton-Schulz | Xₖ₊₁ = Xₖ(I + Rₖ) | 2 阶 |
-| Hyperpower (3 阶) | Xₖ₊₁ = Xₖ(I + Rₖ + Rₖ²) | 3 阶 |
-| Hyperpower (5 阶) | Xₖ₊₁ = Xₖ(Σᵢ₌₀⁴ Rₖⁱ) | 5 阶 |
-
-**运行方法**:
-```bash
-./run.sh
 ```
 
 ---
@@ -147,35 +136,39 @@ MatrixXd A_inv = mat.inverse();
 
 **特点**: 分治策略，缓存效率高，速度最快
 
-### 4. Newton-Schulz 迭代
-
-**公式**: Xₖ₊₁ = Xₖ(I + Rₖ)，Rₖ = I - AXₖ
-
-**初始猜测**: X₀ = αAᵀ，α = 1/(||A||₁·||A||∞)
-
-**特点**: 需要 27-28 次迭代，小矩阵上不如直接法
-
 ---
 
 ## 测试结果
 
-### 性能对比 (288 个矩阵)
+### 40×40 矩阵性能对比 (288 个矩阵，每矩阵 1000 次)
 
-| 方法 | 平均时间 | 相对速度 | 残差 | 速度获胜 |
-|------|----------|----------|------|----------|
-| **Blockwise (2×2)** | **0.000017s** | **1.4x 快** | **~1e-13** | **253/288 (87.8%)** |
-| Eigen | 0.000023s | 1.05x 快 | ~7e-14 | - |
-| LAPACK | 0.000024s | 基准 | ~1e-13 | 35/288 |
-| Newton-Schulz | 0.000190s | 0.09x (慢 11 倍) | ~1e-12 | 0/288 |
+| 方法 | 平均时间 | 相对速度 | 残差 |
+|------|----------|----------|------|
+| **Blockwise** | **0.000015s** | **1.07x 快** | **~1e-13** |
+| Eigen | 0.000016s | - | **~7e-14** |
+| LAPACK | 0.000021s | 1.32x | ~1e-13 |
+
+### 不同规模矩阵性能对比
+
+| 规模 | Eigen | Blockwise | 加速比 (Blockwise/Eigen) |
+|------|-------|-----------|-------------------------|
+| 40×40 | 0.000042s | 0.000032s | **1.31x** |
+| 100×100 | 0.000202s | 0.000147s | **1.37x** |
+| 200×200 | 0.002111s | 0.000443s | **4.77x** |
+| 500×500 | 0.019459s | 0.004374s | **4.45x** |
+
+**关键发现**：
+- **小规模 (n≤40)**：Eigen 和 Blockwise 性能相当，差距 <10%
+- **中规模 (n≈100)**：Blockwise 开始领先，快 1.4x
+- **大规模 (n≥200)**：Blockwise 优势显著，快 **4.5x+**
 
 ### 方法选择建议
 
-| 优先级 | 方法 | 速度 | 精度 | 推荐度 |
-|--------|------|------|------|--------|
-| 🥇 | **Blockwise (2×2)** | 最快 | 高 | ⭐⭐⭐ |
-| 🥈 | Eigen | 快 | 最高 | ⭐⭐ |
-| 🥉 | LAPACK | 快 | 高 | ⭐⭐ |
-| ❌ | 迭代法 | 慢 | 中 | 不推荐 |
+| 矩阵规模 | 推荐方法 | 理由 |
+|----------|---------|------|
+| n ≤ 50 | Eigen | 代码简洁，精度最高，性能相当 |
+| 50 < n < 200 | Blockwise | 性能开始领先，快 1.3-1.5x |
+| n ≥ 200 | **Blockwise** | 性能显著领先，快 4x+ |
 
 ---
 
@@ -208,5 +201,5 @@ export VECLIB_MAX_THREADS=8
 
 ---
 
-*文档更新时间：2026-03-11*
+*文档更新时间：2026-03-12*
 *测试平台：macOS (Apple M4), Accelerate Framework, Eigen 5.0.1*
