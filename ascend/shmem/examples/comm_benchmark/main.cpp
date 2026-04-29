@@ -13,11 +13,15 @@
 #include "acl/acl.h"
 #include "shmem.h"
 #include "shmemi_host_common.h"
-#include "hccl/hccl.h"
-#include "hccl/hccl_types.h"
 #include "utils/utils.h"
 #include "benchmark_config.h"
 #include "benchmark_utils.h"
+
+// HCCL头文件（仅在启用HCCL时包含）
+#ifdef ENABLE_HCCL
+#include "hccl/hccl.h"
+#include "hccl/hccl_types.h"
+#endif
 
 // Kernel函数声明
 extern void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
@@ -59,11 +63,10 @@ int g_npus = 8;
 const char* ipport;
 int f_rank = 0;
 int f_npu = 0;
-const char* test_type_str;
 
 aclshmemx_uniqueid_t default_flag_uid;
 
-// NPU频率 (MHz)，用于转换cycles到时间
+// NPU频率 (MHz)
 const double NPU_FREQ_MHZ = 1000.0;
 
 // 初始化ACL和SHMEM
@@ -79,7 +82,6 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     aclshmemx_init_attr_t attributes;
     test_set_attr(rank, world_size, mem_size, ipport, default_flag_uid, &attributes);
 
-    // 根据engine类型设置通信引擎
     switch (engine) {
         case EngineType::RDMA:
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
@@ -100,7 +102,6 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     return status;
 }
 
-// 清理环境
 void finalize_environment(int rank) {
     int32_t device_id = rank % g_npus + f_npu;
     aclshmem_finalize();
@@ -108,26 +109,22 @@ void finalize_environment(int rank) {
     aclFinalize();
 }
 
-// ========== RDMA PingPong测试 ==========<
+// ========== RDMA PingPong测试 ==========
 StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                          uint8_t* gva, size_t msg_size,
                                          int iterations, int warmup) {
-    // 分配结果缓冲区
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
     aclrtMalloc(&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
-    // 调用kernel
     launch_rdma_pingpong_latency(1, stream, ffts_config, gva,
                                   msg_size, iterations, warmup, result_buffer);
     aclrtSynchronizeStream(stream);
 
-    // 读取结果
     int64_t* host_result;
     aclrtMallocHost((void**)&host_result, result_size);
     aclrtMemcpy(host_result, result_size, result_buffer, result_size, ACL_MEMCPY_DEVICE_TO_HOST);
 
-    // 转换cycles到微秒，并计算统计结果
     std::vector<double> latencies;
     for (int i = 0; i < iterations; i++) {
         double latency_us = cycles_to_us(host_result[i], NPU_FREQ_MHZ);
@@ -140,7 +137,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     return compute_stats(latencies);
 }
 
-// ========== RDMA带宽测试 ==========<
+// ========== RDMA带宽测试 ==========
 StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                  uint8_t* gva, size_t msg_size, int iterations) {
     uint8_t* result_buffer;
@@ -153,18 +150,16 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
     aclrtMallocHost((void**)&host_result, sizeof(int64_t));
     aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
-    // 计算带宽
     double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
     double bw_gb_s = compute_bandwidth(msg_size * iterations, total_time_us);
 
     aclrtFreeHost(host_result);
     aclrtFree(result_buffer);
 
-    // 带宽测试返回单值，没有std等
     return {bw_gb_s, 0, bw_gb_s, bw_gb_s, bw_gb_s};
 }
 
-// ========== MTE PingPong测试 ==========<
+// ========== MTE PingPong测试 ==========
 StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                        uint8_t* gva, size_t msg_size,
                                        int iterations, int warmup) {
@@ -192,7 +187,7 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     return compute_stats(latencies);
 }
 
-// ========== MTE带宽测试 ==========<
+// ========== MTE带宽测试 ==========
 StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                 uint8_t* gva, size_t msg_size, int iterations) {
     uint8_t* result_buffer;
@@ -214,7 +209,7 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
     return {bw_gb_s, 0, bw_gb_s, bw_gb_s, bw_gb_s};
 }
 
-// ========== CPU中转测试 ==========<
+// ========== CPU中转测试 ==========
 StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iterations, int warmup) {
     std::vector<double> latencies;
 
@@ -223,22 +218,17 @@ StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iteration
     aclrtMalloc(&device_buf, msg_size, ACL_MEM_MALLOC_HUGE_FIRST);
     aclrtMallocHost(&host_buf, msg_size);
 
-    // 初始化数据
     memset(host_buf, 0xAA, msg_size);
 
-    // Warmup
     for (int i = 0; i < warmup; i++) {
         aclrtMemcpy(host_buf, msg_size, device_buf, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
         aclrtMemcpy(device_buf, msg_size, host_buf, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
     }
 
-    // 正式测试: D2H + H2D往返时间
     for (int i = 0; i < iterations; i++) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        // D2H
         aclrtMemcpy(host_buf, msg_size, device_buf, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
-        // H2D
         aclrtMemcpy(device_buf, msg_size, host_buf, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -252,14 +242,13 @@ StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iteration
     return compute_stats(latencies);
 }
 
-// ========== 通信隐藏测试 ==========<
+// ========== 通信隐藏测试 ==========
 double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
                          uint8_t* gva, size_t msg_size, int iterations,
                          ComputeConfig compute_cfg) {
     uint8_t* result_buffer;
     aclrtMalloc(&result_buffer, iterations * sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
-    // 分配MatMul缓冲区
     uint8_t* matmul_A, *matmul_B, *matmul_C;
     size_t A_size = compute_cfg.M * compute_cfg.K * sizeof(float);
     size_t B_size = compute_cfg.K * compute_cfg.N * sizeof(float);
@@ -294,41 +283,38 @@ double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
     return avg_overlap_time;
 }
 
-// ========== 主测试流程 ==========<
+// ========== 主测试流程 ==========
 int run_benchmark(int rank, int world_size) {
-    uint64_t mem_size = 256UL * 1024UL * 1024UL;  // 256MB对称内存
+    uint64_t mem_size = 256UL * 1024UL * 1024UL;
 
-    // 创建CSV输出文件
     CSVWriter latency_csv("results/latency_results.csv");
     CSVWriter bandwidth_csv("results/bandwidth_results.csv");
     CSVWriter hidden_csv("results/hidden_results.csv");
 
-    // 测试的引擎类型
     std::vector<EngineType> engines = {
         EngineType::RDMA,
         EngineType::MTE,
-        // EngineType::SDMA,  // SDMA可选
     };
 
     std::cout << "\n==================== Comm Benchmark ====================\n";
     std::cout << "Mode: " << BENCHMARK_MODE_NAME << "\n";
+    std::cout << "HCCL: " << BENCHMARK_HCCL_MODE_NAME << "\n";
     std::cout << "Rank: " << rank << ", WorldSize: " << world_size << "\n";
     print_separator();
 
+    // ========== RDMA/MTE测试 ==========
     for (EngineType engine : engines) {
         std::cout << "\n---------- Testing Engine: " << engine_name(engine) << " ----------\n";
 
-        // 初始化环境
         init_environment(rank, world_size, mem_size, engine);
         aclrtStream stream = nullptr;
         aclrtCreateStream(&stream);
 
         uint64_t ffts_config = util_get_ffts_config();
 
-        // 分配对称内存
         uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
 
-        // ========== 延迟测试 ==========<
+        // PingPong延迟测试
         std::cout << "\n[PingPong Latency Test]\n";
         for (size_t msg_size : MSG_SIZES) {
             int iterations = get_iterations(msg_size);
@@ -351,10 +337,10 @@ int run_benchmark(int rank, int world_size) {
                                    msg_size, iterations, result);
         }
 
-        // ========== 带宽测试 ==========<
+        // 带宽测试
         std::cout << "\n[Bandwidth Test]\n";
         for (size_t msg_size : MSG_SIZES) {
-            if (msg_size < 64 * 1024) continue;  // 小消息不做带宽测试
+            if (msg_size < 64 * 1024) continue;
 
             int iterations = (msg_size <= 8 * 1024 * 1024) ? 1000 : 100;
 
@@ -373,11 +359,11 @@ int run_benchmark(int rank, int world_size) {
                                       msg_size, iterations, result);
         }
 
-        // ========== 通信隐藏测试 ==========<
+        // 通信隐藏测试
         std::cout << "\n[Hidden Communication Test]\n";
-        if (rank == 0) {  // 只在rank0测试
+        if (rank == 0) {
             for (size_t msg_size : MSG_SIZES) {
-                if (msg_size < 256 * 1024) continue;  // 中大消息才测隐藏效果
+                if (msg_size < 256 * 1024) continue;
 
                 int iterations = (msg_size <= 8 * 1024 * 1024) ? 100 : 20;
                 ComputeConfig compute_cfg = match_compute(msg_size);
@@ -386,7 +372,6 @@ int run_benchmark(int rank, int world_size) {
                           << ", Compute: " << compute_cfg.M << "x" << compute_cfg.K << "x" << compute_cfg.N
                           << "\n";
 
-                // 测试纯通信时间
                 StatsResult comm_result;
                 if (engine == EngineType::RDMA) {
                     comm_result = test_rdma_pingpong_latency(stream, ffts_config, gva,
@@ -397,11 +382,9 @@ int run_benchmark(int rank, int world_size) {
                 }
                 double comm_time = comm_result.mean;
 
-                // 测试通信+计算重叠时间
                 double overlap_time = test_hidden_comm(stream, ffts_config, gva,
                                                         msg_size, iterations, compute_cfg);
 
-                // 计算隐藏率
                 double hidden_rate = 100.0 * (1.0 - overlap_time / (comm_time * 2));
 
                 std::cout << "CommTime: " << comm_time << " us"
@@ -418,7 +401,7 @@ int run_benchmark(int rank, int world_size) {
         finalize_environment(rank);
     }
 
-    // ========== CPU中转测试 ==========<
+    // ========== CPU中转测试 ==========
     std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
     init_environment(rank, world_size, mem_size, EngineType::RDMA);
     aclrtStream stream = nullptr;
@@ -437,17 +420,16 @@ int run_benchmark(int rank, int world_size) {
     aclrtDestroyStream(stream);
     finalize_environment(rank);
 
-    // ========== HCCL测试 ==========<
+// ========== HCCL测试（条件编译） ==========
+#ifdef ENABLE_HCCL
     std::cout << "\n---------- Testing Engine: HCCL ----------\n";
     std::cout << "[HCCL] Huawei Collective Communication Library Test\n";
 
-    // 初始化HCCL环境
     int32_t device_id = rank % g_npus + f_npu;
     aclrtSetDevice(device_id);
     aclrtStream hccl_stream = nullptr;
     aclrtCreateStream(&hccl_stream);
 
-    // 初始化HCCL通信域
     HcclComm hccl_comm = nullptr;
     HcclRootInfo root_info;
 
@@ -455,14 +437,12 @@ int run_benchmark(int rank, int world_size) {
         HcclGetRootInfo(&root_info);
     }
 
-    // 实际场景需要广播root_info，这里简化处理
-    // 创建HCCL通信域
     HcclCommInitClusterInfo(rank, world_size, &root_info, &hccl_comm);
 
     std::cout << "[HCCL] Rank " << HcclGetRankId(hccl_comm)
               << " of " << HcclGetRankSize(hccl_comm) << " initialized\n";
 
-    // ========== HCCL PingPong延迟测试 ==========<
+    // HCCL PingPong延迟测试
     std::cout << "\n[HCCL PingPong Latency Test]\n";
     uint32_t hccl_peer = (rank == 0) ? 1 : 0;
 
@@ -472,7 +452,6 @@ int run_benchmark(int rank, int world_size) {
 
         std::cout << "MsgSize: " << msg_size << " bytes, Iterations: " << iterations << "\n";
 
-        // 分配Device内存
         void* send_buf;
         void* recv_buf;
         aclrtMalloc(&send_buf, msg_size, ACL_MEM_MALLOC_HUGE_FIRST);
@@ -480,35 +459,33 @@ int run_benchmark(int rank, int world_size) {
 
         std::vector<double> latencies;
 
-        // Warmup
         for (int i = 0; i < warmup; i++) {
             if (rank == 0) {
-                HcclSend(send_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclSend(send_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
-                HcclRecv(recv_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclRecv(recv_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
             } else {
-                HcclRecv(recv_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclRecv(recv_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
-                HcclSend(send_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclSend(send_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
             }
             aclrtSynchronizeStream(hccl_stream);
         }
 
-        // 正式测试
         for (int i = 0; i < iterations; i++) {
             auto start = std::chrono::high_resolution_clock::now();
 
             if (rank == 0) {
-                HcclSend(send_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclSend(send_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
-                HcclRecv(recv_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclRecv(recv_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
             } else {
-                HcclRecv(recv_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclRecv(recv_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
-                HcclSend(send_buf, msg_size / sizeof(uint8_t), HcclDataType::HCCL_DATA_TYPE_UINT8,
+                HcclSend(send_buf, msg_size, HcclDataType::HCCL_DATA_TYPE_UINT8,
                          hccl_peer, hccl_comm, hccl_stream);
             }
             aclrtSynchronizeStream(hccl_stream);
@@ -526,26 +503,22 @@ int run_benchmark(int rank, int world_size) {
         aclrtFree(recv_buf);
     }
 
-    // ========== HCCL带宽测试 (AllReduce) ==========<
+    // HCCL AllReduce带宽测试
     std::cout << "\n[HCCL AllReduce Bandwidth Test]\n";
     for (size_t msg_size : MSG_SIZES) {
-        if (msg_size < 64 * 1024) continue;  // 小消息不做带宽测试
+        if (msg_size < 64 * 1024) continue;
 
         int iterations = (msg_size <= 8 * 1024 * 1024) ? 1000 : 100;
-
-        std::cout << "MsgSize: " << msg_size << " bytes, Iterations: " << iterations << "\n";
 
         void* buf;
         aclrtMalloc(&buf, msg_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
-        // Warmup
         for (int i = 0; i < 10; i++) {
             HcclAllReduce(buf, buf, msg_size / sizeof(float), HcclDataType::HCCL_DATA_TYPE_FLOAT,
                          HcclReduceOp::HCCL_REDUCE_SUM, hccl_comm, hccl_stream);
         }
         aclrtSynchronizeStream(hccl_stream);
 
-        // 正式测试
         auto start = std::chrono::high_resolution_clock::now();
         for (int i = 0; i < iterations; i++) {
             HcclAllReduce(buf, buf, msg_size / sizeof(float), HcclDataType::HCCL_DATA_TYPE_FLOAT,
@@ -564,7 +537,7 @@ int run_benchmark(int rank, int world_size) {
         aclrtFree(buf);
     }
 
-    // ========== HCCL AllGather测试 ==========<
+    // HCCL AllGather测试
     std::cout << "\n[HCCL AllGather Bandwidth Test]\n";
     for (size_t msg_size : MSG_SIZES) {
         if (msg_size < 64 * 1024) continue;
@@ -596,7 +569,7 @@ int run_benchmark(int rank, int world_size) {
         aclrtFree(recv_buf);
     }
 
-    // ========== HCCL ReduceScatter测试 ==========<
+    // HCCL ReduceScatter测试
     std::cout << "\n[HCCL ReduceScatter Bandwidth Test]\n";
     for (size_t msg_size : MSG_SIZES) {
         if (msg_size < 64 * 1024) continue;
@@ -629,10 +602,13 @@ int run_benchmark(int rank, int world_size) {
         aclrtFree(recv_buf);
     }
 
-    // 清理HCCL
     HcclCommDestroy(hccl_comm);
     aclrtDestroyStream(hccl_stream);
     aclrtResetDevice(device_id);
+#else
+    std::cout << "\n---------- HCCL Test Skipped ----------\n";
+    std::cout << "[INFO] HCCL not enabled. Define ENABLE_HCCL in benchmark_config.h to enable.\n";
+#endif
 
     std::cout << "\n==================== Benchmark Complete ====================\n";
     std::cout << "Results saved to results/ directory\n";
@@ -660,6 +636,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\n[Benchmark Mode] " << BENCHMARK_MODE_NAME << "\n";
+    std::cout << "[HCCL Status] " << BENCHMARK_HCCL_MODE_NAME << "\n";
 
     int status = run_benchmark(rank_id, n_ranks);
 

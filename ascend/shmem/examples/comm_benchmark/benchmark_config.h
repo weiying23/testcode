@@ -13,7 +13,6 @@
 namespace benchmark {
 
 // ========== MPI开关配置 ==========
-// 定义 ENABLE_MPI 宏来启用MPI模式
 // 默认关闭MPI，使用socket模式进行进程间通信
 // 取消下面注释以启用MPI:
 // #define ENABLE_MPI
@@ -24,6 +23,18 @@ namespace benchmark {
 #else
 #define BENCHMARK_INIT_FLAG ACLSHMEMX_INIT_WITH_DEFAULT
 #define BENCHMARK_MODE_NAME "Socket Mode (No MPI)"
+#endif
+
+// ========== HCCL开关配置 ==========
+// HCCL需要CANN环境支持，取消注释启用HCCL测试
+// #define ENABLE_HCCL
+
+#ifdef ENABLE_HCCL
+#define BENCHMARK_HCCL_AVAILABLE 1
+#define BENCHMARK_HCCL_MODE_NAME "HCCL Enabled"
+#else
+#define BENCHMARK_HCCL_AVAILABLE 0
+#define BENCHMARK_HCCL_MODE_NAME "HCCL Disabled (No HCCL Library)"
 #endif
 
 // ========== 消息大小配置 ==========
@@ -49,13 +60,9 @@ const std::vector<size_t> MSG_SIZES = get_msg_sizes();
 
 // ========== 迭代次数配置 ==========
 inline int get_iterations(size_t msg_size) {
-    if (msg_size <= 256 * 1024) {
-        return 10000;
-    } else if (msg_size <= 8 * 1024 * 1024) {
-        return 1000;
-    } else {
-        return 100;
-    }
+    if (msg_size <= 256 * 1024) return 10000;
+    else if (msg_size <= 8 * 1024 * 1024) return 1000;
+    else return 100;
 }
 
 inline int get_warmup_iterations(size_t msg_size) {
@@ -67,10 +74,10 @@ inline int get_warmup_iterations(size_t msg_size) {
 
 // ========== 通信引擎类型 ==========
 enum class EngineType {
-    RDMA,       // RoCE RDMA通信
-    MTE,        // MTE引擎 (同节点最优)
-    SDMA,       // 系统DMA
-    CPU_D2H_H2D // CPU中转 (Host拷贝)
+    RDMA,
+    MTE,
+    SDMA,
+    CPU_D2H_H2D
 };
 
 inline std::string engine_name(EngineType type) {
