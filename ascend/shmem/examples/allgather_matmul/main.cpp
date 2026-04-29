@@ -84,7 +84,11 @@ void ShmemAllGatherMatmul(
     using ArchTag = Catlass::Arch::AtlasA2;
 
     // Prepare comm address
+    // aclshmem_my_pe(): 获取当前PE编号（在Kernel内调用）
+    // 返回当前进程在通信组中的编号，用于确定数据分片位置
     uint32_t pe = aclshmem_my_pe();
+    // aclshmem_n_pes(): 获取通信组中的总PE数量
+    // 用于计算矩阵分块和数据分布
     uint32_t peSize = aclshmem_n_pes();
 
     Catlass::GemmCoord problemShape{m, n, k};
@@ -255,8 +259,12 @@ int main(int argc, char **argv)
     status = aclrtSetDevice(device_id);
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
+    // test_set_attr: 填充初始化属性（PE编号、进程数、内存大小、rendezvous地址）
     test_set_attr(pe_id, n_pes, local_mem_size, ipport.c_str(), default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
+    // 初始化后可以使用对称内存和通信操作
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     // ACLStream init
@@ -290,6 +298,9 @@ int main(int argc, char **argv)
     uint8_t *cHost;
     ACL_CHECK(aclrtMallocHost(reinterpret_cast<void**>(&cHost), cSize));
 
+    // aclshmem_malloc: 分配对称内存（用于通信数据缓冲区）
+    // 参数: (204 * 1024 * 1024) * sizeof(__fp16) - 约400MB的对称内存
+    // 对称内存用于AllGather操作的数据交换
     void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *gmSymmetric = (uint8_t *)symmPtr;
 
@@ -322,6 +333,8 @@ int main(int argc, char **argv)
         std::printf("test finished\n");
     }
 
+    // aclshmem_free: 释放对称内存
+    // 必须与aclshmem_malloc配对使用
     aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
@@ -333,6 +346,8 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
+    // aclshmem_finalize: 终止shmem运行时
+    // 释放所有shmem资源，包括通信通道、内部状态等
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

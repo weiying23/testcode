@@ -76,7 +76,9 @@ void ShmemAllGatherMatmulWithGatherResult(
     using ArchTag = Catlass::Arch::AtlasA2;
 
     // Prepare comm address
+    // aclshmem_my_pe(): 获取当前PE编号（在Kernel内调用）
     uint32_t pe = aclshmem_my_pe();
+    // aclshmem_n_pes(): 获取总PE数量
     uint32_t peSize = aclshmem_n_pes();
 
     Catlass::GemmCoord problemShape{m, n, k};
@@ -271,8 +273,10 @@ int main(int argc, char **argv)
     status = aclrtSetDevice(device_id);
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipPort.c_str(), default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     // ACLStream init
@@ -310,6 +314,8 @@ int main(int argc, char **argv)
     uint8_t *gatherAHost;
     ACL_CHECK(aclrtMallocHost(reinterpret_cast<void**>(&gatherAHost), gatherASize));
 
+    // aclshmem_malloc: 分配对称内存（用于AllGather通信缓冲区）
+    // 参数: (204 * 1024 * 1024) * sizeof(__fp16) - 约400MB对称内存
     void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *gmSymmetric = (uint8_t *)symmPtr;
 
@@ -334,6 +340,7 @@ int main(int argc, char **argv)
         std::printf("test finished\n");
     }
 
+    // aclshmem_free: 释放对称内存
     aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
@@ -347,6 +354,7 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
+    // aclshmem_finalize: 终止shmem运行时
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

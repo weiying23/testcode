@@ -65,6 +65,8 @@ int test_aclshmem_kv_shuffle(int pe_id, int n_pes)
     aclrtMallocHost(reinterpret_cast<void **>(&k_cache_host), kv_cache_size);
     inputFile = "../../examples/kv_shuffle/scripts/output/k_cache_input_pe_" + std::to_string(pe_id) + ".bin";
     ReadFile(inputFile, k_cache_host, kv_cache_size);
+    // aclshmem_malloc: 分配对称内存（用于KV Cache数据通信）
+    // KV Shuffle需要在对称内存中存储KV Cache以便跨PE传输
     void *k_cache_ptr = aclshmem_malloc(kv_cache_size);
     aclrtMemcpy(k_cache_ptr, kv_cache_size, k_cache_host, kv_cache_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
@@ -73,6 +75,7 @@ int test_aclshmem_kv_shuffle(int pe_id, int n_pes)
     aclrtMallocHost(reinterpret_cast<void **>(&v_cache_host), kv_cache_size);
     inputFile = "../../examples/kv_shuffle/scripts/output/v_cache_input_pe_" + std::to_string(pe_id) + ".bin";
     ReadFile(inputFile, v_cache_host, kv_cache_size);
+    // aclshmem_malloc: 分配对称内存（用于V Cache数据）
     void *v_cache_ptr = aclshmem_malloc(kv_cache_size);
     aclrtMemcpy(v_cache_ptr, kv_cache_size, v_cache_host, kv_cache_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
@@ -158,6 +161,7 @@ int test_aclshmem_kv_shuffle(int pe_id, int n_pes)
     outputFile = "../../examples/kv_shuffle/scripts/output/v_cache_output_pe_" + std::to_string(pe_id) + ".bin";
     WriteFile(outputFile, v_output_host, kv_cache_size);
 
+    // aclshmem_free: 释放对称内存（KV Cache）
     aclshmem_free(k_cache_ptr);
     aclshmem_free(v_cache_ptr);
     aclrtFree(global_shuffle_table_ptr);
@@ -198,13 +202,16 @@ int main(int argc, char *argv[])
     status = aclrtSetDevice(device_id);
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
 
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     status = test_aclshmem_kv_shuffle(pe_id, n_pes);
 
+    // aclshmem_finalize: 终止shmem运行时
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

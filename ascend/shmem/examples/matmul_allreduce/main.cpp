@@ -72,6 +72,7 @@ void ShmemMatmulAllReduce(
     using ArchTag = Catlass::Arch::AtlasA2;
 
     uint32_t peIdx = aclshmem_my_pe();
+    // aclshmem_n_pes(): 获取总PE数量，用于ReduceScatter分块计算
     uint32_t peSize = aclshmem_n_pes();
 
     Catlass::GemmCoord problemShape{m, n, k};
@@ -254,9 +255,11 @@ int main(int argc, char **argv)
     status = aclrtSetDevice(device_id);
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipPort.c_str(), default_flag_uid, &attributes);
 
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
 
@@ -289,6 +292,8 @@ int main(int argc, char **argv)
     aclrtMemset(dHost, dSize, 0, dSize);  // 零初始化 C 矩阵
     ACL_CHECK(aclrtMemcpy(dDevice, dSize, dHost, dSize, ACL_MEMCPY_HOST_TO_DEVICE));
 
+    // aclshmem_malloc: 分配对称内存（用于ReduceScatter/AllGather通信缓冲区）
+    // 参数: (204 * 1024 * 1024) * sizeof(__fp16) - 约400MB对称内存
     void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *symmetricPtr = reinterpret_cast<uint8_t *>(symmPtr);
 
@@ -305,6 +310,8 @@ int main(int argc, char **argv)
     ACL_CHECK(aclrtSynchronizeStream(stream));
     std::cout << "After calling MM_AR kernel " << std::endl;
 
+    // aclshmemx_show_prof: 显示性能统计信息（可选调试功能）
+    // 参数: nullptr(默认输出), true(启用输出)
     aclshmemx_show_prof(nullptr, true);
 
     if (pe_id == 0) {
@@ -313,6 +320,7 @@ int main(int argc, char **argv)
         std::printf("test finished\n");
     }
 
+    // aclshmem_free: 释放对称内存
     aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
@@ -324,6 +332,7 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
+    // aclshmem_finalize: 终止shmem运行时
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

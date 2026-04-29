@@ -218,8 +218,10 @@ int main(int argc, char **argv)
     ACL_CHECK(aclrtCreateStream(&stream));
     // status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipPort.c_str(), default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     uint64_t fftsAddr{0};
@@ -352,6 +354,8 @@ int main(int argc, char **argv)
             wADevice = gatherADevice;
         }
 
+        // aclshmem_malloc: 分配对称内存（用于通信数据缓冲区）
+        // ACLSHMEM_BUFF_BYTES是预定义的缓冲区大小常量
         void *symmPtr = aclshmem_malloc(ACLSHMEM_BUFF_BYTES);
         uint8_t *gmSymmetric = (uint8_t *)symmPtr;
 
@@ -429,6 +433,7 @@ int main(int argc, char **argv)
             std::printf("M: %d, K: %d, N: %d aclrtSynchronizeStream success!\n", cocTiling.m, cocTiling.k, cocTiling.n);
         }
 
+        // aclshmem_free: 释放对称内存
         aclshmem_free(symmPtr);
 
         if (data_file != "") {
@@ -449,6 +454,7 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
+    // aclshmem_finalize: 终止shmem运行时
     status = aclshmem_finalize();
     status = aclrtResetDevice(deviceId);
     status = aclFinalize();

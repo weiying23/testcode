@@ -150,6 +150,7 @@ public:
 
         // Prepare comm address
         uint32_t rank = aclshmem_my_pe();
+        // aclshmem_n_pes(): 获取总PE数量，用于MoE专家分布计算
         uint32_t rankSize = aclshmem_n_pes();
 
         using LayoutA = layout::RowMajor;
@@ -306,8 +307,10 @@ int main(int argc, char **argv)
 
     // status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(rank_id, n_ranks, local_mem_size, ipport.c_str(), default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     uint32_t m = atoi(argv[5]);
@@ -423,6 +426,8 @@ int main(int argc, char **argv)
 
     ACL_CHECK(aclrtMalloc(reinterpret_cast<void**>(&ptrWorkspace), workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST));
     int32_t aclshmem_size = (504 * 1024 * 1024) * sizeof(__fp16);
+    // aclshmem_malloc: 分配对称内存（用于Dispatch GMM通信缓冲区）
+    // MoE专家分发需要对称内存来存储中间结果
     void *symmPtr = aclshmem_malloc(aclshmem_size);
     uint8_t *symmetricPtr = (uint8_t *) symmPtr;
 
@@ -462,6 +467,7 @@ int main(int argc, char **argv)
     if (rank_id == 0) {
         std::printf("\ntest finished\n");
     }
+    // aclshmem_free: 释放对称内存
     aclshmem_free(symmPtr);
     ACL_CHECK(aclrtFreeHost(b1Host));
     ACL_CHECK(aclrtFreeHost(b2Host));
@@ -474,6 +480,7 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
+    // aclshmem_finalize: 终止shmem运行时
     status = aclshmem_finalize();
     status = aclrtResetDevice(deviceId);
     status = aclFinalize();

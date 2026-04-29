@@ -37,12 +37,21 @@ extern "C" __global__ __aicore__ void kernel_test(__gm__ int* input, __gm__ int*
     }
 
     int mype = aclshmem_my_pe();
+    // aclshmem_n_pes(): 获取总PE数量
     int npes = aclshmem_n_pes();
     int peer = (mype + 1) % npes;
 
     for (int iii = 0; iii < 10; iii++) {
+        // aclshmem_int32_p: 对int32类型数据的Put操作（发送到目标PE）
+        // 参数: input(数据地址), value(要发送的值), pe(目标PE编号)
+        // 将peer值发送到peer PE的input地址
         aclshmem_int32_p(input, peer, peer);
+        // aclshmem_quiet: 等待所有shmem操作完成
+        // 确保Put操作完成后才能进行Get
         aclshmem_quiet();
+        // aclshmem_int32_g: 对int32类型数据的Get操作（从目标PE获取数据）
+        // 参数: input(目标地址), pe(目标PE编号)
+        // 返回从peer PE获取的值
         auto get_num = aclshmem_int32_g(input, peer);
         aclshmem_quiet();
         *(output ) = get_num;
@@ -73,11 +82,16 @@ int test_aclshmem_rma_scalar_8p(int my_pe, int n_pes)
     *output_host = my_pe;
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(my_pe, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     auto status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
     ACL_CHECK_WITH_RET(status, ERROR_LOG("aclshmemx_init_attr failed"), return -1);
 
+    // aclshmemx_malloc: 分配对称内存（带HOST_SIDE参数，从Host端分配）
+    // 参数: size(内存大小), side(分配端：HOST_SIDE或DEVICE_SIDE)
+    // HOST_SIDE表示在Host端分配对称内存
     uint8_t *input = (uint8_t*)aclshmemx_malloc(2*1024*1024, HOST_SIDE);
     uint8_t *output = nullptr;
     ACL_CHECK_WITH_RET(aclrtMalloc((void **)&output, sizeof(int), ACL_MEM_MALLOC_HUGE_FIRST),
@@ -87,10 +101,12 @@ int test_aclshmem_rma_scalar_8p(int my_pe, int n_pes)
     ACL_CHECK_WITH_RET(aclrtMemcpy(output, sizeof(int), output_host, sizeof(int), ACL_MEMCPY_HOST_TO_DEVICE),
         ERROR_LOG("aclrtMemcpy failed"), return -1);
 
+    // aclshmem_barrier_all: 全局屏障同步，确保所有PE数据初始化完成
     aclshmem_barrier_all();
     run_demo_scalar(1, stream, (int*)input, (int*)output);
 
     ACL_CHECK_WITH_RET(aclrtSynchronizeStream(stream), ERROR_LOG("aclrtSynchronizeStream failed"), return -1);
+    // aclshmem_barrier_all: 全局屏障同步，确保所有PE的RMA操作完成
     aclshmem_barrier_all();
 
     ACL_CHECK_WITH_RET(aclrtMemcpy(input_host, sizeof(int), input, sizeof(int), ACL_MEMCPY_DEVICE_TO_HOST),
@@ -105,7 +121,9 @@ int test_aclshmem_rma_scalar_8p(int my_pe, int n_pes)
         printf("[ERROR] run result incorrect in pe %d\n", my_pe);  // 期望input变为前卡, output变为后卡
     }
 
+    // aclshmemx_free: 释放对称内存（带HOST_SIDE参数）
     aclshmemx_free(input, HOST_SIDE);
+    // aclshmem_finalize: 终止shmem运行时
     aclshmem_finalize();
     ACL_CHECK_WITH_RET(aclrtFreeHost(input_host), ERROR_LOG("aclrtFreeHost failed"), return -1);
     ACL_CHECK_WITH_RET(aclrtFreeHost(output_host), ERROR_LOG("aclrtFreeHost failed"), return -1);
