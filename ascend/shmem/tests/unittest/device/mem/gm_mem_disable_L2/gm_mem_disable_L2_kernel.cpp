@@ -1,16 +1,16 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #undef L2_CACHE_HINT
 #include "kernel_operator.h"
 
-#include "shmem_api.h"
+#include "shmem.h"
 
 const int length = 16;
 const int ub_size = 256;
@@ -29,32 +29,32 @@ public:
         src_gm.SetGlobalBuffer(dev_gm);
         dst_gm.SetGlobalBuffer(gva_gm);
 
-        rank = shmem_my_pe();
-        rank_size = shmem_n_pes();
+        rank = aclshmem_my_pe();
+        rank_size = aclshmem_n_pes();
 
         /* 1x4096 Bytes Buffer */
         pipe.InitBuffer(buf_queue, 1, buffer_bytes);
     }
     __aicore__ inline void Process(uint64_t config)
     {
-        shmemx_set_ffts_config(config);
+        util_set_ffts_config(config);
         AscendC::LocalTensor<int8_t> buf_tensor = buf_queue.AllocTensor<int8_t>();
         uintptr_t addr = static_cast<uintptr_t>(buf_tensor.address_.bufferAddr);
         __ubuf__ int8_t *buf = (__ubuf__ int8_t *)addr;
-        shmem_mte_put_mem_nbi(gva_gm, dev_gm, buf, (uint32_t)ub_size, rank_size * length / 4U, rank, EVENT_ID0);
+        aclshmemx_mte_put_nbi(gva_gm, dev_gm, buf, (uint32_t)ub_size, rank_size * length / 4U, rank, EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        shmem_mte_put_mem_nbi(dst_gm[rank_size * length / 4U], src_gm[rank_size * length / 4U], buf_tensor,
+        aclshmemx_mte_put_nbi(dst_gm[rank_size * length / 4U], src_gm[rank_size * length / 4U], buf_tensor,
             rank_size * length / 4U, rank, EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        shmemx_mte_put_mem_nbi(gva_gm + rank_size * length / 2U, dev_gm + rank_size * length / 2U,
+        aclshmemx_mte_put_nbi(gva_gm + rank_size * length / 2U, dev_gm + rank_size * length / 2U,
             rank_size * length / 4U, rank, false);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-        shmemx_mte_put_mem_nbi(gva_gm + rank_size * length * 3U / 4U, dev_gm + rank_size * length * 3U / 4U,
+        aclshmemx_mte_put_nbi(gva_gm + rank_size * length * 3U / 4U, dev_gm + rank_size * length * 3U / 4U,
             rank_size * length / 4U, rank, false);
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
         buf_queue.FreeTensor(buf_tensor);
     }
 private:
@@ -95,40 +95,40 @@ public:
         src_gm.SetGlobalBuffer(gva_gm);
         dst_gm.SetGlobalBuffer(dev_gm);
 
-        rank = shmem_my_pe();
-        rank_size = shmem_n_pes();
+        rank = aclshmem_my_pe();
+        rank_size = aclshmem_n_pes();
 
         /* 1x4096 Bytes Buffer */
         pipe.InitBuffer(buf_queue, 1, buffer_bytes);
     }
     __aicore__ inline void Process(uint64_t config)
     {
-        shmemx_set_ffts_config(config);
+        util_set_ffts_config(config);
         AscendC::LocalTensor<int8_t> buf_tensor = buf_queue.AllocTensor<int8_t>();
         uintptr_t addr = static_cast<uintptr_t>(buf_tensor.address_.bufferAddr);
         __ubuf__ int8_t *buf = (__ubuf__ int8_t *)addr;
 
         for (int i = 0; i < rank_size / 2U; i++) {
-            shmem_mte_get_mem_nbi(dev_gm + length * i, gva_gm, buf, (uint32_t)ub_size,
+            aclshmemx_mte_get_nbi(dev_gm + length * i, gva_gm, buf, (uint32_t)ub_size,
                 length / 2U, i % rank_size, EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            shmem_mte_get_mem_nbi(dst_gm[length * i + length / 2U], src_gm, buf_tensor,
+            aclshmemx_mte_get_nbi(dst_gm[length * i + length / 2U], src_gm, buf_tensor,
                 length / 2U, i % rank_size, EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
 
         for (int i = rank_size / 2U; i < rank_size; i++) {
-            shmemx_mte_get_mem_nbi(dev_gm + length * i, gva_gm, length, i % rank_size, true);
+            aclshmemx_mte_get_nbi(dev_gm + length * i, gva_gm, length, i % rank_size, true);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            shmemx_mte_get_mem_nbi(dev_gm + length * i + length / 2U, gva_gm, length / 2U, i % rank_size, true);
+            aclshmemx_mte_get_nbi(dev_gm + length * i + length / 2U, gva_gm, length / 2U, i % rank_size, true);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
 
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
         buf_queue.FreeTensor(buf_tensor);
     }
 private:

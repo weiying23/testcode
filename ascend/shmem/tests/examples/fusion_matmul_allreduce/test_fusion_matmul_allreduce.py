@@ -1,12 +1,12 @@
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 import hashlib
 import random
 from functools import reduce
@@ -247,9 +247,9 @@ def test_fusion_matmul_allreduce(case_params):
         p.join()
         assert p.exitcode == 0
 
-    shmem_output_path = os.path.join(data_dir, "shmem_output.bin")
-    shmem_result_data = np.fromfile(shmem_output_path, dtype=numpy_dtype)
-    act = shmem_result_data.reshape(-1)
+    aclshmem_output_path = os.path.join(data_dir, "aclshmem_output.bin")
+    aclshmem_result_data = np.fromfile(aclshmem_output_path, dtype=numpy_dtype)
+    act = aclshmem_result_data.reshape(-1)
 
     # 计算次数公式：每个rank做矩阵乘法 + AllReduce累加
     # MatMul: world_size * m * k * n (每个rank的矩阵乘法)
@@ -263,7 +263,7 @@ def test_fusion_matmul_allreduce(case_params):
                 np.abs(gt[rel_err_check_mask]) + 1e-7
         )
         max_re = re.max().item()
-        assert max_re <= err, f"Relative error check failed for {shmem_output_path}!"
+        assert max_re <= err, f"Relative error check failed for {aclshmem_output_path}!"
         "Max RE = {max_re:.4e} > threshold ({err:.4e})"
 
     # Mask for absolute error check: |golden| < 1.0
@@ -271,5 +271,5 @@ def test_fusion_matmul_allreduce(case_params):
     if abs_err_check_mask.any():
         ae = np.abs(act[abs_err_check_mask] - gt[abs_err_check_mask])
         max_ae = ae.max().item()
-        assert max_ae <= err, f"Absolute error check failed for {shmem_output_path}! "
+        assert max_ae <= err, f"Absolute error check failed for {aclshmem_output_path}! "
         "Max AE = {max_ae:.4e} > threshold ({err:.4e})"

@@ -1,12 +1,12 @@
-#
-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 from enum import IntEnum
 import numpy as np
 import torch
@@ -45,14 +45,14 @@ class DataType(IntEnum):
 
 def tensor_to_file(tensor: torch.Tensor, file_name: str) -> None:
     if tensor.dtype == torch.bfloat16:
-        tensor.view(torch.uint16).numpy().tofile(file_name)
+        tensor.to(torch.float32).numpy().tofile(file_name)
     else:
         tensor.numpy().tofile(file_name)
 
 
 def tensor_from_file(file_name: str, dtype: torch.dtype) -> torch.Tensor:
     if dtype == torch.bfloat16:
-        return torch.from_numpy(np.fromfile(file_name, dtype=np.float16)).view(torch.bfloat16)
+        return torch.from_numpy(np.fromfile(file_name, dtype=np.float32)).to(torch.bfloat16)
     else:
         numpy_dtype = torch.empty(0, dtype=dtype).numpy().dtype
         return torch.from_numpy(np.fromfile(file_name, numpy_dtype))

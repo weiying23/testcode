@@ -25,7 +25,7 @@
   - Atlas 800I A2/A3 系列产品
   - Atlas 800T A2/A3 系列产品
 - 平台：aarch64/x86
-- 配套软件：驱动固件 Ascend HDK 25.0.RC1.1、 CANN 8.2.RC1及之后版本。（参考《[CANN软件安装指南](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=local&OS=Ubuntu&Software=cannToolKit)》安装CANN开发套件包以及配套固件和驱动）  
+- 配套软件：驱动固件 Ascend HDK 25.0.RC1.1、 CANN 8.3.RC1 及之后版本。（参考《[CANN软件安装指南](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0000.html?Mode=PmIns&InstallType=local&OS=Ubuntu&Software=cannToolKit)》安装CANN开发套件包以及配套固件和驱动）  
 cmake >= 3.19  
 GLIBC >= 2.28
 
@@ -56,7 +56,7 @@ GLIBC >= 2.28
 
 shmem 默认开启tls通信加密。如果需要关闭，需要调用接口主动关闭：
 ```c
-int32_t ret = shmem_set_conf_store_tls(false, null, 0);
+int32_t ret = aclshmemx_set_conf_store_tls(false, null, 0);
 ```
 具体细节详见安全声明章节
 
@@ -91,7 +91,7 @@ run.sh脚本提供-ranks -ipport -test_filter等参数自定义执行用例的�
 bash scripts/run.sh -ranks 8 -ipport tcp://127.0.0.1:8666 -test_filter Init
 ```
 
-## python侧test用例     [python接口API列表](./doc/pythonAPI.md)
+## python侧test用例     [python接口API列表](api/pythonAPI.md)
 1. 在scripts目录下编译的时候，带上build python的选项
 
 ```sh
@@ -138,13 +138,13 @@ torchrun --nproc-per-node=k test.py // k为想运行的ranksize
 
 ## unique id 初始化方式
 
-注：使用unique id的接口初始化，需要手动配置环境变量SHMEM_UID_SESSION_ID或者SHMEM_UID_SOCK_IFNAM，同时配置时只读SHMEM_UID_SESSION_ID
+注：使用unique id的接口初始化，需要手动配置环境变量SHMEM_UID_SESSION_ID或者SHMEM_UID_SOCK_IFNAME，同时配置时只读SHMEM_UID_SESSION_ID
 SHMEM_UID_SESSION_ID配置示例：
-SHMEM_UID_SOCK_IFNAM=127.0.0.1:1234
-SHMEM_UID_SOCK_IFNAM=[6666:6666:6666:6666:6666:6666:6666:6666]:886
-SHMEM_UID_SOCK_IFNAM配置示例：
-SHMEM_UID_SOCK_IFNAM=enpxxxx:inet4  取ipv4
-SHMEM_UID_SOCK_IFNAM=enpxxxx:inet6  取ipv6
+SHMEM_UID_SESSION_ID=127.0.0.1:1234
+SHMEM_UID_SESSION_ID=[6666:6666:6666:6666:6666:6666:6666:6666]:886
+SHMEM_UID_SOCK_IFNAME配置示例：
+SHMEM_UID_SOCK_IFNAME=enpxxxx:inet4  取ipv4
+SHMEM_UID_SOCK_IFNAME=enpxxxx:inet6  取ipv6
 不配置默认取eth:inet4
 
 - python初始化例子
@@ -153,8 +153,8 @@ import shmem as ash
 
 # xxx
 
-uid = ash.shmem_get_unique_id()
-ret = ash.shmem_init_using_unique_id(rank, world_size, mem_size, uid)
+uid = ash.aclshmem_get_unique_id()
+ret = ash.aclshmem_init_using_unique_id(rank, world_size, mem_size, uid)
 
 # xxx
 ```
@@ -163,9 +163,28 @@ ret = ash.shmem_init_using_unique_id(rank, world_size, mem_size, uid)
 
 - c++初始化例子
 ```cpp
-shmem_uniqueid_t uid;
-shmem_init_attr_t *attr;
-int ret = shmem_get_uniqueid(&uid);
-ret = shmem_set_attr(my_rank, n_ranks, mem_size, nullptr, &attr); // 第4个参数是ip_port，当前场景传入nullptr
-ret = shmem_set_attr_uniqueid_args(my_rank, n_ranks, &uid, attr);
+aclshmemx_uniqueid_t uid;
+aclshmemx_init_attr_t *attr;
+int ret = aclshmemx_get_uniqueid(&uid);
+ret = aclshmemx_set_attr_uniqueid_args(my_pe, n_pes, mem_size, &uid, attr);
+```
+## SHMEM方式
+注：使用unique id的接口初始化，可以手动配置环境变量SHMEM_UID_SESSION_ID或者SHMEM_UID_SOCK_IFNAME，同时配置时只读SHMEM_UID_SESSION_ID，都不配置会自动搜索可用网口。
+SHMEM_UID_SESSION_ID配置示例：
+SHMEM_UID_SESSION_ID=127.0.0.1:1234
+SHMEM_UID_SESSION_ID=[6666:6666:6666:6666:6666:6666:6666:6666]:886
+SHMEM_UID_SESSION_ID=[6666:6666:6666:6666:6666:6666:6666:6666%eth]:886
+SHMEM_UID_SOCK_IFNAME配置示例：
+SHMEM_UID_SOCK_IFNAME=enpxxxx:inet4  取ipv4
+SHMEM_UID_SOCK_IFNAME=enpxxxx:inet6  取ipv6
+不配置默认取inet4自动搜索可用网口，搜索优先级：非docker、lo>>docker>>lo。
+
+
+- c++初始化例子
+```cpp
+aclshmemx_uniqueid_t uid;
+aclshmemx_init_attr_t *attr;
+int ret = aclshmemx_get_uniqueid(&uid);
+shmemx_set_attr_uniqueid_args(rank, rank_size, local_mem_size, &uid, &attributes);
+status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, attributes);
 ```

@@ -1,5 +1,5 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * Comm Benchmark主程序 - NPU通信性能对比测试
  */
 
@@ -11,10 +11,11 @@
 #include <cstring>
 
 #include "acl/acl.h"
-#include "shmem_api.h"
+#include "shmem.h"
 #include "shmemi_host_common.h"
 #include "hccl/hccl.h"
 #include "hccl/hccl_types.h"
+#include "utils/utils.h"
 #include "benchmark_config.h"
 #include "benchmark_utils.h"
 
@@ -60,6 +61,8 @@ int f_rank = 0;
 int f_npu = 0;
 const char* test_type_str;
 
+aclshmemx_uniqueid_t default_flag_uid;
+
 // NPU频率 (MHz)，用于转换cycles到时间
 const double NPU_FREQ_MHZ = 1000.0;
 
@@ -73,26 +76,26 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     aclrtStream stream = nullptr;
     status = aclrtCreateStream(&stream);
 
-    shmem_init_attr_t* attributes;
-    status = shmem_set_attr(rank, world_size, mem_size, ipport, &attributes);
+    aclshmemx_init_attr_t attributes;
+    test_set_attr(rank, world_size, mem_size, ipport, default_flag_uid, &attributes);
 
     // 根据engine类型设置通信引擎
     switch (engine) {
         case EngineType::RDMA:
-            attributes->option_attr.data_op_engine_type = SHMEM_DATA_OP_ROCE;
+            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
             break;
         case EngineType::MTE:
-            attributes->option_attr.data_op_engine_type = SHMEM_DATA_OP_MTE;
+            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
             break;
         case EngineType::SDMA:
-            attributes->option_attr.data_op_engine_type = SHMEM_DATA_OP_SDMA;
+            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
             break;
         default:
-            attributes->option_attr.data_op_engine_type = SHMEM_DATA_OP_ROCE;
+            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
     }
 
-    shmem_set_conf_store_tls(false, nullptr, 0);
-    status = shmem_init_attr(attributes);
+    aclshmemx_set_conf_store_tls(false, nullptr, 0);
+    status = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
 
     return status;
 }
@@ -100,7 +103,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
 // 清理环境
 void finalize_environment(int rank) {
     int32_t device_id = rank % g_npus + f_npu;
-    shmem_finalize();
+    aclshmem_finalize();
     aclrtResetDevice(device_id);
     aclFinalize();
 }
@@ -308,6 +311,7 @@ int run_benchmark(int rank, int world_size) {
     };
 
     std::cout << "\n==================== Comm Benchmark ====================\n";
+    std::cout << "Mode: " << BENCHMARK_MODE_NAME << "\n";
     std::cout << "Rank: " << rank << ", WorldSize: " << world_size << "\n";
     print_separator();
 
@@ -319,10 +323,10 @@ int run_benchmark(int rank, int world_size) {
         aclrtStream stream = nullptr;
         aclrtCreateStream(&stream);
 
-        uint64_t ffts_config = shmemx_get_ffts_config();
+        uint64_t ffts_config = util_get_ffts_config();
 
         // 分配对称内存
-        uint8_t* gva = (uint8_t*)shmem_malloc(mem_size);
+        uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
 
         // ========== 延迟测试 ==========<
         std::cout << "\n[PingPong Latency Test]\n";
@@ -398,8 +402,6 @@ int run_benchmark(int rank, int world_size) {
                                                         msg_size, iterations, compute_cfg);
 
                 // 计算隐藏率
-                // hidden_rate = (comm_time - (overlap_time - compute_time)) / comm_time
-                // 简化: 隐藏率 = 1 - overlap_time/(comm_time+compute_time)
                 double hidden_rate = 100.0 * (1.0 - overlap_time / (comm_time * 2));
 
                 std::cout << "CommTime: " << comm_time << " us"
@@ -411,7 +413,7 @@ int run_benchmark(int rank, int world_size) {
             }
         }
 
-        shmem_free(gva);
+        aclshmem_free(gva);
         aclrtDestroyStream(stream);
         finalize_environment(rank);
     }
@@ -553,7 +555,6 @@ int run_benchmark(int rank, int world_size) {
         auto end = std::chrono::high_resolution_clock::now();
 
         double total_time_us = std::chrono::duration<double, std::micro>(end - start).count();
-        // AllReduce带宽 = msg_size * iterations * 2 / time
         double bw_gb_s = compute_bandwidth(msg_size * iterations * 2, total_time_us);
 
         std::cout << "Bandwidth: " << bw_gb_s << " GB/s\n";
@@ -657,6 +658,8 @@ int main(int argc, char* argv[]) {
     if (!check_env()) {
         return -1;
     }
+
+    std::cout << "\n[Benchmark Mode] " << BENCHMARK_MODE_NAME << "\n";
 
     int status = run_benchmark(rank_id, n_ranks);
 

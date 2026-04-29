@@ -1,12 +1,12 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This file is a part of the CANN Open Software.
- * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 #ifndef CATCOC_COMM_EPILOGUE_BLOCK_EPILOGUE_TO_SHARE_MEM_H
 #define CATCOC_COMM_EPILOGUE_BLOCK_EPILOGUE_TO_SHARE_MEM_H
@@ -76,16 +76,16 @@ public:
 
     template <>
     struct ParamsBase<false> {
-        __gm__ ElementDst *shmemPtr{nullptr};
-        LayoutDst shmemLayout;
+        __gm__ ElementDst *aclshmemPtr{nullptr};
+        LayoutDst aclshmemLayout;
         GemmRemapper gemmRemapper;
 
         CATLASS_HOST_DEVICE
         ParamsBase() {}
 
         CATLASS_HOST_DEVICE
-        ParamsBase(__gm__ ElementDst *shmemPtr_, LayoutDst const &shmemLayout_, GemmRemapper const &gemmRemapper_)
-            : shmemPtr(shmemPtr_), shmemLayout(shmemLayout_), gemmRemapper(gemmRemapper_) {}
+        ParamsBase(__gm__ ElementDst *aclshmemPtr_, LayoutDst const &aclshmemLayout_, GemmRemapper const &gemmRemapper_)
+            : aclshmemPtr(aclshmemPtr_), aclshmemLayout(aclshmemLayout_), gemmRemapper(gemmRemapper_) {}
 
         CATLASS_DEVICE
         static MatrixCoord CoreSplit() { return CoreSplit::ToCoord(); }
@@ -97,8 +97,8 @@ public:
 
     template <>
     struct ParamsBase<true> {
-        __gm__ ElementDst *shmemPtr{nullptr};
-        LayoutDst shmemLayout;
+        __gm__ ElementDst *aclshmemPtr{nullptr};
+        LayoutDst aclshmemLayout;
         GemmRemapper gemmRemapper;
         MatrixCoord coreSplit;
         MatrixCoord blockShape;
@@ -108,9 +108,9 @@ public:
         ParamsBase() {}
 
         CATLASS_HOST_DEVICE
-        ParamsBase(__gm__ ElementDst *shmemPtr_, LayoutDst const &shmemLayout_, GemmRemapper const &gemmRemapper_,
+        ParamsBase(__gm__ ElementDst *aclshmemPtr_, LayoutDst const &aclshmemLayout_, GemmRemapper const &gemmRemapper_,
             MatrixCoord coreSplit_, MatrixCoord blockShape_, MatrixCoord tileShape_)
-            : shmemPtr(shmemPtr_), shmemLayout(shmemLayout_), gemmRemapper(gemmRemapper_),
+            : aclshmemPtr(aclshmemPtr_), aclshmemLayout(aclshmemLayout_), gemmRemapper(gemmRemapper_),
               coreSplit(coreSplit_), blockShape(blockShape_), tileShape(tileShape_) {}
 
         CATLASS_DEVICE

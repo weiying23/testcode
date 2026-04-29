@@ -1,12 +1,12 @@
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 import os
 import pandas as pd
 import numpy as np
@@ -21,7 +21,7 @@ def open_input_file(input_file):
 
 
 def get_time_data(df, test_line_num: int):
-    df = df[df['kernel_type'].astype(str).str.contains("VEC", na=False)]
+    df = df[df['kernel_type'].astype(str).str.contains("CORE", na=False)]
     df = df.reset_index(drop=True)
     time_data = []
     total_rows = len(df)
@@ -63,10 +63,12 @@ def get_pref_path(path):
 
 
 def process_kernel_data():
-    tiling_df = open_input_file(os.path.join(os.getcwd(), "../../build/bin/results.csv"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(script_dir)
+    tiling_df = open_input_file(os.path.join(parent_dir, "results.csv"))
     print(tiling_df)
 
-    pref_file_list = get_pref_path("./output")
+    pref_file_list = get_pref_path(os.path.join(parent_dir, "output"))
     print(pref_file_list)
 
     case_num = len(tiling_df)
@@ -80,7 +82,7 @@ def process_kernel_data():
 
     perf_output = perf_output / len(pref_file_list)
     tiling_df['Time(us)'] = perf_output
-    tiling_df.to_csv("./result.csv", index=False)
+    tiling_df.to_csv(os.path.join(parent_dir, "result.csv"), index=False)
 
 if __name__ == '__main__':
     process_kernel_data()

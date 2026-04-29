@@ -10,6 +10,28 @@
 - **CPU中转通信**：D2H + H2D方式（对比最低性能）
 - **通信隐藏效果**：非阻塞通信 + 计算重叠
 
+## MPI开关配置
+
+本Benchmark支持两种进程间通信模式：
+
+| 模式 | 宏定义 | 初始化标志 | 说明 |
+|------|--------|-----------|------|
+| **Socket模式（默认）** | 无需定义 | `ACLSHMEMX_INIT_WITH_DEFAULT` | 使用socket进行进程间通信，无需MPI |
+| **MPI模式** | `ENABLE_MPI` | `ACLSHMEMX_INIT_WITH_MPI` | 使用MPI进行进程间通信 |
+
+### 切换MPI模式
+
+编辑 `benchmark_config.h` 文件：
+
+```cpp
+// ========== MPI开关配置 ==========
+// 默认关闭MPI，使用socket模式进行进程间通信
+// 取消下面注释以启用MPI:
+// #define ENABLE_MPI    // <-- 取消此行注释启用MPI
+```
+
+**当前默认：Socket模式（关闭MPI）**
+
 ## 测试维度
 
 | 测试类型 | 测试内容 | 输出指标 |
@@ -30,40 +52,54 @@
 
 ```
 comm_benchmark/
-├── CMakeLists.txt           # 构建配置
-├── main.cpp                  # 主程序入口
-├── kernels/                  # NPU Kernel实现
-│   ├── rdma_pingpong_kernel.cpp
-│   ├── rdma_bw_kernel.cpp
-│   ├── mte_pingpong_kernel.cpp
-│   ├── mte_bw_kernel.cpp
-│   ├── hidden_comm_kernel.cpp
-│   └── matmul_compute_kernel.cpp
-├── host/                     # Host端实现
-│   └── cpu_transfer.cpp
-├── include/                  # 头文件
-│   ├── benchmark_config.h
-│   └── benchmark_utils.h
-├── scripts/                  # 运行脚本
-│   └── run_benchmark.sh
-├── results/                  # 结果输出
+├── CMakeLists.txt              # 构建配置
+├── main.cpp                    # 主程序入口
+├── comm_benchmark_kernel.cpp   # 所有NPU Kernel实现
+├── benchmark_config.h          # 配置文件（含MPI开关）
+├── benchmark_utils.h           # 工具函数
+├── scripts/
+│   └── run_benchmark.sh        # 运行脚本
+├── results/                    # 结果输出目录
 │   ├── latency_results.csv
 │   ├── bandwidth_results.csv
 │   └── hidden_results.csv
-└── README.md                 # 本文档
+└── README.md                   # 本文档
 ```
 
 ## 编译
+
+### 1. 设置环境变量
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
+
+### 2. 编译（Socket模式，默认）
 
 ```bash
 cd shmem/
 bash scripts/build.sh -examples
 
-# 编译产物
+# 编译产物位置
 # build/bin/comm_benchmark
+# build/lib/libcomm_benchmark_kernel.so
+```
+
+### 3. 编译（MPI模式）
+
+如需使用MPI模式，先修改 `benchmark_config.h` 启用 `ENABLE_MPI`，然后：
+
+```bash
+cd shmem/
+bash scripts/build.sh -examples
+
+# MPI编译需要确保环境中已安装MPI库
+# 如：openmpi, mpich等
 ```
 
 ## 运行
+
+### 方式一：使用运行脚本
 
 ```bash
 cd examples/comm_benchmark
@@ -76,6 +112,31 @@ bash scripts/run_benchmark.sh 0,1
 bash scripts/run_benchmark.sh 0,1,2,3
 ```
 
+### 方式二：手动运行
+
+```bash
+# 基本用法
+./comm_benchmark <n_ranks> <rank_id> <ipport> <g_npus> <f_rank> <f_npu>
+
+# 示例：2卡测试，在两个终端分别执行
+# 终端1 (Rank 0):
+./comm_benchmark 2 0 tcp://127.0.0.1:8789 8 0 0
+
+# 终端2 (Rank 1):
+./comm_benchmark 2 1 tcp://127.0.0.1:8789 8 0 1
+```
+
+### 参数说明
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| n_ranks | 总进程数 | 2 |
+| rank_id | 当前进程编号 | 0 或 1 |
+| ipport | 通信地址（Socket模式） | tcp://127.0.0.1:8789 |
+| g_npus | 节点内NPU数量 | 8 |
+| f_rank | rank偏移量 | 0 |
+| f_npu | NPU编号偏移量 | 0 或 1 |
+
 ## 结果输出
 
 ### latency_results.csv
@@ -85,7 +146,6 @@ RDMA,pingpong_latency,1024,10000,5.2,0.3,4.8,6.5,5.1
 MTE,pingpong_latency,1024,10000,3.8,0.2,3.5,4.2,3.7
 HCCL,pingpong_latency,1024,10000,6.0,0.4,5.5,7.0,5.9
 CPU_D2H_H2D,pingpong_latency,1024,10000,50.5,2.1,48.0,55.0,50.2
-...
 ```
 
 ### bandwidth_results.csv
@@ -96,7 +156,6 @@ MTE,bandwidth,1048576,1000,45.2,0,45.2,45.2,45.2
 HCCL,allreduce_bandwidth,1048576,1000,28.0,0,28.0,28.0,28.0
 HCCL,allgather_bandwidth,1048576,1000,30.0,0,30.0,30.0,30.0
 HCCL,reducescatter_bandwidth,1048576,1000,26.0,0,26.0,26.0,26.0
-...
 ```
 
 ### hidden_results.csv
@@ -104,7 +163,6 @@ HCCL,reducescatter_bandwidth,1048576,1000,26.0,0,26.0,26.0,26.0
 engine,msg_size,comm_time_us,compute_time_us,overlap_time_us,hidden_rate
 RDMA,1048576,500,200,400,60
 MTE,1048576,300,200,250,83
-...
 ```
 
 ## 性能对比预期
@@ -117,8 +175,6 @@ MTE,1048576,300,200,250,83
 | **CPU中转** | 最高 | 最低 | 无RDMA环境的fallback |
 
 ## HCCL测试内容
-
-HCCL测试包括以下集合通信操作：
 
 | 操作 | 说明 | 测试指标 |
 |------|------|---------|
@@ -139,17 +195,14 @@ HCCL测试包括以下集合通信操作：
 6. 隐藏率 = (T_comm - (T_overlap - T_compute)) / T_comm
 ```
 
-预期结果：
-- MTE隐藏效果更好（带宽更高，通信时间更短）
-- 大消息隐藏率更高（通信时间占比更大）
-
 ## 注意事项
 
-1. **单节点环境**：MTE测试仅在单节点内有效
-2. **多次迭代**：每组测试多次迭代取平均值
-3. **Warmup**：丢弃前1-5%迭代作为预热
-4. **统计指标**：输出mean, std, min, max, median
-5. **HCCL依赖**：需要CANN环境包含HCCL库
+1. **MPI模式**：默认关闭，使用Socket模式运行更便捷
+2. **单节点环境**：MTE测试仅在单节点内有效
+3. **多次迭代**：每组测试多次迭代取平均值
+4. **Warmup**：丢弃前1-5%迭代作为预热
+5. **统计指标**：输出mean, std, min, max, median
+6. **HCCL依赖**：需要CANN环境包含HCCL库
 
 ## 已实现功能
 
@@ -167,9 +220,4 @@ HCCL测试包括以下集合通信操作：
 | 通信隐藏测试 | ✅ 已实现 |
 | 统计分析输出 | ✅ 已实现 |
 | CSV结果输出 | ✅ 已实现 |
-
-## 扩展功能（可选）
-
-- MPI对比：需要额外安装MPI库
-- 更多计算负载：可调整MatMul维度
-- 多节点测试：需要跨节点环境
+| MPI开关控制 | ✅ 已实现 |

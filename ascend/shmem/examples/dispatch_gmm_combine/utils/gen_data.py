@@ -1,12 +1,12 @@
-#
-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 import os
 import shutil
 from copy import deepcopy
@@ -22,7 +22,7 @@ import numpy
 
 
 LCAL_PATH = os.getcwd().replace("build", "")
-DATA_PATH = os.path.join(LCAL_PATH, "examples", "dispatch_gmm_combine", "utils", "test_data")
+DATA_PATH = os.path.join(LCAL_PATH, "utils", "test_data_golden_cpu")
 shutil.rmtree(DATA_PATH, ignore_errors=True)
 os.makedirs(DATA_PATH)
 print(f'Use DATA_PATH = {DATA_PATH}')
@@ -254,7 +254,7 @@ class QuantInfo:
         self.dequant_offset_list.clear()
         self.dequant_scale_origin_list.clear()
         for _ in range(self.rank_size):
-            self.get_output_dequant_tensor(shape_info, l0c_dtype, coc_dtype_desc, type)
+            _, _ = self.get_output_dequant_tensor(shape_info, l0c_dtype, coc_dtype_desc, type)
             self.dequant_scale_list.append(self.dequant_scale)
             self.dequant_scale_origin_list.append(self.dequant_scale_origin)
             self.dequant_scale = None
@@ -418,6 +418,9 @@ class MoeTestDate:
                 self.matrix_b2_list = [tensor.transpose(1, 2) for tensor in self.matrix_b2_list]
             for i in range(rank_size):
                 self.write_to_bin(self.matrix_a_list[i], f"matrix_a_{i}")
+                self.write_to_bin(self.matrix_b1_list[i], f"matrix_b1_origin_{i}")
+                self.write_to_bin(self.matrix_b2_list[i], f"matrix_b2_origin_{i}")
+
                 if weight_nz:
                     matrix_b1 = self.convert_nd_to_nz(coc_dtype_desc, self.matrix_b1_list[i])
                     self.write_to_bin(matrix_b1, f"matrix_b1_{i}")
@@ -448,6 +451,21 @@ class MoeTestDate:
             num_local_tokens_per_expert = [item_dict.get(i, 0) for i in range(self.expert_num)]
         return num_local_tokens_per_expert, indices
 
+    def write_npu_output(self, tensor, prefix):
+        file_path = f"{DATA_PATH}/{prefix}.bin"
+        if tensor is None:
+            return
+        untyped_dict = {
+            torch.float16: torch.int16,
+            torch.bfloat16: torch.int16,
+            torch.int8: torch.int8,
+            torch.float32: torch.int32,
+            torch.int32: torch.int32,
+            torch.int64: torch.int64
+        }
+        print(tensor.shape, tensor.dtype, file_path)
+        tensor.view(untyped_dict[tensor.dtype]).numpy().tofile(file_path)
+
     def write_to_bin(self, tensor, prefix):
         file_path = f"{DATA_PATH}/{prefix}_{self.endfix}"
         if tensor is None:
@@ -461,7 +479,7 @@ class MoeTestDate:
             torch.int64: torch.int64
         }
         print(tensor.shape, tensor.dtype, file_path)
-        tensor.view(untyped_dict.get(tensor.dtype)).numpy().tofile(file_path)
+        tensor.view(untyped_dict[tensor.dtype]).numpy().tofile(file_path)
 
     def get_moe_input_output_splits(self, expert_per_rank, ep, mode, max_output_size, num_local_tokens_per_expert):
         all_gather_res = num_local_tokens_per_expert[0].tolist()
@@ -542,7 +560,6 @@ class MoeTestDate:
                 matrix_a_block_list[src_ep].append(src_offset - src_offset_old)
         return matrix_a_i_list, matrix_a_block_list
 
-    @staticmethod
     def convert_nd_to_nz(self, coc_dtype_desc, input_tensor):
         split_tensors = torch.unbind(input_tensor, dim=0)
         split_tensors = [t.unsqueeze(0) for t in split_tensors]
@@ -556,14 +573,12 @@ class MoeTestDate:
         output_tensor = torch.cat(processed_tensors, dim=0)
         return output_tensor
 
-    @staticmethod
     def swiglu(self, x: torch.Tensor) -> torch.Tensor:
         x0, gate = x.chunk(2, dim=-1)
         swish = x0 * torch.sigmoid(x0)
         y = swish * gate
         return y
 
-    @staticmethod
     def quant(self, x: torch.Tensor):
         x_row_max = torch.max(torch.abs(x), dim=-1).values
         quant_result = x * 127. / x_row_max[:, None]
@@ -571,7 +586,6 @@ class MoeTestDate:
         scale = (x_row_max / 127.).to(torch.float32)
         return y, scale
 
-    @staticmethod
     def unpermute(self, permuted_tokens, origin_sorted_indices, probs):
         orgin_dtype = permuted_tokens.dtype
         permuted_tokens = permuted_tokens.to(torch.float).cpu()
@@ -635,6 +649,7 @@ class MoeTestDate:
                 if dequant_offset_list:
                     self.write_to_bin(dequant_offset_list[i], f"matrix_dequant_offset1_{i}")
                 self.write_to_bin(dequant_scale_list[i], f"matrix_dequant_scale1_{i}")
+                self.write_to_bin(self.quant_info.dequant_scale_origin_list[i], f"matrix_dequant_scale1_origin_{i}")
 
             if self.quant_info.dequant_granularity is QuantGranularity.PER_TOKEN:
                 quant_scale_list = self.pertoken_scale_list
@@ -715,6 +730,7 @@ class MoeTestDate:
                 print(f"dequant_scale_list[i] shape is {dequant_scale_list[i].shape} "
                       f"type is {dequant_scale_list[i].dtype}")
                 self.write_to_bin(dequant_scale_list[i], f"matrix_dequant_scale2_{i}")
+                self.write_to_bin(self.quant_info.dequant_scale_origin_list[i], f"matrix_dequant_scale2_origin_{i}")
                 split_scale = torch.split(dequant_scale_origin_list[i], input_info[2], dim=1)
 
                 offset_list_per_tensor.extend(split_offset)
@@ -775,9 +791,9 @@ class MoeTestDate:
                 ep_idx = i // self.tp
                 permuted_tokens = matrix_c_list[i].to(self.output_dtype)
                 self.write_to_bin(permuted_tokens, f"ptrC2_{ep_idx}")
-                self.write_to_bin(torch_npu.npu_moe_token_unpermute(permuted_tokens.squeeze(0).to('npu'),
+                self.write_npu_output(torch_npu.npu_moe_token_unpermute(permuted_tokens.squeeze(0).to('npu'),
                                   origin_sorted_indecies[ep_idx].to('npu'),
-                                  probs.to('npu')).cpu(), f"unpermuted_token_{ep_idx}")
+                                  probs.to('npu')).cpu().to(torch.float32), f"unpermuted_token_{ep_idx}")
 
 
 def validate_args(data_type):
@@ -823,8 +839,6 @@ def main():
     expert_tokens_before_capacity_flag = config['initRoutingInfo']['expertTokensBeforeCapacityFlag']
     expert_tokens_count_or_cumsum_flag = int(config['initRoutingInfo']['expertTokensCountOrCumsumFlag'])
     quant_mode = int(config['initRoutingInfo']['quantMode'])
-
-    print(f"{mode=}")
 
     is_deterministic = os.environ.get('LCCL_DETERMINISTIC')
     if is_deterministic is not None and is_deterministic.lower() in ['true', '1']:

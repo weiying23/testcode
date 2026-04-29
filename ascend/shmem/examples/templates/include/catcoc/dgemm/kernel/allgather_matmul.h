@@ -1,12 +1,12 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #ifndef CATCOC_DGEMM_KERNEL_ALLGATHER_MATMUL_H
 #define CATCOC_DGEMM_KERNEL_ALLGATHER_MATMUL_H
 
@@ -17,6 +17,8 @@
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
+
+#include "utils/prof/shmemi_prof.h"
 
 namespace Catcoc::DGemm::Kernel {
 
@@ -229,7 +231,7 @@ public:
                 Catlass::Arch::CrossCoreWaitFlag(flagAicFinishStore[stageId]);
             }
 
-            shmemx_barrier_all_vec();
+            aclshmemx_barrier_all_vec();
 
             allGather.InitBlockLoop();
             if (subcoreIdx == 0 && aicoreIdx < commAicoreNum) {
@@ -248,17 +250,18 @@ public:
 
                     auto gmBlockDst = gmSymmetric[layoutSymmetric.GetOffset(offsetDst)];
                     auto layoutBlockDst = layoutSymmetric.GetTileLayout(actualCommBlockShape);
-
+                    SHMEMI_PROF_START(0);
                     allGather(
                         gmBlockSrc, layoutBlockSrc,
                         gmBlockDst, layoutBlockDst,
                         actualCommBlockShape, remoteRankIdx % params.rankSize
                     );
+                    SHMEMI_PROF_END(0);
                 }
             }
             allGather.FinalizeBlockLoop();
             // AllGather is completed, waiting until tasks on all devices are complete.
-            shmemx_barrier_all_vec();
+            aclshmemx_barrier_all_vec();
 
             // set aic
             Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishCompute[stageId]);

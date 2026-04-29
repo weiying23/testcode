@@ -6,8 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-shmem_add_fusion_example(dispatch_gmm_combine main.cpp)
+aclshmem_add_fusion_example(dispatch_gmm_combine main.cpp)
 
-target_compile_options(dispatch_gmm_combine PRIVATE --cce-auto-sync)
-
-target_include_directories(dispatch_gmm_combine PRIVATE ${PROJECT_SOURCE_DIR}/examples/dispatch_gmm_combine/include)
+if(USE_EXAMPLES)
+    target_compile_options(dispatch_gmm_combine PRIVATE --cce-auto-sync)
+    target_include_directories(dispatch_gmm_combine PRIVATE ${PROJECT_SOURCE_DIR}/examples/dispatch_gmm_combine/include)
+endif()

@@ -1,12 +1,12 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 #ifndef CATLASS_GEMM_KERNEL_GROUPED_MATMUL_DEQUANT_FIXPIPE_H
 #define CATLASS_GEMM_KERNEL_GROUPED_MATMUL_DEQUANT_FIXPIPE_H
@@ -19,12 +19,12 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
-#include "shmem_api.h"
+#include "shmem.h"
 
-#include "block_mmad_preload_async_fixpipe_quant.h"
-#include "block_mmad_preload_fixpipe.h"
 #include "copy_gm_to_l1_custom.h"
 #include "copy_l0c_to_gm_custom.h"
+#include "block_mmad_preload_async_fixpipe_quant.h"
+#include "block_mmad_preload_fixpipe.h"
 #include "block_epilogue_pertoken_row.h"
 #include "block_epilogue_pertoken_swiglu.h"
 #include "sync_util.h"
@@ -296,22 +296,22 @@ private:
         for (uint32_t processIndex = 0; processIndex < processCount; ++processIndex) {
             uint32_t curProcessNum = (processIndex == processCount - 1) ? elemNum - ubMoveNum * (processCount - 1) :
                                       ubMoveNum;
-            AscendC::TEventID EVENT_ID = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
+            AscendC::TEventID event_id = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
             AscendC::LocalTensor<T> buf = pingpongId == 0 ? tmpBuffer1 : tmpBuffer2;
             auto processOffset = processIndex * ubMoveNum;
 
             auto inputOffset = processOffset;
             auto outputOffset = processOffset;
             // [ReduceScatter] 2. Pre Interface Sync
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
-            // [ReduceScatter] 3. Start shmem_mte_get_mem_nbi
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
+            // [ReduceScatter] 3. Start aclshmemx_mte_get_nbi
             copyGmToUb(buf, src[inputOffset], layout::RowMajor{1, curProcessNum}, layout::RowMajor{1, curProcessNum});
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event_id);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event_id);
             copyUbToGm(dst[outputOffset], buf, layout::RowMajor{1, curProcessNum}, layout::RowMajor{1, curProcessNum});
 
             // [ReduceScatter] 4. Post Interface Sync
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
             pingpongId = (pingpongId + 1) % BufferNum;
         }
         // [ReduceScatter] 4. Post Interface Sync
@@ -600,7 +600,7 @@ private:
     CATLASS_DEVICE
     void Dispatch(Params const &params)
     {
-        __gm__ void *srcPeermemPtr = shmem_ptr(params.symmetricPtr, params.rank);
+        __gm__ void *srcPeermemPtr = aclshmem_ptr(params.symmetricPtr, params.rank);
         GM_ADDR localTokenPerExpert = peermemInfo.ptrPeerTokenPerExpert +
                                       params.rank * (params.EP * params.expertPerRank + 8) *
                                       sizeof(int32_t);
@@ -621,7 +621,7 @@ private:
             AscendC::GlobalTensor<int32_t> srcAddress;
             srcAddress.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(localTokenPerExpert));
             AscendC::GlobalTensor<int32_t> dstAddress;
-            __gm__ void *dstPeermemPtr = shmem_ptr(localTokenPerExpert, coreIdx);
+            __gm__ void *dstPeermemPtr = aclshmem_ptr(localTokenPerExpert, coreIdx);
             dstAddress.SetGlobalBuffer((__gm__ int32_t *)dstPeermemPtr);
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -691,7 +691,7 @@ private:
                     }
                     uint32_t rowSrc = prevSum;
                     prevSum += rows;
-                    __gm__ void *peermemPtr = shmem_ptr(peermemInfo.ptrA, dstEpIdx);
+                    __gm__ void *peermemPtr = aclshmem_ptr(peermemInfo.ptrA, dstEpIdx);
                     AscendC::GlobalTensor<ElementA> gmRemoteA;
                     gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA * > (peermemPtr));
                     AscendC::GlobalTensor<ElementPerTokenScale> gmRemotePerTokenScale;
@@ -793,7 +793,7 @@ private:
             AscendC::SyncAll<true>();
 
             for (int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
-                __gm__ void *dstPeermemPtr = shmem_ptr(peermemInfo.ptrD, dstEpIdx);
+                __gm__ void *dstPeermemPtr = aclshmem_ptr(peermemInfo.ptrD, dstEpIdx);
                 AscendC::GlobalTensor<ElementD2> gmRemotePeer;
                 gmRemotePeer.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD2 * > (dstPeermemPtr));
                 uint32_t srcRowOffset =

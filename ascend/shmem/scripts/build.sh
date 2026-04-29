@@ -1,13 +1,13 @@
 #!/bin/bash
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 if [ -n "$ASCEND_HOME_PATH" ]; then
     _ASCEND_INSTALL_PATH=$ASCEND_HOME_PATH
 fi
@@ -15,7 +15,31 @@ fi
 export ASCEND_TOOLKIT_HOME=${_ASCEND_INSTALL_PATH}
 export ASCEND_HOME_PATH=${_ASCEND_INSTALL_PATH}
 
-source "$(dirname "$_ASCEND_INSTALL_PATH")/set_env.sh"
+ascend_dir=$(dirname "$_ASCEND_INSTALL_PATH")
+env_script_path_old="${ascend_dir}/set_env.sh"
+env_script_path_new="${ascend_dir}/ascend-toolkit/set_env.sh"
+
+if [ -n "$_ASCEND_INSTALL_PATH" ] && [ -f "$env_script_path_old" ] && [ -x "$env_script_path_old" ] && \
+   [ -f "$env_script_path_new" ] && [ -x "$env_script_path_new" ]; then
+    echo "[WARNING] Both old and new set_env.sh files are detected!"
+    echo "          Old path: $env_script_path_old"
+    echo "          New path: $env_script_path_new"
+    echo "          The new path file will be used by priority!"
+fi
+
+if [ -n "$_ASCEND_INSTALL_PATH" ] && [ -f "$env_script_path_new" ] && [ -x "$env_script_path_new" ]; then
+    source "$env_script_path_new"
+elif [ -n "$_ASCEND_INSTALL_PATH" ] && [ -f "$env_script_path_old" ] && [ -x "$env_script_path_old" ]; then
+    source "$env_script_path_old"
+else
+    if [ -z "$_ASCEND_INSTALL_PATH" ]; then
+        echo "[WARNING] Environment variable _ASCEND_INSTALL_PATH is not set, cannot find set_env.sh script" >&2
+    else
+        echo "[WARNING] Valid set_env.sh script not found!" >&2
+        echo "       Check path 1: $env_script_path_old (does not exist or is not executable)" >&2
+        echo "       Check path 2: $env_script_path_new (does not exist or is not executable)" >&2
+    fi
+fi
 
 CURRENT_DIR=$(pwd)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -32,11 +56,17 @@ UNDER_DIR=$PROJECT_ROOT/src/
 BUILD_TYPE=RELEASE
 PYEXPAND_TYPE=OFF
 PACKAGE=OFF
+USE_CXX11_ABI=ON
+USE_MSSANITIZER=OFF
+ENABLE_EXAMPLES=OFF
+PYEXPAND_EXAMPLE=OFF
+BUILD_ALL=OFF
 
 COMPILE_OPTIONS=""
 
 COVERAGE_TYPE=""
 GEN_DOC=OFF
+SOC_TYPE=""
 
 cann_default_path="/usr/local/Ascend/ascend-toolkit"
 
@@ -44,12 +74,13 @@ cd ${PROJECT_ROOT}
 
 function fn_build()
 {
-    fn_build_under_memfabric
-    [ -d build ] && rm -rf build
-    mkdir -p build
+    mkdir -p build && cd build
+    local enable_udma_support=OFF
+    if [ "$SOC_TYPE" = "Ascend950" ]; then
+        enable_udma_support=ON
+    fi
 
-    cd build
-    cmake -DBUILD_PYTHON=$PYEXPAND_TYPE $COMPILE_OPTIONS -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=$BUILD_TYPE ..
+    cmake $COMPILE_OPTIONS -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DUSE_CXX11_ABI=$USE_CXX11_ABI -DUSE_MSSANITIZER=$USE_MSSANITIZER -DSOC_TYPE=${SOC_TYPE} -DPYEXPAND_EXAMPLE=$PYEXPAND_EXAMPLE -DACLSHMEM_UDMA_SUPPORT=$enable_udma_support ..
     make install -j17
     cd -
 }
@@ -58,18 +89,15 @@ function fn_whl_build()
 {
   echo "Python extension enabled. Copying and packaging Python wheel..."
 
-  cd "${PROJECT_ROOT}/scripts"
-  source set_env.sh
-
   cd "${PROJECT_ROOT}/src/python"
-  rm -rf build shmem.egg-info build dist
-  GIT_COMMIT=`git rev-parse HEAD`
+  rm -rf shmem.egg-info ${PROJECT_ROOT}/dist
+GIT_COMMIT=`git rev-parse HEAD` || true
   {
   echo "commit_id: ${GIT_COMMIT}"
   } > "${PROJECT_ROOT}/src/python/shmem/VERSION"
-  python3 setup.py bdist_wheel
 
   cd "${PROJECT_ROOT}"
+  python3 setup.py bdist_wheel
 }
 
 function make_package()
@@ -85,7 +113,7 @@ function make_package()
 
     mkdir -p "${PROJECT_ROOT}"/package/$ARCH/
     if [ "$PYEXPAND_TYPE" = "ON" ]; then
-         cp "${PROJECT_ROOT}"/src/python/dist/*.whl "${PROJECT_ROOT}"/package/$ARCH/
+         cp "${PROJECT_ROOT}"/dist/*.whl "${PROJECT_ROOT}"/package/$ARCH/
          whl_name=`basename ${PROJECT_ROOT}/src/python/dist/*.whl`
          echo "${whl_name} is copy to ${PROJECT_ROOT}/package"
     fi
@@ -107,7 +135,7 @@ function fn_make_run_package()
     fi
 
     branch=$(git symbolic-ref -q --short HEAD || git describe --tags --exact-match 2> /dev/null || echo $branch)
-    commit_id=$(git rev-parse HEAD)
+    commit_id=$(git rev-parse HEAD) || true
     mkdir -p $OUTPUT_DIR
     touch $OUTPUT_DIR/version.info
     cat>$OUTPUT_DIR/version.info<<EOF
@@ -144,10 +172,17 @@ function fn_build_googletest()
         return 0
     fi
     cd $THIRD_PARTY_DIR
-    [[ ! -d "googletest" ]] && git clone --branch v1.14.0 --depth 1 https://gitee.com/mirrors/googletest.git
+    [[ ! -d "googletest" ]] && git clone --branch v1.14.x --depth 1 https://gitcode.com/GitHub_Trending/go/googletest.git
     cd googletest
 
-    rm -rf build && mkdir build && cd build
+    mkdir -p build && cd build
+    if [ "$USE_CXX11_ABI" == "ON" ]
+    then
+        sed -i '21 a add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)' ../CMakeLists.txt
+    else
+        sed -i '21 a add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)' ../CMakeLists.txt
+    fi
+
     cmake .. -DCMAKE_INSTALL_PREFIX=$THIRD_PARTY_DIR/googletest -DCMAKE_SKIP_RPATH=TRUE -DCMAKE_CXX_FLAGS="-fPIC"
     cmake --build . --parallel $(nproc)
     cmake --install . > /dev/null
@@ -156,71 +191,16 @@ function fn_build_googletest()
     cd ${PROJECT_ROOT}
 }
 
-function fn_build_secodefuzz()
+function fn_build_nlohmann_json()
 {
-    if [ -f "$THIRD_PARTY_DIR/secodefuzz/lib/libSecodefuzz.a" ] && [ -f "$THIRD_PARTY_DIR/secodefuzz/include/secodefuzz/secodeFuzz.h" ]; then
+    if [ -f "$THIRD_PARTY_DIR/json/single_include/nlohmann/json.hpp" ]; then
         return 0
     fi
+
     cd $THIRD_PARTY_DIR
-
-    # Need to replace git link before build fuzz test
-    [[ ! -d "secodefuzz" ]] && git clone --branch v2.4.8 --depth 1 secodefuzz.git
-    cd secodefuzz
-
-    # build secodefuzz
-    # -- HACK: enable PIC
-    sed -i 's/cmake ../cmake -DCMAKE_POSITION_INDEPENDENT_CODE=ON ../g' ./build.sh
-    # -- HACK: remove signal handlers, to support running multi-task tests.
-    sed -i 's/#define HAS_SIGNAL/#undef HAS_SIGNAL/g' ./Secodefuzz/secodeFuzz.h
-    bash build.sh
-    if [ $? -ne 0 ]; then
-        echo "secodefuzz build failed."
-        return 1
-    fi
-
-    # install lib and headers into target directory
-    mkdir -p "$THIRD_PARTY_DIR/secodefuzz/lib"
-    cp ./examples/out-bin-x64/out/* "$THIRD_PARTY_DIR/secodefuzz/lib"
-    cp ./examples/out-bin-x64/libSecodefuzz.a "$THIRD_PARTY_DIR/secodefuzz/lib"
-    mkdir -p "$THIRD_PARTY_DIR/secodefuzz/include/secodefuzz"
-    cp ./Secodefuzz/secodeFuzz.h "$THIRD_PARTY_DIR/secodefuzz/include/secodefuzz"
-    echo "secodefuzz is successfully installed to $THIRD_PARTY_DIR/secodefuzz"
+    rm -rf json
+    git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git json
     cd ${PROJECT_ROOT}
-}
-
-function fn_build_memfabric()
-{
-    if [ -d "$THIRD_PARTY_DIR/memfabric_hybrid/output/smem/lib64" ]; then
-        echo "Memfabric_hybrid already build"
-    else
-        git submodule update 3rdparty/memfabric_hybrid # not with recursive
-        cd $THIRD_PARTY_DIR/memfabric_hybrid
-        bash script/build.sh $BUILD_TYPE OFF OFF $PYEXPAND_TYPE
-        find output
-        cd ${PROJECT_ROOT}
-    fi
-
-    mkdir -p $OUTPUT_DIR/memfabric_hybrid/lib
-    mkdir -p $OUTPUT_DIR/memfabric_hybrid/include
-    cp -r $THIRD_PARTY_DIR/memfabric_hybrid/output/hybm/lib64/* $OUTPUT_DIR/memfabric_hybrid/lib
-    cp -r $THIRD_PARTY_DIR/memfabric_hybrid/output/smem/lib64/* $OUTPUT_DIR/memfabric_hybrid/lib
-    cp -r $THIRD_PARTY_DIR/memfabric_hybrid/output/smem/include/smem $OUTPUT_DIR/memfabric_hybrid/include
-    echo "Memfabric_hybrid is successfully installed to $THIRD_PARTY_DIR/memfabric_hybrid"
-}
-
-function fn_build_under_memfabric()
-{
-    cd $UNDER_DIR/memfabric_hybrid
-    bash script/build.sh $BUILD_TYPE OFF
-    ls -l output/smem
-    cd ${PROJECT_ROOT}
-
-    mkdir -p $OUTPUT_DIR/memfabric_hybrid/lib
-    mkdir -p $OUTPUT_DIR/memfabric_hybrid/include
-    cp -r $UNDER_DIR/memfabric_hybrid/output/hybm/lib64/* $OUTPUT_DIR/memfabric_hybrid/lib
-    cp -r $UNDER_DIR/memfabric_hybrid/output/smem/lib64/* $OUTPUT_DIR/memfabric_hybrid/lib
-    cp -r $UNDER_DIR/memfabric_hybrid/output/smem/include/smem $OUTPUT_DIR/memfabric_hybrid/include
-    echo "Memfabric_hybrid is successfully installed to $UNDER_DIR/memfabric_hybrid"
 }
 
 function fn_build_doxygen()
@@ -232,7 +212,7 @@ function fn_build_doxygen()
     wget --no-check-certificate https://github.com/doxygen/doxygen/releases/download/Release_1_9_6/doxygen-1.9.6.src.tar.gz
     tar -xzvf doxygen-1.9.6.src.tar.gz
     cd doxygen-1.9.6
-    rm -rf build && mkdir build && cd build
+    mkdir -p build && cd build
     cmake .. -DCMAKE_INSTALL_PREFIX=$THIRD_PARTY_DIR/doxygen
     cmake --build . --parallel $(nproc)
     cmake --install . > /dev/null
@@ -243,10 +223,11 @@ function fn_build_doxygen()
 function fn_build_sphinx()
 {
     [[ "$COVERAGE_TYPE" != "" ]] && return 0
-    pip install -U sphinx
+    pip install sphinx
     pip install sphinx_rtd_theme
     pip install myst_parser
     pip install breathe
+    pip install linkify-it-py
 }
 
 function fn_gen_doc()
@@ -259,7 +240,7 @@ function fn_gen_doc()
     [[ -d "$doxygen_output_dir" ]] && rm -rf $doxygen_output_dir
     mkdir -p $doxygen_output_dir
     $THIRD_PARTY_DIR/doxygen/bin/doxygen -g $doxyfile
-    sed -i "s#PROJECT_NAME           =.*#PROJECT_NAME           = "Shmem"#g" $doxyfile
+    sed -i "s#PROJECT_NAME           =.*#PROJECT_NAME           = \"Shmem\"#g" $doxyfile
     sed -i "s#PROJECT_NUMBER         =.*#PROJECT_NUMBER         = $branch#g" $doxyfile
     sed -i "s#OUTPUT_DIRECTORY       =.*#OUTPUT_DIRECTORY       = $doxygen_output_dir#g" $doxyfile
     sed -i "s#OUTPUT_LANGUAGE        =.*#OUTPUT_LANGUAGE        = English#g" $doxyfile
@@ -276,11 +257,10 @@ function fn_gen_doc()
     sed -i "s#GENERATE_TREEVIEW      =.*#GENERATE_TREEVIEW      = YES#g" $doxyfile
     sed -i "s#WARN_AS_ERROR          =.*#WARN_AS_ERROR          = YES#g" $doxyfile
     sed -i "s#GENERATE_XML           =.*#GENERATE_XML           = YES#g" $doxyfile
-    sed -i "s#MACRO_EXPANSION        =.*#MACRO_EXPANSION        = YES#g" $doxyfile
-    sed -i "s#EXPAND_ONLY_PREDEF     =.*#EXPAND_ONLY_PREDEF     = YES#g" $doxyfile
-    sed -i "s#EXPAND_AS_DEFINED      =.*#EXPAND_AS_DEFINED      = SHMEM_TYPE_FUNC SHMEM_TYPENAME_P_AICORE SHMEM_TYPENAME_G_AICORE SHMEM_GET_TYPENAME_MEM SHMEM_GET_TYPENAME_MEM_TENSOR SHMEM_PUT_TYPENAME_MEM SHMEM_PUT_TYPENAME_MEM_TENSOR SHMEM_GET_TYPENAME_MEM_TENSOR_DETAILED SHMEM_PUT_TYPENAME_MEM_DETAILED SHMEM_PUT_TYPENAME_MEM_TENSOR_DETAILED#g" $doxyfile
-    sed -i "s#EXCLUDE_SYMBOLS        =.*#EXCLUDE_SYMBOLS        = SHMEM_GLOBAL SHMEM_TYPENAME_P_AICORE SHMEM_TYPENAME_G_AICORE SHMEM_GET_TYPENAME_MEM SHMEM_GET_TYPENAME_MEM_TENSOR SHMEM_PUT_TYPENAME_MEM SHMEM_PUT_TYPENAME_MEM_TENSOR SHMEM_GET_TYPENAME_MEM_DETAILED SHMEM_GET_TYPENAME_MEM_TENSOR_DETAILED SHMEM_PUT_TYPENAME_MEM_DETAILED SHMEM_PUT_TYPENAME_MEM_TENSOR_DETAILED DcciCacheline addrGm#g" $doxyfile
-
+    sed -i "s#EXPAND_ONLY_PREDEF     =.*#EXPAND_ONLY_PREDEF     = NO#g" $doxyfile
+    sed -i "s#SKIP_FUNCTION_MACROS   =.*#SKIP_FUNCTION_MACROS   = NO#g" $doxyfile
+    sed -i "s#ALLOW_DUPLICATE_MEMBERS =.*#ALLOW_DUPLICATE_MEMBERS = YES#g" $doxyfile
+    sed -i "s#EXCLUDE_SYMBOLS        =.*#EXCLUDE_SYMBOLS        = shmem* addrGm#g" "$doxyfile"
     $THIRD_PARTY_DIR/doxygen/bin/doxygen $doxyfile
     [[ "$COVERAGE_TYPE" != "" ]] && return 0
     local sphinx_out_dir=$PROJECT_ROOT/docs/$branch/guide
@@ -294,30 +274,41 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -uttests)
             fn_build_googletest
-            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitee.com/ascend/catlass; cd $PROJECT_ROOT
+            BUILD_TYPE=Debug
+            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitcode.com/cann/catlass.git; cd $PROJECT_ROOT
             COMPILE_OPTIONS="${COMPILE_OPTIONS} -DUSE_UNIT_TEST=ON"
             shift
             ;;
-        -fuzz)
-            fn_build_secodefuzz
-            fn_build_googletest
-            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitee.com/ascend/catlass; cd $PROJECT_ROOT
-            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DUSE_FUZZ_TEST=ON"
+        -cann)
+            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DENABLE_CANN_BUILD=ON"
             shift
             ;;
         -debug)
             BUILD_TYPE=Debug
-            fn_build_googletest
-            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DUSE_UNIT_TEST=ON"
+            COMPILE_OPTIONS="${COMPILE_OPTIONS}"
             shift
             ;;
         -examples)
-            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitee.com/ascend/catlass; cd $PROJECT_ROOT
-            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DUSE_EXAMPLES=ON"
+            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitcode.com/cann/catlass.git; cd $PROJECT_ROOT
+            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DUSE_EXAMPLES=ON -DPython3_EXECUTABLE=$(which python3)"
+            ENABLE_EXAMPLES=ON
+            shift
+            ;;
+        -enable_rdma)
+            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DACLSHMEM_RDMA_SUPPORT=ON"
+            shift
+            ;;
+        -enable_simt)
+            COMPILE_OPTIONS="${COMPILE_OPTIONS} -DACLSHMEM_SIMT_SUPPORT=ON"
             shift
             ;;
         -python_extension)
             PYEXPAND_TYPE=ON
+            shift
+            ;;
+        -python_example)
+            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitcode.com/cann/catlass.git; cd $PROJECT_ROOT
+            PYEXPAND_EXAMPLE=ON
             shift
             ;;
         -gendoc)
@@ -342,6 +333,28 @@ while [[ $# -gt 0 ]]; do
             PYEXPAND_TYPE=ON
             shift
             ;;
+        -full)
+            BUILD_ALL=ON
+            fn_build_googletest
+            cd $THIRD_PARTY_DIR; [[ ! -d "catlass" ]] && git clone https://gitcode.com/cann/catlass.git; cd $PROJECT_ROOT
+            shift
+            ;;
+        -use_cxx11_abi1)
+            USE_CXX11_ABI=ON
+            shift
+            ;;
+        -use_cxx11_abi0)
+            USE_CXX11_ABI=OFF
+            shift
+            ;;
+        -mssanitizer)
+            USE_MSSANITIZER=ON
+            shift
+            ;;
+        -soc_type)
+            SOC_TYPE="$2"
+            shift 2
+            ;;
         *)
             echo "Error: Unknown option $1."
             exit 1
@@ -349,19 +362,45 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-fn_build
+if [ "$SOC_TYPE" = "Ascend950" ]; then
+    fn_build_nlohmann_json
+fi
 
-if [ "$PYEXPAND_TYPE" = "ON" ]; then
+# 清空 build
+[ -d build ] && rm -rf build
+
+if [ "$BUILD_ALL" = "ON" ]; then
+    OLD_COMPILE_OPTIONS=${COMPILE_OPTIONS}
+    # build whl
     fn_whl_build
-fi
 
-fn_make_run_package
-if [ ${GEN_DOC} == "ON" ]; then
-    fn_gen_doc
-fi
+    # build examples
+    COMPILE_OPTIONS="${OLD_COMPILE_OPTIONS} -DUSE_EXAMPLES=ON"
+    fn_build
 
-if [ "$PACKAGE" == "ON" ]; then
+    # build uttests
+    BUILD_TYPE=Debug
+    COMPILE_OPTIONS="${OLD_COMPILE_OPTIONS} -DUSE_UNIT_TEST=ON"
+    fn_build
+
+    # build package
+    PYEXPAND_TYPE=ON
+    fn_make_run_package
     make_package
+else
+    if [ "$PYEXPAND_TYPE" = "ON" ]; then
+        fn_whl_build
+    fi
+
+    fn_build
+    fn_make_run_package
+    if [ "$PACKAGE" == "ON" ]; then
+        make_package
+    fi
+
+    if [ ${GEN_DOC} == "ON" ]; then
+        fn_gen_doc
+    fi
 fi
 
 cd ${CURRENT_DIR}

@@ -1,12 +1,12 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #ifndef _EPILOGUE_ALLREDUCE_HPP
 #define _EPILOGUE_ALLREDUCE_HPP
 
@@ -22,7 +22,7 @@
 #include "epilogue/block/block_swizzle_dynamic.hpp"
 
 // from shmem-device
-#include "shmem_api.h"
+#include "shmem.h"
 
 using namespace Catlass;
 
@@ -144,7 +144,7 @@ public:
         peerMem.SetGlobalBuffer(params.symmetricPtr);
 
         // Local matmul is completed, waiting until tasks on all devices are complete.
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
 
         AscendC::SetAtomicAdd<ElementC>();
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -183,7 +183,7 @@ public:
                 int pingpongId = 0;
 
                 for (uint32_t processIndex = 0; processIndex < processLoop; ++processIndex) {
-                    AscendC::TEventID EVENT_ID = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
+                    AscendC::TEventID event_id = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
                     AscendC::LocalTensor<ElementC> buf = pingpongId == 0 ? tmpBuffer1 : tmpBuffer2;
 
                     MatrixCoord processCoord{processIndex / processCount.column(),
@@ -202,14 +202,14 @@ public:
                     int64_t outputElemOffset = layoutPeerMemStore.GetOffset(outputOffset);
 
                     // [ReduceScatter] 2. Pre Interface Sync
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
 
-                    // [ReduceScatter] 3. Start shmem_mte_get_mem_nbi
-                    shmem_mte_get_mem_nbi(peerMem[outputElemOffset], peerMem[inputElemOffset], buf, copySize,
-                                          mRankIdx % rankSize, EVENT_ID);
+                    // [ReduceScatter] 3. Start aclshmemx_mte_get_nbi
+                    aclshmemx_mte_get_nbi(peerMem[outputElemOffset], peerMem[inputElemOffset], buf, copySize,
+                                          mRankIdx % rankSize, event_id);
 
                     // [ReduceScatter] 4. Post Interface Sync
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
+                    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
                     pingpongId = (pingpongId + 1) % BufferNum;
                 }
                 // [ReduceScatter] 4. Post Interface Sync
@@ -224,7 +224,7 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
 
         // ReduceScatter is completed, waiting until tasks on all devices are complete.
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
 
         if (aivIndex == 0 && aicoreIndex < realAicoreNum) {
             for (uint32_t idx = aicoreIndex; idx < commCoreLoops; idx += realAicoreNum) {
@@ -293,11 +293,11 @@ public:
 
                             uint32_t copySize = actualMoveShape.row() * actualMoveShape.column();
 
-                            AscendC::TEventID EVENT_ID = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
+                            AscendC::TEventID event_id = pingpongId == 0 ? EVENT_ID0 : EVENT_ID1;
                             AscendC::LocalTensor<ElementC> buf = pingpongId == 0 ? tmpBuffer1 : tmpBuffer2;
 
                             // [AllGather] 2. Pre Interface Sync
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
 
                             non_contiguous_copy_param copyParams;
                             copyParams.repeat = actualMoveShape.row();
@@ -305,12 +305,12 @@ public:
                             copyParams.src_ld = layoutInput.stride(0);
                             copyParams.dst_ld = layoutOutput.stride(0);
 
-                            // [AllGather] 3. Start shmem_mte_get_mem_nbi non-contiguous version
-                            shmem_mte_get_mem_nbi(params.destination[outputElemOffset], peerMem[inputElemOffset], buf,
-                                                  copyParams, mRankIdx % rankSize, EVENT_ID);
+                            // [AllGather] 3. Start aclshmemx_mte_get_nbi non-contiguous version
+                            aclshmemx_mte_get_nbi(params.destination[outputElemOffset], peerMem[inputElemOffset], buf,
+                                                  copyParams, mRankIdx % rankSize, event_id);
 
                             // [AllGather] 4. Post Interface Sync
-                            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event_id);
                             pingpongId = (pingpongId + 1) % BufferNum;
                         }
                         residueM -= actualMoveM;
@@ -324,7 +324,7 @@ public:
         }
 
         // AllGather is completed, waiting until tasks on all devices are complete.
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
     }
 
 private:

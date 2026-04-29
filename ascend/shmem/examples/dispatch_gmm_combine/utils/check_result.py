@@ -1,12 +1,12 @@
-#
-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 import sys
 import argparse
 import torch
@@ -58,20 +58,20 @@ def read_binary_file(file_path, dtype=torch.float32):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--rank_size', type=int, required=True)
+parser.add_argument('--pe_size', type=int, required=True)
 parser.add_argument('--dataType', type=int, required=True)
 parser.add_argument('--m', type=int, required=True)
 parser.add_argument('--k', type=int, required=True)
 parser.add_argument('--n', type=int, required=True)
-parser.add_argument('--expert_per_rank', type=int, required=True)
+parser.add_argument('--expert_per_pe', type=int, required=True)
 parser.add_argument('--EP', type=int, required=True)
 
 args = parser.parse_args()
-for i in range(args.rank_size):
-    print(f"================{i} rank ================")
+for i in range(args.pe_size):
+    print(f"================ pe {i} ================")
     a = read_binary_file(f"./out/output_{i}.bin", dtype=torch.float16)
     b = read_binary_file(
         f"./utils/test_data/unpermuted_token_{i}_{args.dataType}_1_{args.m}_{args.k}_{args.n}_"
-        f"{args.expert_per_rank}_{args.EP}_1.bin",
+        f"{args.expert_per_pe}_{args.EP}_1.bin",
         dtype=torch.float16)
     output_error_item(a, b)

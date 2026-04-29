@@ -6,4 +6,4 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 
-shmem_add_fusion_example(allgather_matmul_with_gather_result main.cpp)
+aclshmem_add_fusion_example(allgather_matmul_with_gather_result main.cpp)

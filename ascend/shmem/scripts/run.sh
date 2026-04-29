@@ -1,13 +1,13 @@
 #!/bin/bash
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 readonly CURRENT_DIR=$(pwd)
 readonly SCRIPT_DIR=$(dirname $(readlink -f "${BASH_SOURCE[0]}"))
 readonly PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
@@ -23,6 +23,7 @@ rm -rf "$COVERAGE_PATH"
 set -e
 RANK_SIZE="8"
 IPPORT="tcp://127.0.0.1:8666"
+SESSION_ID="127.0.0.1:8766"
 GNPU_NUM="8"
 FIRST_NPU="0"
 FIRST_RANK="0"
@@ -66,8 +67,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -ipport)
             if [ -n "$2" ]; then
-                if [[ "$2" =~ ^[a-zA-z0-9.:/_-]+$ ]]; then
-                    IPPORT="$2"
+                if [[ "$2" =~ ^[a-zA-Z0-9/:._-]+$ ]]; then
+                    IPPORT="tcp://${2}"
+                    SESSION_ID="${2}"
+                    export SHMEM_UID_SESSION_ID=$SESSION_ID
                     shift 2
                 else
                     echo "Error: Invalid -ipport format, only alphanumeric and :/_- allowed"
@@ -126,11 +129,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 export SMEM_CONF_STORE_TLS_ENABLE=0
-export LD_LIBRARY_PATH=${PROJECT_ROOT}/build/lib:${PROJECT_ROOT}/install/memfabric_hybrid/lib:${ASCEND_HOME_PATH}/lib64:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=${PROJECT_ROOT}/build/lib:${ASCEND_HOME_PATH}/lib64:$LD_LIBRARY_PATH
 
 # Run unit test
 cd "$BUILD_PATH"
-./bin/shmem_unittest "$RANK_SIZE" "$IPPORT" "$GNPU_NUM" "$FIRST_RANK" "$FIRST_NPU"  --gtest_output=xml:test_detail.xml --gtest_filter=${TEST_FILTER}
+./bin/aclshmem_unittest "$RANK_SIZE" "$IPPORT" "$GNPU_NUM" "$FIRST_RANK" "$FIRST_NPU"  --gtest_output=xml:test_detail.xml --gtest_filter=${TEST_FILTER}
 
 # Collect coverage
 if [[ $lcov_not_found -ne 0 ]]; then
@@ -138,7 +141,7 @@ if [[ $lcov_not_found -ne 0 ]]; then
 else
     mkdir -p "$COVERAGE_PATH"
     cd "$COVERAGE_PATH"
-    lcov -d "$BUILD_PATH" --c --output-file "$COVERAGE_PATH/coverage.info" -rc lcov_branch_coverage=1 --rc lcov_excl_br_line="LCOV_EXCL_BR_LINE|SHM_LOG_*|SHM_ASSERT*|SHMEM_CHECK_RET"
+    lcov -d "$BUILD_PATH" --c --output-file "$COVERAGE_PATH/coverage.info" -rc lcov_branch_coverage=1 --rc lcov_excl_br_line="LCOV_EXCL_BR_LINE|SHM_LOG_*|SHM_ASSERT*|ACLSHMEM_CHECK_RET"
     lcov -e "$COVERAGE_PATH/coverage.info" "*/src/host/*" -o "$COVERAGE_PATH/coverage.info" --rc lcov_branch_coverage=1
     lcov -r "$COVERAGE_PATH/coverage.info" "*src/host/common/*" -o "$COVERAGE_PATH/coverage.info" --rc lcov_branch_coverage=1
     genhtml -o "$COVERAGE_PATH/result" "$COVERAGE_PATH/coverage.info" --show-details --legend --rc lcov_branch_coverage=1

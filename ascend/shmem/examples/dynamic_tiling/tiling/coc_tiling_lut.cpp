@@ -1,12 +1,12 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #include "coc_tiling_lut.h"
 #include <iostream>
 #include <limits>
@@ -59,7 +59,7 @@ const std::map<LutKey, const LUTGroup *> g_allLutGroups = {
     // 继续添加...
 };
 
-void ApplyLookupTable(const COCMatMulInfo &info,
+bool ApplyLookupTable(const COCMatMulInfo &info,
                       CocCommType type,
                       int rankSize,
                       CocTilingParams &t)
@@ -68,7 +68,7 @@ void ApplyLookupTable(const COCMatMulInfo &info,
     auto it = g_allLutGroups.find(key);
     if (it == g_allLutGroups.end()) {
         std::cerr << "[LUT] no table for (" << type << ',' << rankSize << ")\n";
-        return;
+        return false;
     }
     constexpr uint32_t COMM_TILE_M_MULTIPLIER = 2;
     constexpr uint32_t N0_IF_M0_IS_256 = 128;
@@ -85,4 +85,5 @@ void ApplyLookupTable(const COCMatMulInfo &info,
     t.commBlockM = t.commTileM;
     t.n0 = (t.m0 == DEFAULT_M0) ? N0_IF_M0_IS_256 : N0_IF_M0_IS_NOT_256;
     t.k0 = DEFAULT_K0;
+    return true;
 }

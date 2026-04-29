@@ -1,12 +1,12 @@
 /**
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 #ifndef CATCOC_EPILOGUE_TILE_TILE_REMOTE_COPY_H
 #define CATCOC_EPILOGUE_TILE_TILE_REMOTE_COPY_H
@@ -18,7 +18,7 @@
 #include "catlass/catlass.hpp"
 
 // from shmem
-#include "shmem_api.h"
+#include "shmem.h"
 
 namespace Catcoc::CommEpilogue::Tile {
 
@@ -65,7 +65,7 @@ struct TileRemoteCopy<ArchTag, SrcType_, DstType_, detail::CopyDirect::Get> {
         copyParams.length = copyShape.column();
         copyParams.src_ld = srcLayout.stride(0);
         copyParams.dst_ld = dstLayout.stride(0);
-        shmem_mte_get_mem_nbi(dstTensor, srcTensor, tmpUb, copyParams, peerIdx, copyEventId);
+        aclshmemx_mte_get_nbi(dstTensor, srcTensor, tmpUb, copyParams, peerIdx, copyEventId);
     }
 };
 
@@ -99,7 +99,7 @@ struct TileRemoteCopy<ArchTag, SrcType_, DstType_, detail::CopyDirect::Put> {
         copyParams.length = copyShape.column();
         copyParams.src_ld = srcLayout.stride(0);
         copyParams.dst_ld = dstLayout.stride(0);
-        shmem_mte_put_mem_nbi(dstTensor, srcTensor, tmpUb, copyParams, peerIdx, copyEventId);
+        aclshmemx_mte_put_nbi(dstTensor, srcTensor, tmpUb, copyParams, peerIdx, copyEventId);
     }
 };
 

@@ -1,22 +1,33 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #ifndef COPY_L0C_TO_GM_CUSTOM_H
 #define COPY_L0C_TO_GM_CUSTOM_H
 namespace Catlass::Gemm::Tile {
+
+template <
+    class ArchTag,
+    class ElementAccumulator,
+    class GmType,
+    ScaleGranularity DEQUANT_GRANULARITY = ScaleGranularity::NO_QUANT,
+    bool ReluEnable = false
+>
+struct ShmCopyL0CToGm {
+    static_assert(DEPENDENT_FALSE<ArchTag>, "Unsupported copy l0c to gm, can not find the specialization.");
+};
 // Fixpipe with quant VDEQF16
 template <
     class ElementAccumulator_,
     class ElementDst_,
     bool ReluEnable_
 >
-struct CopyL0CToGm<Catlass::Arch::AtlasA2,
+struct ShmCopyL0CToGm<Catlass::Arch::AtlasA2,
                 ElementAccumulator_,
                 Gemm::GemmType<ElementDst_, layout::RowMajor>,
                 ScaleGranularity::PER_CHANNEL,

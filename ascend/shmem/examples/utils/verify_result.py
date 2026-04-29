@@ -1,4 +1,4 @@
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -6,7 +6,7 @@
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 
 import logging
 import sys
@@ -99,10 +99,10 @@ def precision_performance_analysis(op_type, golden_output_tensor_list, output_te
         precision_threshold, eb_threshold = get_precision_and_eb_threshold(op_type, actual_output.dtype, rtol)
         precision, eb = cal_precision_eb_percent(op_type, actual_output, golden_output,
                                                  precision_threshold, eb_threshold)
+    print(f"Old precision - precision: {precision}, eb: {eb}", flush=True)
     if precision == 100 and eb <= 100:
         return True
     else:
-        print(f"precision: {precision}, eb: {eb}")
         return False
 
 
@@ -113,7 +113,6 @@ def cal_precision_eb_percent(op_type, actual_output, golden_output, precision_th
         actual_output.dtype in [torch.float16, torch.bfloat16]):
         actual_output = actual_output.to(torch.float32)
         golden_output = golden_output.to(torch.float32)
-    #对于输出中出现的NAN以及INF全部替换成0
     actual_output = torch.where(torch.isnan(actual_output), torch.full_like(actual_output, 0), actual_output)
     actual_output = torch.where(torch.isinf(actual_output), torch.full_like(actual_output, 0), actual_output)
     golden_output = torch.where(torch.isnan(golden_output), torch.full_like(golden_output, 0), golden_output)
@@ -143,15 +142,38 @@ def cal_precision_eb_percent(op_type, actual_output, golden_output, precision_th
             break
     error_num = len(different_element_indexes)
     if error_num > 0:
-        print(f"error num: {error_num}")
+        print(f"Differential num: {error_num}")
 
-    # eb 统计误差偏移情况
     eb = eb_threshold
     if eb_threshold != 0:
         eb = torch.abs(torch.mean(torch.div(diff, tensor_max)))
     precision_percent = torch.sum(tolerance <= 0).numpy() / torch.numel(tolerance) * 100
     eb_percent = 0 if eb == 0 else torch.sum(eb).to(torch.float).numpy() / eb_threshold * 100
     return precision_percent, eb_percent
+
+
+def calculate_metrics(actual, golden):
+    actual = actual.to(torch.float32)
+    golden = golden.to(torch.float32)
+    
+    actual = torch.where(torch.isnan(actual), torch.full_like(actual, 0), actual)
+    actual = torch.where(torch.isinf(actual), torch.full_like(actual, 0), actual)
+    golden = torch.where(torch.isnan(golden), torch.full_like(golden, 0), golden)
+    golden = torch.where(torch.isinf(golden), torch.full_like(golden, 0), golden)
+    
+    diff = torch.abs(actual - golden)
+    golden_abs = torch.abs(golden)
+    denominator = golden_abs + 1e-7
+    
+    relative_error = diff / denominator
+    mare = torch.max(relative_error).item()
+    mere = torch.mean(relative_error).item()
+    
+    squared_error = diff ** 2
+    mean_squared_error = torch.mean(squared_error).item()
+    rmse = np.sqrt(mean_squared_error)
+    
+    return mare, mere, rmse
 
 
 def verify_result():
@@ -163,14 +185,52 @@ def verify_result():
     parser.add_argument('m', type=int)
     parser.add_argument('n', type=int)
     parser.add_argument('k', type=int)
+    parser.add_argument('torch_output', nargs='?', default=None, type=str,
+                        help='Torch_NPU output file for new precision check (optional)')
     args = parser.parse_args()
 
     output = tensor_from_file(args.output, dtype=args.out_dtype.torch_type)
     golden = tensor_from_file(args.golden, dtype=torch.float32)
 
+    old_pass = False
+    new_pass = False
+
     rtol = get_rtol(dtype=args.out_dtype.torch_type, compute_times=args.k)
-    result = precision_performance_analysis(OpTypes.COMPUTE_FLOAT, [golden], [output], rtol)
-    return result
+    op_type = OpTypes.COMPUTE_FLOAT
+    print(f"Running old precision check...")
+    old_pass = precision_performance_analysis(op_type, [golden], [output], rtol)
+
+    if args.torch_output is not None:
+        print(f"Loading torch_output from: {args.torch_output}", flush=True)
+        torch_output = tensor_from_file(args.torch_output, dtype=args.out_dtype.torch_type)
+        print(f"torch_output loaded, shape: {torch_output.shape}", flush=True)
+        print(f"Running new precision check...", flush=True)
+        shmem_mare, shmem_mere, shmem_rmse = calculate_metrics(output, golden)
+        torch_mare, torch_mere, torch_rmse = calculate_metrics(torch_output, golden)
+
+        print(f"SHMEM metrics - MARE: {shmem_mare:.9f}, MERE: {shmem_mere:.9f}, RMSE: {shmem_rmse:.9f}", flush=True)
+        print(f"Torch_NPU metrics - MARE: {torch_mare:.9f}, MERE: {torch_mere:.9f}, RMSE: {torch_rmse:.9f}", flush=True)
+
+        mare_ratio = shmem_mare / torch_mare if torch_mare != 0 else float('inf')
+        mere_ratio = shmem_mere / torch_mere if torch_mere != 0 else float('inf')
+        rmse_ratio = shmem_rmse / torch_rmse if torch_rmse != 0 else float('inf')
+
+        print(f"Ratios - MARE: {mare_ratio:.9f}, MERE: {mere_ratio:.9f}, RMSE: {rmse_ratio:.9f}", flush=True)
+
+        mare_pass = mare_ratio <= 10
+        mere_pass = mere_ratio <= 2
+        rmse_pass = rmse_ratio <= 2
+
+        new_pass = mare_pass and mere_pass and rmse_pass
+
+        if not mare_pass:
+            print(f"{RED}MARE ratio {mare_ratio:.9f} > 10{RESET}", flush=True)
+        if not mere_pass:
+            print(f"{RED}MERE ratio {mere_ratio:.9f} > 2{RESET}", flush=True)
+        if not rmse_pass:
+            print(f"{RED}RMSE ratio {rmse_ratio:.9f} > 2{RESET}", flush=True)
+
+    return old_pass or new_pass
 
 
 if __name__ == '__main__':
@@ -178,7 +238,7 @@ if __name__ == '__main__':
         res = verify_result()
         if not res:
             print(f"{RED}||||||||||| PRECISION ERROR |||||||||||||||{RESET}")
-            sys.exit(0)
+            sys.exit(1)
         else:
             print(f"{GREEN}PRECISION PASS{RESET}")
             sys.exit(0)

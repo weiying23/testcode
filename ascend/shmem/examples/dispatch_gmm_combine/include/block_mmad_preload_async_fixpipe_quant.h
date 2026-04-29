@@ -1,12 +1,12 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 
 #ifndef CATLASS_GEMM_BLOCK_BLOCK_MMAD_PRELOAD_QUANT_H
 #define CATLASS_GEMM_BLOCK_BLOCK_MMAD_PRELOAD_QUANT_H
@@ -89,12 +89,12 @@ public:
     using CopyGmToL1S = Gemm::Tile::CopyGmToL1<ArchTag, Gemm::GemmType<uint64_t, layout::VectorLayout>>;
     using CopyL1ToL0A = typename TileCopy_::CopyL1ToL0A;
     using CopyL1ToL0B = typename TileCopy_::CopyL1ToL0B;
-
+    
     using ElementAccumulator =
         typename Gemm::helper::ElementAccumulatorSelector<ElementA, ElementB>::ElementAccumulator;
     using CopyL0CToGm = typename std::conditional<
         std::is_same_v<ElementA, int8_t>,
-        Gemm::Tile::CopyL0CToGm<ArchTag, ElementAccumulator, CType_, Gemm::Tile::ScaleGranularity::PER_CHANNEL>,
+        Gemm::Tile::ShmCopyL0CToGm<ArchTag, ElementAccumulator, CType_, Gemm::Tile::ScaleGranularity::PER_CHANNEL>,
         typename TileCopy_::CopyL0CToGm
     >::type;
     using LayoutAInL1 = typename CopyL1ToL0A::LayoutSrc;
@@ -287,7 +287,7 @@ private:
         layout::VectorLayout layoutScale;
         int32_t syncLoopIdx;
         int32_t flag;
-
+        
         CATLASS_DEVICE
         L1TileMmadParams() = default;
     };
@@ -344,25 +344,6 @@ private:
     }
 
     CATLASS_DEVICE
-    uint8_t GetUnitFlag(L1TileMmadParams const &params, uint32_t mPartIdx, uint32_t kPartIdx, uint32_t nPartIdx)
-    {
-        uint32_t mPartLoop = CeilDiv<L0TileShape::M>(params.mRound);
-        uint32_t nPartLoop = CeilDiv<L0TileShape::N>(params.nRound);
-        uint32_t kPartLoop = CeilDiv<L0TileShape::K>(params.kActual);
-
-        uint8_t unitFlag = 0b00;
-        if constexpr (ENABLE_UNIT_FLAG) {
-            if (params.isKLoopLast &&
-                (mPartIdx == mPartLoop - 1) && (kPartIdx == kPartLoop - 1) && (nPartIdx == nPartLoop - 1)) {
-                unitFlag = 0b11;
-            } else {
-                unitFlag = 0b10;
-            }
-        }
-        return unitFlag;
-    }
-
-    CATLASS_DEVICE
     void L1TileMmad(L1TileMmadParams const &params)
     {
         uint32_t mPartLoop = CeilDiv<L0TileShape::M>(params.mRound);
@@ -394,8 +375,7 @@ private:
                 auto l1ATile = l1ATensor[L1A_LAYOUT.GetOffset(l1AOffset)];
 
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0AEventList[l0AListId]);
-                // means mPartIdx and kPartIdx are both 0; to reduce loop depth, change to add and compare to 0
-                if (mPartIdx + kPartIdx == 0) {
+                if ((mPartIdx == 0) && (kPartIdx == 0)) {
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[params.l1ListId]);
                 }
                 copyL1ToL0A(l0ATile, l1ATile, layoutAInL0, L1A_LAYOUT);
@@ -430,7 +410,15 @@ private:
                     // If the current tile is the first tile on the k axis, the accumulator needs to be reset to 0
                     bool initC = (params.isKLoopFirst && (kPartIdx == 0));
                     // If the unit flag is enabled, the unit flag is set according to the calculation progress
-                    uint8_t unitFlag = GetUnitFlag(params, mPartIdx, kPartIdx, nPartIdx);
+                    uint8_t unitFlag = 0b00;
+                    if constexpr (ENABLE_UNIT_FLAG) {
+                        if (params.isKLoopLast &&
+                            (mPartIdx == mPartLoop - 1) && (kPartIdx == kPartLoop - 1) && (nPartIdx == nPartLoop - 1)) {
+                            unitFlag = 0b11;
+                        } else {
+                            unitFlag = 0b10;
+                        }
+                    }
                     tileMmad(l0CTile, l0ATile, l0BTile, mPartActual, nPartActual, kPartActual, initC, unitFlag);
 
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);

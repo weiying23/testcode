@@ -1,879 +1,653 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
-#include <stdint.h>
-#include <stdlib.h>
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #include <iostream>
 #include <sstream>
-#include <algorithm>
-#include <fstream>
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <random>
+#include <functional>
+#include <unordered_set>
+
 #include "acl/acl.h"
+#include "acl/acl_rt.h"
 #include "shmemi_host_common.h"
-#include "internal/host/shmemi_host_def.h"
+#include "shmemi_init.h"
+#include "host/shmem_host_def.h"
+#include "prof/prof_util.h"
 
 using namespace std;
 
-namespace shm {
-constexpr uint64_t MIN_PORT = 1024;
-constexpr uint64_t MAX_PORT = 65536;
-constexpr uint64_t MAX_ATTEMPTS = 1000;
-constexpr uint64_t MAX_IFCONFIG_LENGTH = 23;
-constexpr uint64_t MAX_IP = 48;
-constexpr int DEFAULT_MY_PE = -1;
-constexpr int DEFAULT_N_PES = -1;
+#define DEFAULT_MY_PE (-1)
+#define DEFAULT_N_PES (-1)
 
-constexpr int DEFAULT_FLAG = 0;
-constexpr int DEFAULT_ID = 0;
-constexpr int DEFAULT_TIMEOUT = 120;
 constexpr int DEFAULT_TEVENT = 0;
 constexpr int DEFAULT_BLOCK_NUM = 1;
-constexpr int DEFAULT_IFNAME_LNEGTH = 4;
+
+constexpr uint32_t DEFAULT_MTE_UB_SIZE = 16 * 1024;
+constexpr uint32_t DEFAULT_SDMA_UB_SIZE = 64;
+constexpr int64_t DEFAULT_SDMA_UB_OFFSET = 191 * 1024;
+constexpr uint32_t DEFAULT_RDMA_UB_SIZE = 64;
+constexpr int64_t DEFAULT_RDMA_UB_OFFSET = 190 * 1024;
 
 // initializer
-#define SHMEM_DEVICE_HOST_STATE_INITIALIZER                                            \
-    {                                                                                 \
-        (1 << 16) + sizeof(shmemi_device_host_state_t),  /* version */                     \
-            (DEFAULT_MY_PE),                           /* mype */                       \
-            (DEFAULT_N_PES),                           /* npes */                       \
-            NULL,                                    /* heap_base */                   \
-            NULL,                                  /* p2p_heap_host_base */           \
-            NULL,                                  /* sdma_heap_host_base */          \
-            NULL,                                  /* roce_heap_host_base */          \
-            NULL,                                  /* p2p_heap_device_base */        \
-            NULL,                                  /* sdma_heap_device_base */       \
-            NULL,                                  /* roce_heap_device_base */       \
-            {},                                     /* topo_list */                     \
-            SIZE_MAX,                                /* heap_size */                   \
-            {NULL},                                  /* team_pools */                  \
-            0,                                       /* sync_pool */                  \
-            0,                                       /* sync_counter */                \
-            0,                                      /* core_sync_pool */             \
-            0,                                      /* core_sync_counter */          \
-            0,                                        /* partial_barrier_pool */      \
-            false,                                   /* shmem_is_shmem_initialized */ \
-            false,                                   /* shmem_is_shmem_created */     \
-            {0, 16 * 1024, 0},                       /* shmem_mte_config */           \
+#define ACLSHMEM_DEVICE_HOST_STATE_INITIALIZER                                                         \
+    {                                                                                                  \
+        (1 << 16) + sizeof(aclshmem_device_host_state_t),       /* version */                          \
+            (DEFAULT_MY_PE),                                    /* mype */                             \
+            (DEFAULT_N_PES),                                    /* npes */                             \
+            NULL,                                               /* heap_base */                        \
+            NULL,                                               /* host_heap_base */                   \
+            NULL,                                               /* p2p_device_heap_base */             \
+            NULL,                                               /* rdma_device_heap_base */            \
+            NULL,                                               /* sdma_device_heap_base */            \
+            NULL,                                               /* p2p_heap_host_base */               \
+            NULL,                                               /* rdma_heap_host_base */              \
+            NULL,                                               /* sdma_heap_host_base */              \
+            {},                                                 /* topo_list */                        \
+            SIZE_MAX,                                           /* heap_size */                        \
+            {NULL},                                             /* team_pools */                       \
+            0,                                                  /* sync_pool */                        \
+            0,                                                  /* sync_counter */                     \
+            0,                                                  /* core_sync_pool */                   \
+            0,                                                  /* core_sync_counter */                \
+            false,                                              /* aclshmem_is_aclshmem_initialized */ \
+            false,                                              /* aclshmem_is_aclshmem_created */     \
+            {0, DEFAULT_MTE_UB_SIZE, 0},                        /* aclshmem_mte_config */              \
+            {DEFAULT_SDMA_UB_OFFSET, DEFAULT_SDMA_UB_SIZE, 0},  /* aclshmem_sdma_config */             \
+            {DEFAULT_RDMA_UB_OFFSET, DEFAULT_RDMA_UB_SIZE, 0},  /* aclshmem_rdma_config */             \
+            0,                                                  /* qp_info */                          \
+            0,                                                  /* sdma_workspace_addr */              \
+            NULL,                                               /* aclshmem_prof_pe_t */               \
+            0,                                                  /* signal_addr */                      \
     }
 
-shmemi_device_host_state_t g_state = SHMEM_DEVICE_HOST_STATE_INITIALIZER;
-shmemi_host_state_t g_state_host = {nullptr, DEFAULT_TEVENT, DEFAULT_BLOCK_NUM};
-shmem_init_attr_t g_attr;
-static smem_shm_t g_smem_handle = nullptr;
-static bool g_attr_init = false;
-static char g_ipport[SHMEM_MAX_IP_PORT_LEN] = {0};
+aclshmem_device_host_state_t g_state = ACLSHMEM_DEVICE_HOST_STATE_INITIALIZER;
+aclshmem_host_state_t g_state_host = {nullptr, DEFAULT_TEVENT, DEFAULT_BLOCK_NUM, 0};
+aclshmem_prof_pe_t g_host_profs;
+
+// bootstrap plugin_hdl
+void *plugin_hdl = nullptr;
+aclshmemi_bootstrap_handle_t g_boot_handle;
+std::shared_ptr<memory_manager> aclshmemi_memory_manager = nullptr;
+std::shared_ptr<memory_manager> aclshmemi_host_memory_manager = nullptr;
+
+// Count Used to guard Multi instance scenario
+static int g_init_manager_count = 0;
+aclshmemi_init_backend* init_manager = nullptr;
+
+// Protect instance context access
+static std::mutex g_aclshmem_ctx_mutex;
+
+// Instance context used to store global_resources
+struct aclshmem_context
+{
+    uint64_t instance_id = 0;
+
+    aclshmem_device_host_state_t state = ACLSHMEM_DEVICE_HOST_STATE_INITIALIZER;
+    aclshmem_host_state_t host_state = {nullptr, DEFAULT_TEVENT, DEFAULT_BLOCK_NUM};
+
+    void *bootstrap_plugin_hdl = nullptr;
+    aclshmemi_bootstrap_handle_t boot_handle;
+
+    std::shared_ptr<memory_manager> dev_mem_manager = nullptr;
+    std::shared_ptr<memory_manager> host_mem_manager = nullptr;
+
+    explicit aclshmem_context(uint64_t id) : instance_id(id) {}
+};
+
+// g_instance_ctx for global use
+aclshmem_instance_ctx *g_instance_ctx = new aclshmem_instance_ctx{0, nullptr};
+
+std::map<uint32_t, aclshmem_instance_ctx*> aclshmem_ctx_domain = { {0, g_instance_ctx} };
+std::map<uint32_t, aclshmem_context*> aclshmem_resource_domain = { {0, new aclshmem_context(0)} };
 
 int32_t version_compatible()
 {
-    int32_t status = SHMEM_SUCCESS;
+    int32_t status = ACLSHMEM_SUCCESS;
     return status;
 }
 
-int32_t bind_tcp_port_v4(int &sockfd, int port, shmem_uniqueid_inner_t *innerUId, char *ip_str)
+int32_t aclshmemi_state_init_attr(aclshmemx_init_attr_t *attributes)
 {
-    sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd != -1) {
-        int on_v4 = 1;
-        if (::setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on_v4, sizeof(on_v4)) == 0) {
-            innerUId->addr.addr.addr4.sin_port = htons(port);
-            sockaddr *cur_addr = reinterpret_cast<sockaddr *>(&innerUId->addr.addr.addr4);
-            if (::bind(sockfd, cur_addr, sizeof(innerUId->addr.addr.addr4)) == 0) {
-                SHM_LOG_INFO("bind ipv4 success " << ", fd:" << sockfd << ", " << ip_str << ":" << port);
-                return 0;
-            } else {
-                SHM_LOG_ERROR("bind socket fail:" << errno << "," << ip_str << ":" << port);
-            }
-        } else {
-            SHM_LOG_ERROR("set socket opt fail:" << errno << ","  << ip_str << ":" << port);
-        }
-        close(sockfd);
-        sockfd = -1;
-    } else {
-        SHM_LOG_ERROR("create socket fail:" << errno << ", " << ip_str << ":" << port);
-    }
-    return -1;
-}
-
-int32_t bind_tcp_port_v6(int &sockfd, int port, shmem_uniqueid_inner_t *innerUId, char *ip_str)
-{
-    sockfd = ::socket(AF_INET6, SOCK_STREAM, 0);
-    if (sockfd != -1) {
-        int on_v6 = 1;
-        if (::setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on_v6, sizeof(on_v6)) == 0) {
-            innerUId->addr.addr.addr6.sin6_port = htons(port);
-            sockaddr *cur_addr = reinterpret_cast<sockaddr *>(&innerUId->addr.addr.addr6);
-            if (::bind(sockfd, cur_addr, sizeof(innerUId->addr.addr.addr6)) == 0) {
-                SHM_LOG_INFO("bind ipv6 success " << ", fd:" << sockfd << ", " << ip_str << ":" << port);
-                return 0;
-            } else {
-                SHM_LOG_ERROR("bind socket6 fail:" << errno << "," << ip_str << ":" << port);
-            }
-        } else {
-            SHM_LOG_ERROR("set socket6 opt fail:" << errno << "," << ip_str << ":" << port);
-        }
-        close(sockfd);
-        sockfd = -1;
-    } else {
-        SHM_LOG_ERROR("create socket6 fail:" << errno << "," << ip_str << ":" << port);
-    }
-    return -1;
-}
-
-int32_t shmemi_options_init()
-{
-    int32_t status = SHMEM_SUCCESS;
-    return status;
-}
-
-int32_t shmemi_state_init_attr(shmem_init_attr_t *attributes)
-{
-    int32_t status = SHMEM_SUCCESS;
-    g_state.mype = attributes->my_rank;
-    g_state.npes = attributes->n_ranks;
-    g_state.heap_size = attributes->local_mem_size + SHMEM_EXTRA_SIZE;
+    int32_t status = ACLSHMEM_SUCCESS;
+    g_state.mype = attributes->my_pe;
+    g_state.npes = attributes->n_pes;
+    g_state.heap_size = attributes->local_mem_size + ACLSHMEM_EXTRA_SIZE;
 
     aclrtStream stream = nullptr;
-    SHMEM_CHECK_RET(aclrtCreateStream(&stream), aclrtCreateStream);
+    ACLSHMEM_CHECK_RET(aclrtCreateStream(&stream));
     g_state_host.default_stream = stream;
     g_state_host.default_event_id = DEFAULT_TEVENT;
     g_state_host.default_block_num = DEFAULT_BLOCK_NUM;
     return status;
 }
 
-void shmemi_reach_info_init(void *&gva)
+bool is_valid_data_op_engine_type(data_op_engine_type_t value)
 {
-    uint32_t reach_info = 0;
-    int32_t status = SHMEM_SUCCESS;
-    for (int32_t i = 0; i < g_state.npes; i++) {
-        status = smem_shm_topology_can_reach(g_smem_handle, i, &reach_info);
-        if (status != SHMEM_SUCCESS) {
-            SHM_LOG_ERROR("smem_shm_topology_can_reach failed");
-        }
-        g_state.p2p_heap_host_base[i] = (void *)((uintptr_t)gva + g_state.heap_size * static_cast<uint32_t>(i));
-        if (reach_info & SMEMS_DATA_OP_MTE) {
-            g_state.topo_list[i] |= SHMEM_TRANSPORT_MTE;
-        }
-        if (reach_info & SMEMS_DATA_OP_SDMA) {
-            g_state.sdma_heap_host_base[i] = (void *)((uintptr_t)gva + g_state.heap_size * static_cast<uint32_t>(i));
-        } else {
-            g_state.sdma_heap_host_base[i] = NULL;
-        }
-        if (reach_info & SMEMS_DATA_OP_RDMA) {
-            g_state.topo_list[i] |= SHMEM_TRANSPORT_ROCE;
-        }
-    }
+    constexpr uint32_t valid_mask = (static_cast<uint32_t>(ACLSHMEM_DATA_OP_MAX) << 1) - 1;
+    uint32_t int_value = static_cast<uint32_t>(value);
+    return int_value > 0 && (int_value & ~valid_mask) == 0;
 }
 
-int32_t shmemi_heap_init(shmem_init_attr_t *attributes)
+int32_t check_attr(aclshmemx_init_attr_t *attributes)
 {
-    void *gva = nullptr;
-    int32_t status = SHMEM_SUCCESS;
-    int32_t device_id;
-    SHMEM_CHECK_RET(aclrtGetDevice(&device_id), aclrtGetDevice);
+    SHM_LOG_DEBUG("check_attr my_pe=" << attributes->my_pe << " n_pes=" << attributes->n_pes << " local_mem_size=" << attributes->local_mem_size
+                                      << " shm_init_timeout=" << attributes->option_attr.shm_init_timeout
+                                      << " control_operation_timeout=" << attributes->option_attr.control_operation_timeout);
+    SHM_VALIDATE_RETURN(attributes->my_pe >= 0, "my_pe is less than zero", ACLSHMEM_INVALID_VALUE);
+    SHM_VALIDATE_RETURN(attributes->n_pes > 0, "n_pes is less than or equal to zero", ACLSHMEM_INVALID_VALUE);
+    SHM_VALIDATE_RETURN(attributes->n_pes <= ACLSHMEM_MAX_PES, "n_pes is too large", ACLSHMEM_INVALID_VALUE);
+    SHM_VALIDATE_RETURN(attributes->my_pe < attributes->n_pes, "my_pe is greater than or equal to n_pes", ACLSHMEM_INVALID_PARAM);
+    SHM_VALIDATE_RETURN(attributes->local_mem_size > 0, "local_mem_size less than or equal to 0", ACLSHMEM_INVALID_VALUE);
+    SHM_ASSERT_RETURN(attributes->local_mem_size <= ACLSHMEM_MAX_LOCAL_SIZE, ACLSHMEM_INVALID_VALUE);
 
-    status = smem_init(DEFAULT_FLAG);
-    if (status != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("smem_init Failed");
-        return SHMEM_SMEM_ERROR;
-    }
-    smem_shm_config_t config;
-    status = smem_shm_config_init(&config);
-    if (status != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("smem_shm_config_init Failed");
-        return SHMEM_SMEM_ERROR;
-    }
-    // set config.sockFd value
-    config.sockFd = attributes->option_attr.sockFd;
-    status = smem_shm_init(attributes->ip_port, attributes->n_ranks, attributes->my_rank, device_id, &config);
-    if (status != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("smem_shm_init Failed");
-        return SHMEM_SMEM_ERROR;
-    }
-
-    config.shmInitTimeout = attributes->option_attr.shm_init_timeout;
-    config.shmCreateTimeout = attributes->option_attr.shm_create_timeout;
-    config.controlOperationTimeout = attributes->option_attr.control_operation_timeout;
-
-    g_smem_handle = smem_shm_create(DEFAULT_ID, attributes->n_ranks, attributes->my_rank, g_state.heap_size,
-                                    static_cast<smem_shm_data_op_type>(attributes->option_attr.data_op_engine_type),
-                                    DEFAULT_FLAG, &gva);
-    if (g_smem_handle == nullptr || gva == nullptr) {
-        SHM_LOG_ERROR("smem_shm_create Failed");
-        return SHMEM_SMEM_ERROR;
-    }
-    SHMEM_CHECK_RET(
-        aclrtMallocHost(((void **)&g_state.p2p_heap_host_base), g_state.npes * sizeof(void *)));
-    SHMEM_CHECK_RET(
-        aclrtMallocHost(((void **)&g_state.sdma_heap_host_base), g_state.npes * sizeof(void *)));
-    SHMEM_CHECK_RET(
-        aclrtMallocHost(((void **)&g_state.roce_heap_host_base), g_state.npes * sizeof(void *)));
-
-    SHMEM_CHECK_RET(aclrtMalloc(((void **)&g_state.p2p_heap_device_base), g_state.npes * sizeof(void *),
-        ACL_MEM_MALLOC_HUGE_FIRST));
-    SHMEM_CHECK_RET(aclrtMalloc(((void **)&g_state.sdma_heap_device_base), g_state.npes * sizeof(void *),
-        ACL_MEM_MALLOC_HUGE_FIRST));
-    SHMEM_CHECK_RET(aclrtMalloc(((void **)&g_state.roce_heap_device_base), g_state.npes * sizeof(void *),
-        ACL_MEM_MALLOC_HUGE_FIRST));
-
-    auto alignedSize = ALIGN_UP(g_state.heap_size, SHMEM_HEAP_SEGMENT_SIZE);
-    g_state.heap_base = (void *)((uintptr_t)gva + alignedSize * static_cast<uint32_t>(attributes->my_rank));
-    g_state.heap_size = alignedSize;
-
-    shmemi_reach_info_init(gva);
-    if (shm::g_ipport[0] != '\0') {
-        g_ipport[0] = '\0';
-        bzero(attributes->ip_port, sizeof(attributes->ip_port));
-    } else {
-        SHM_LOG_WARN("my_rank:" << attributes->my_rank << " shm::g_ipport is released in advance!");
-        bzero(attributes->ip_port, sizeof(attributes->ip_port));
-    }
-    g_state.is_shmem_created = true;
-    return status;
+    SHM_VALIDATE_RETURN(attributes->option_attr.shm_init_timeout != 0, "shm_init_timeout is zero", ACLSHMEM_INVALID_VALUE);
+    SHM_VALIDATE_RETURN(attributes->option_attr.control_operation_timeout != 0, "control_operation_timeout is zero", ACLSHMEM_INVALID_VALUE);
+    SHM_VALIDATE_RETURN(attributes->option_attr.data_op_engine_type > 0, "sockFd is invalid", ACLSHMEM_INVALID_VALUE);
+    SHM_ASSERT_RETURN(is_valid_data_op_engine_type(attributes->option_attr.data_op_engine_type), ACLSHMEM_INVALID_VALUE);
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmemi_control_barrier_all()
+int32_t aclshmemi_control_barrier_all()
 {
-    SHM_ASSERT_RETURN(g_smem_handle != nullptr, SHMEM_INVALID_PARAM);
-    auto ret = smem_shm_control_barrier(g_smem_handle);
-    if (ret != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("Barrier failed");
-        return ret;
-    }
-    return SHMEM_SUCCESS;
+    return init_manager->aclshmemi_control_barrier_all();
+}
+
+int32_t is_alloc_size_symmetric(size_t size)
+{
+    return init_manager->is_alloc_size_symmetric(size);
 }
 
 int32_t update_device_state()
 {
-    if (!g_state.is_shmem_created) {
-        return SHMEM_NOT_INITED;
-    }
-
-    SHMEM_CHECK_RET(aclrtMemcpy(g_state.p2p_heap_device_base, g_state.npes * sizeof(void *),
-        g_state.p2p_heap_host_base, g_state.npes * sizeof(void *), ACL_MEMCPY_HOST_TO_DEVICE), aclrtMemcpy);
-    SHMEM_CHECK_RET(aclrtMemcpy(g_state.sdma_heap_device_base, g_state.npes * sizeof(void *),
-        g_state.sdma_heap_host_base, g_state.npes * sizeof(void *), ACL_MEMCPY_HOST_TO_DEVICE), aclrtMemcpy);
-    SHMEM_CHECK_RET(aclrtMemcpy(g_state.roce_heap_device_base, g_state.npes * sizeof(void *),
-        g_state.roce_heap_host_base, g_state.npes * sizeof(void *), ACL_MEMCPY_HOST_TO_DEVICE), aclrtMemcpy);
-    auto ret = smem_shm_set_extra_context(g_smem_handle, (void *)&g_state, sizeof(shmemi_device_host_state_t));
-    if (ret != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("Failed to attach extra context to segment");
-        return ret;
-    }
-    return SHMEM_SUCCESS;
+    return init_manager->update_device_state((void *)&g_state, sizeof(aclshmem_device_host_state_t));
 }
 
-int32_t check_attr(shmem_init_attr_t *attributes)
+
+int32_t aclshmemx_init_status(void)
 {
-    if ((attributes->my_rank < 0) || (attributes->n_ranks <= 0)) {
-        SHM_LOG_ERROR("my_rank:" << attributes->my_rank << " and n_ranks: " << attributes->n_ranks
-                                 << " cannot be less 0 , n_ranks still cannot be equal 0");
-        return SHMEM_INVALID_VALUE;
-    } else if (attributes->n_ranks > SHMEM_MAX_RANKS) {
-        SHM_LOG_ERROR("n_ranks: " << attributes->n_ranks << " cannot be more than " << SHMEM_MAX_RANKS);
-        return SHMEM_INVALID_VALUE;
-    } else if (attributes->my_rank >= attributes->n_ranks) {
-        SHM_LOG_ERROR("n_ranks:" << attributes->n_ranks << " cannot be less than my_rank:" << attributes->my_rank);
-        return SHMEM_INVALID_PARAM;
-    } else if (attributes->local_mem_size <= 0) {
-        SHM_LOG_ERROR("local_mem_size:" << attributes->local_mem_size << " cannot be less or equal 0");
-        return SHMEM_INVALID_VALUE;
-    }
-    return SHMEM_SUCCESS;
+    if (!g_state.is_aclshmem_created)
+        return ACLSHMEM_STATUS_NOT_INITIALIZED;
+    else if (!g_state.is_aclshmem_initialized)
+        return ACLSHMEM_STATUS_SHM_CREATED;
+    else if (g_state.is_aclshmem_initialized)
+        return ACLSHMEM_STATUS_IS_INITIALIZED;
+    else
+        return ACLSHMEM_STATUS_INVALID;
 }
 
-}  // namespace shm
+int aclshmemx_set_attr_uniqueid_args(int my_pe, int n_pes, int64_t local_mem_size,
+                                    aclshmemx_uniqueid_t *uid,
+                                    aclshmemx_init_attr_t *aclshmem_attr) {
+    /* Save to uid_args */
+    SHM_ASSERT_RETURN(local_mem_size <= ACLSHMEM_MAX_LOCAL_SIZE, ACLSHMEM_INVALID_VALUE);
+    SHM_ASSERT_RETURN(n_pes <= ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);
+    SHM_ASSERT_RETURN(my_pe < ACLSHMEM_MAX_PES, ACLSHMEM_INVALID_VALUE);
+    aclshmemi_bootstrap_uid_state_t *uid_args = (aclshmemi_bootstrap_uid_state_t *)(uid);
+    void * comm_args = reinterpret_cast<void *>(uid_args);
+    aclshmem_attr->comm_args = comm_args;
+    aclshmem_attr->my_pe = my_pe;
+    aclshmem_attr->n_pes = n_pes;
+    aclshmem_attr->local_mem_size = local_mem_size;
 
-int32_t shmem_set_data_op_engine_type(shmem_init_attr_t *attributes, data_op_engine_type_t value)
-{
-    SHM_ASSERT_RETURN(attributes != nullptr, SHMEM_INVALID_PARAM);
-    attributes->option_attr.data_op_engine_type = value;
-    return SHMEM_SUCCESS;
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_set_timeout(shmem_init_attr_t *attributes, uint32_t value)
+bool check_support_d2h()
 {
-    SHM_ASSERT_RETURN(attributes != nullptr, SHMEM_INVALID_PARAM);
-    attributes->option_attr.shm_init_timeout = value;
-    attributes->option_attr.shm_create_timeout = value;
-    attributes->option_attr.control_operation_timeout = value;
-    return SHMEM_SUCCESS;
-}
-
-int32_t shmem_set_attr(int32_t my_rank, int32_t n_ranks, uint64_t local_mem_size, const char *ip_port,
-                       shmem_init_attr_t **attributes)
-{
-    SHM_ASSERT_RETURN(local_mem_size <= SHMEM_MAX_LOCAL_SIZE, SHMEM_INVALID_VALUE);
-    SHM_ASSERT_RETURN(n_ranks <= SHMEM_MAX_RANKS, SHMEM_INVALID_VALUE);
-    SHM_ASSERT_RETURN(my_rank < SHMEM_MAX_RANKS, SHMEM_INVALID_VALUE);
-    *attributes = &shm::g_attr;
-    size_t ip_len = 0;
-    if (ip_port != nullptr) {
-        ip_len = std::min(strlen(ip_port), sizeof(shm::g_ipport) - 1);
-
-        std::copy_n(ip_port, ip_len, shm::g_ipport);
-        shm::g_ipport[ip_len] = '\0';
-        std::copy_n(shm::g_ipport, ip_len, shm::g_attr.ip_port);
-        if (shm::g_ipport[0] == '\0') {
-            SHM_LOG_ERROR("my_rank:" << my_rank << " shm::g_ipport is nullptr!");
-            return SHMEM_INVALID_VALUE;
-        }
-    } else {
-        SHM_LOG_WARN("init with my_rank:" << my_rank << " ip_port is nullptr!");
-    }
-
-    int attr_version = static_cast<int>((1 << 16) + sizeof(shmem_init_attr_t));
-    shm::g_attr.my_rank = my_rank;
-    shm::g_attr.n_ranks = n_ranks;
-    shm::g_attr.ip_port[ip_len] = '\0';
-    shm::g_attr.local_mem_size = local_mem_size;
-    shm::g_attr.option_attr = {attr_version, SHMEM_DATA_OP_MTE, shm::DEFAULT_TIMEOUT,
-                               shm::DEFAULT_TIMEOUT, shm::DEFAULT_TIMEOUT, 0};
-    shm::g_attr_init = true;
-    return SHMEM_SUCCESS;
-}
-
-int32_t shmem_get_uid_magic(shmem_uniqueid_inner_t *innerUId)
-{
-    std::ifstream urandom("/dev/urandom", std::ios::binary);
-    if (!urandom) {
-        SHM_LOG_ERROR("open random failed");
-        return SHMEM_INNER_ERROR;
-    }
-
-    urandom.read(reinterpret_cast<char *>(&innerUId->magic), sizeof(innerUId->magic));
-    if (urandom.fail()) {
-        SHM_LOG_ERROR("read random failed.");
-        return SHMEM_INNER_ERROR;
-    }
-    SHM_LOG_DEBUG("init magic id to " << innerUId->magic);
-    return SHMEM_SUCCESS;
-}
-
-int32_t shmem_get_port_magic(shmem_uniqueid_inner_t *innerUId, char *ip_str)
-{
-    static std::random_device rd;
-    const int min_port = shm::MIN_PORT;
-    const int max_port = shm::MAX_PORT;
-    const int max_attempts = shm::MAX_ATTEMPTS;
-    const int offset_bit = 32;
-    uint64_t seed = 1;
-    seed |= static_cast<uint64_t>(getpid()) << offset_bit;
-    seed |= static_cast<uint64_t>(static_cast<uint32_t>(std::chrono::system_clock::now().time_since_epoch().count())
-                                  & 0xFFFFFFFF);
-    static std::mt19937_64 gen(seed);
-    std::uniform_int_distribution<> dis(min_port, max_port);
-
-    int sockfd = -1;
-    int32_t ret;
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int port = dis(gen);
-        if (innerUId->addr.type == ADDR_IPv4) {
-            ret = shm::bind_tcp_port_v4(sockfd, port, innerUId, ip_str);
-            if (ret == 0) {
-                innerUId->inner_sockFd = sockfd;
-                return 0;
-            }
-        } else {
-            ret = shm::bind_tcp_port_v6(sockfd, port, innerUId, ip_str);
-            if (ret == 0) {
-                innerUId->inner_sockFd = sockfd;
-                return 0;
-            }
-        }
-    }
-    SHM_LOG_ERROR("Not find a available tcp port");
-    return -1;
-}
-
-int32_t shmem_using_env_port(shmem_uniqueid_inner_t *innerUId, char *ip_str, uint16_t envPort)
-{
-    if (envPort < shm::MIN_PORT) {   // envPort > MAX_PORT always false
-        SHM_LOG_ERROR("env port is invalid. " << envPort);
-        return SHMEM_INVALID_PARAM;
-    }
-
-    int sockfd = -1;
-    int32_t ret;
-    if (innerUId->addr.type == ADDR_IPv4) {
-        ret = shm::bind_tcp_port_v4(sockfd, envPort, innerUId, ip_str);
-        if (ret == 0) {
-            innerUId->inner_sockFd = sockfd;
-            return 0;
-        }
-    } else {
-        ret = shm::bind_tcp_port_v6(sockfd, envPort, innerUId, ip_str);
-        if (ret == 0) {
-            innerUId->inner_sockFd = sockfd;
-            return 0;
-        }
-    }
-    SHM_LOG_ERROR("init with env port fialed " << envPort << ", ret=" << ret);
-    return ret;
-}
-
-int32_t ParseInterfaceWithType(const char *ipInfo, char *IP, sa_family_t &sockType, bool &flag)
-{
-    const char *delim = ":";
-    const char *sep = strchr(ipInfo, delim[0]);
-    if (sep != nullptr) {
-        size_t leftLen = sep - ipInfo;
-        if (leftLen >= shm::MAX_IFCONFIG_LENGTH - 1 || leftLen == 0) {
-            return SHMEM_INVALID_VALUE;
-        }
-        std::copy_n(ipInfo, leftLen, IP);
-        IP[leftLen] = '\0';
-        sockType = (strcmp(sep + 1, "inet6") != 0) ? AF_INET : AF_INET6;
-        flag = true;
-    }
-    return SHMEM_SUCCESS;
-}
-
-int32_t shmem_auto_get_ip(struct sockaddr *ifaAddr, char *local, sa_family_t &sockType)
-{
-    sockType = ifaAddr->sa_family;
-    if (sockType == AF_INET) {
-        auto localIp = reinterpret_cast<struct sockaddr_in *>(ifaAddr)->sin_addr;
-        if (inet_ntop(sockType, &localIp, local, shm::MAX_IP) == nullptr) {
-            SHM_LOG_ERROR("convert local ipv4 to string failed. ");
-            return SHMEM_INVALID_PARAM;
-        }
-        return SHMEM_SUCCESS;
-    } else if (sockType == AF_INET6) {
-        auto localIp = reinterpret_cast<struct sockaddr_in6 *>(ifaAddr)->sin6_addr;
-        if (inet_ntop(sockType, &localIp, local, shm::MAX_IP) == nullptr) {
-            SHM_LOG_ERROR("convert local ipv6 to string failed. ");
-            return SHMEM_INVALID_PARAM;
-        }
-        return SHMEM_SUCCESS;
-    }
-    return SHMEM_INVALID_PARAM;
-}
-
-bool shmem_check_ifa(struct ifaddrs *ifa, sa_family_t sockType, bool flag, char *ifaName, size_t ifaLen)
-{
-    if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr || ifa->ifa_name == nullptr) {
-        SHM_LOG_DEBUG("loop ifa_addr/ifa_netmask/ifa_name is nullptr");
+    int32_t major_version = -1;
+    int32_t minor_version = -1;
+    int32_t patch_version = -1;
+    if (aclrtGetVersion(&major_version, &minor_version, &patch_version) != 0) {
+        SHM_LOG_INFO("aclrtGetVersion failed, disable d2h feature");
         return false;
     }
-
-    // socket type match and input env ifa valid
-    if (ifa->ifa_addr->sa_family != sockType && flag) {
-        SHM_LOG_DEBUG("sa family is not match, get " << ifa->ifa_addr->sa_family << ", expect " << sockType);
+    if (major_version <= 1 && minor_version < 15) {
+        SHM_LOG_INFO("The current AscendCL version is "
+            << major_version << "." << minor_version << "." << patch_version << ", which does not support d2h.");
         return false;
-    }
-
-    //  prefix match with input ifa name
-    if (strncmp(ifa->ifa_name, ifaName, ifaLen) != 0) {
-        SHM_LOG_DEBUG("ifa name prefix un-match, get " << ifa->ifa_name << ", expect " << ifaName);
-        return false;
-    }
-
-    // ignore ifa which is down or loopback or not running
-    if ((ifa->ifa_flags & IFF_LOOPBACK) || !(ifa->ifa_flags & IFF_RUNNING) || !(ifa->ifa_flags & IFF_UP)) {
-        SHM_LOG_DEBUG("ifa flag un-match, flag=" << ifa->ifa_flags);
-        return false;
-    }
-
-    if (sockType == AF_INET6) {
-        struct sockaddr_in6 *sa6 = reinterpret_cast<struct sockaddr_in6 *>(ifa->ifa_addr);
-        if (IN6_IS_ADDR_LINKLOCAL(&sa6->sin6_addr)) {
-            SHM_LOG_DEBUG("ifa is scope link addr " << ifaName);
-            return false;
-        }
     }
     return true;
 }
 
-int32_t shmem_get_ip_from_ifa(char *local, sa_family_t &sockType, const string ipInfo)
+int32_t aclshmemi_signal_finalize()
 {
-    struct ifaddrs *ifaddr;
-    char ifaName[shm::MAX_IFCONFIG_LENGTH];
-    sockType = AF_INET;
-    bool flag = false;
-    if (ipInfo.empty()) {
-        std::copy_n("eth", shm::DEFAULT_IFNAME_LNEGTH, ifaName);
-        ifaName[shm::DEFAULT_IFNAME_LNEGTH - 1] = '\0';
-        SHM_LOG_INFO("use default if to find IP:" << ifaName);
-    } else if (ParseInterfaceWithType(ipInfo.c_str(), ifaName, sockType, flag) != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("IP size set in SHMEM_CONF_STORE_MASTER_IF format has wrong length");
-        return SHMEM_INVALID_PARAM;
+    if (g_state.signal_addr != 0) {
+        aclshmem_free(reinterpret_cast<void *>(g_state.signal_addr));
+        g_state.signal_addr = 0;
     }
-    if (getifaddrs(&ifaddr) == -1) {
-        SHM_LOG_ERROR("get local net interfaces failed: " << errno);
-        return SHMEM_INVALID_PARAM;
-    }
-    int32_t result = SHMEM_INVALID_PARAM;
-    const int IP_STR_BUFFER_SIZE = 64;
-    for (auto ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-        if (!shmem_check_ifa(ifa, sockType, flag, ifaName, strlen(ifaName))) {
-            continue;
-        }
-        if (sockType == AF_INET && flag) {
-            auto localIp = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr)->sin_addr;
-            if (inet_ntop(sockType, &localIp, local, IP_STR_BUFFER_SIZE) == nullptr) {
-                SHM_LOG_ERROR("convert local ipv4 to string failed. ");
-                continue;
-            }
-            result = SHMEM_SUCCESS;
-            break;
-        } else if (sockType == AF_INET6 && flag) {
-            auto localIp = reinterpret_cast<struct sockaddr_in6 *>(ifa->ifa_addr)->sin6_addr;
-            if (inet_ntop(sockType, &localIp, local, IP_STR_BUFFER_SIZE) == nullptr) {
-                SHM_LOG_ERROR("convert local ipv6 to string failed. ");
-                continue;
-            }
-            result = SHMEM_SUCCESS;
-            break;
-        } else {
-            auto ret = shmem_auto_get_ip(ifa->ifa_addr, local, sockType);
-            if (ret != SHMEM_SUCCESS) {
-                continue;
-            }
-            result = SHMEM_SUCCESS;
-            break;
-        }
-    }
-    freeifaddrs(ifaddr);
-    return result;
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_get_ip_from_env(char *ip, uint16_t &port, sa_family_t &sockType, const string ipPort)
+int32_t aclshmemi_signal_init()
 {
-    if (!ipPort.empty()) {
-        SHM_LOG_DEBUG("get env SHMEM_UID_SESSION_ID value:" << ipPort);
-        std::string ipPortStr = ipPort;
-
-        if (ipPort[0] == '[') {
-            sockType = AF_INET6;
-            size_t found = ipPortStr.find_last_of(']');
-            if (found == std::string::npos || ipPortStr.length() - found <= 1) {
-                SHM_LOG_ERROR("get env SHMEM_UID_SESSION_ID is invalid");
-                return SHMEM_INVALID_PARAM;
-            }
-            std::string ipStr = ipPortStr.substr(1, found - 1);
-            std::string portStr = ipPortStr.substr(found + 2);
-
-            std::string result = ipStr;
-            if (result.length() >= shm::MAX_IP) {
-                SHM_LOG_ERROR("IP address is too long");
-                return SHMEM_INVALID_PARAM;
-            }
-            std::copy(result.begin(), result.end(), ip);
-            ip[result.length()] = '\0';
-
-            port = std::stoi(portStr);
-        } else {
-            sockType = AF_INET;
-            size_t found = ipPortStr.find_last_of(':');
-            if (found == std::string::npos || ipPortStr.length() - found <= 1) {
-                SHM_LOG_ERROR("get env SHMEM_UID_SESSION_ID is invalid");
-                return SHMEM_INVALID_PARAM;
-            }
-            std::string ipStr = ipPortStr.substr(0, found);
-            std::string portStr = ipPortStr.substr(found + 1);
-
-            std::string result = ipStr;
-            if (result.length() >= shm::MAX_IP) {
-                SHM_LOG_ERROR("IP address is too long");
-                return SHMEM_INVALID_PARAM;
-            }
-            std::copy(result.begin(), result.end(), ip);
-            ip[result.length()] = '\0';
-
-            port = std::stoi(portStr);
-        }
-        return SHMEM_SUCCESS;
+    constexpr size_t align_size = 512;
+    g_state.signal_addr = (uint64_t)aclshmem_malloc(align_size);
+    if (g_state.signal_addr == 0) {
+        SHM_LOG_ERROR("malloc signal failed.");
+        return ACLSHMEM_INNER_ERROR;
     }
-    return SHMEM_INVALID_PARAM;
+    auto ret = aclrtMemset((void *)g_state.signal_addr, ACLSHMEM_SIGNAL_SIZE, 0, ACLSHMEM_SIGNAL_SIZE);
+    if (ret != 0) {
+        aclshmemi_signal_finalize();
+        SHM_LOG_ERROR("memset signal failed. ret=" << ret);
+        return ACLSHMEM_INNER_ERROR;
+    }
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_set_ip_info(shmem_uniqueid_t *uid, sa_family_t &sockType, char *pta_env_ip, uint16_t pta_env_port,
-                          bool is_from_ifa)
+static int32_t aclshmemi_instance_port_selection(aclshmemx_init_attr_t *attributes)
 {
-    // init default uid
-    SHM_ASSERT_RETURN(uid != nullptr, SHMEM_INVALID_PARAM);
-    *uid = SHMEM_UNIQUEID_INITIALIZER;
-    shmem_uniqueid_inner_t *innerUID = reinterpret_cast<shmem_uniqueid_inner_t *>(uid);
-    if (sockType == AF_INET) {
-        innerUID->addr.addr.addr4.sin_family = AF_INET;
-        if (inet_pton(AF_INET, pta_env_ip, &(innerUID->addr.addr.addr4.sin_addr)) <= 0) {
-            SHM_LOG_ERROR("inet_pton IPv4 failed");
-            return SHMEM_NOT_INITED;
-        }
-        innerUID->addr.type = ADDR_IPv4;
-    } else if (sockType == AF_INET6) {
-        innerUID->addr.addr.addr6.sin6_family = AF_INET6;
-        if (inet_pton(AF_INET6, pta_env_ip, &(innerUID->addr.addr.addr6.sin6_addr)) <= 0) {
-            SHM_LOG_ERROR("inet_pton IPv6 failed");
-            return SHMEM_NOT_INITED;
-        }
-        innerUID->addr.type = ADDR_IPv6;
-    } else {
-        SHM_LOG_ERROR("IP Type is not IPv4 or IPv6");
-        return SHMEM_INVALID_PARAM;
+    // 1. Get Port Range From Environment
+    const char* env_port_range = std::getenv("SHMEM_INSTANCE_PORT_RANGE");
+    if (env_port_range == nullptr) {
+        SHM_LOG_ERROR("The environment variable SHMEM_INSTANCE_PORT_RANGE is not set.");
+        return ACLSHMEM_INVALID_VALUE;
     }
 
-    // fill ip port as part of uid
-    if (is_from_ifa) {
-        int32_t ret = shmem_get_port_magic(innerUID, pta_env_ip);
-        if (ret != 0) {
-            SHM_LOG_ERROR("get available port failed.");
-            return SHMEM_INVALID_PARAM;
-        }
-    } else {
-        int32_t ret = shmem_using_env_port(innerUID, pta_env_ip, pta_env_port);
-        if (ret != 0) {
-            SHM_LOG_ERROR("using env port failed.");
-            return SHMEM_INVALID_PARAM;
-        }
+    std::string env_port_range_str(env_port_range);
+    std::size_t env_pos = env_port_range_str.find(':');
+    if (env_pos == std::string::npos) {
+        SHM_LOG_ERROR("SHMEM_INSTANCE_PORT_RANGE format should be start_port:end_port");
+        return ACLSHMEM_INVALID_VALUE;
     }
 
-    SHM_LOG_INFO("gen unique id success.");
-    return SHMEM_SUCCESS;
+    uint16_t start_port;
+    uint16_t end_port;
+    try {
+        start_port = static_cast<uint16_t>(std::stoi(env_port_range_str.substr(0, env_pos)));
+        end_port = static_cast<uint16_t>(std::stoi(env_port_range_str.substr(env_pos + 1, env_port_range_str.size())));
+    } catch (const std::exception& e) {
+        SHM_LOG_ERROR("Invalid SHMEM_INSTANCE_PORT_RANGE format: " << e.what());
+        return ACLSHMEM_INVALID_VALUE;
+    }
+    if (end_port < start_port) {
+        SHM_LOG_ERROR("SHMEM_INSTANCE_PORT_RANGE: start_port " << start_port << " exceeds end_port " << end_port);
+        return ACLSHMEM_INVALID_VALUE;
+    }
+
+    // 2. Check if instance_id is valid
+    int max_instance_num = end_port - start_port;
+    uint64_t instance_id = attributes->instance_id;
+    if (instance_id > static_cast<uint64_t>(max_instance_num)) {
+        SHM_LOG_ERROR("instance_id " << instance_id << " exceeds max_instance_num " << max_instance_num << " in default mode");
+        return ACLSHMEM_INVALID_VALUE;
+    }
+    uint16_t port = start_port + static_cast<uint16_t>(instance_id);
+
+    // 3. If ip_port is null, return
+    if (attributes->ip_port[0] == '\0') {
+        SHM_LOG_ERROR("init with my_rank:" << attributes->my_pe << " ip_port is nullptr!");
+        return ACLSHMEM_INVALID_VALUE;
+    }
+
+    // 4. replace ip_port in attributes
+    std::string ip_port_str(attributes->ip_port);
+    std::size_t pos = ip_port_str.find(':', ip_port_str.find(':') + 1);
+    if (pos == std::string::npos) {
+        SHM_LOG_ERROR("ip_port format should be ip:port");
+        return ACLSHMEM_INVALID_VALUE;
+    }
+
+    uint16_t input_port;
+    try {
+        input_port = static_cast<uint16_t>(std::stoi(ip_port_str.substr(pos + 1, ip_port_str.size())));
+    } catch (const std::exception& e) {
+        SHM_LOG_ERROR("Invalid ip_port format: " << e.what());
+        return ACLSHMEM_INVALID_VALUE;
+    }
+    if (input_port != 0) {
+        SHM_LOG_ERROR("input_port must be 0 in default mode, but input_port is " << input_port);
+        return ACLSHMEM_INVALID_VALUE;
+    }
+
+    std::string instance_ipport = ip_port_str.substr(0, pos) + ":" + std::to_string(port);
+    if (instance_ipport.empty()) {
+        SHM_LOG_ERROR("my_rank:" << attributes->my_pe << " instance ipport is nullptr!");
+        return ACLSHMEM_INVALID_VALUE;
+    }
+
+    // 5. Write port in attributes
+    size_t ipport_len = std::min(instance_ipport.size(), static_cast<std::size_t>(ACLSHMEM_MAX_IP_PORT_LEN - 1));
+    std::copy_n(instance_ipport.c_str(), ipport_len, attributes->ip_port);
+    attributes->ip_port[ipport_len] = '\0';
+
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_get_uniqueid(shmem_uniqueid_t *uid)
+static int aclshmemi_instance_ctx_create(aclshmemx_init_attr_t *attributes)
 {
-    if (shmem_set_log_level(shm::WARN_LEVEL) != 0) {
-        SHM_LOG_ERROR("failed to set log level");
-        return SHMEM_INNER_ERROR;
+    uint64_t instance_id = attributes->instance_id;
+    if (instance_id == 0) {
+        // Do Nothing.
+        return ACLSHMEM_SUCCESS;
     }
-    char pta_env_ip[shm::MAX_IP];
-    uint16_t pta_env_port{};
-    sa_family_t sockType;
-    const char *ipPortInput = std::getenv("SHMEM_UID_SESSION_ID");
-    const char *ipInfoInput = std::getenv("SHMEM_UID_SOCK_IFNAM");
-    const string ipPort = ipPortInput ? ipPortInput : "";
-    const string ipInfo = ipInfoInput ? ipInfoInput : "";
-    bool is_from_ifa = false;
-    if (!ipPort.empty()) {
-        if (shmem_get_ip_from_env(pta_env_ip, pta_env_port, sockType, ipPort) != SHMEM_SUCCESS) {
-            SHM_LOG_ERROR("cant get pta master addr.");
-            return SHMEM_INVALID_PARAM;
-        }
-    } else {
-        is_from_ifa = true;
-        if (shmem_get_ip_from_ifa(pta_env_ip, sockType, ipInfo) != SHMEM_SUCCESS) {
-            SHM_LOG_ERROR("cant get available ip port.");
-            return SHMEM_INVALID_PARAM;
-        }
+
+    // Check if Repeat
+    if (aclshmem_ctx_domain.find(instance_id) != aclshmem_ctx_domain.end() || 
+        aclshmem_resource_domain.find(instance_id) != aclshmem_resource_domain.end()) {
+        SHM_LOG_WARN("Instance " << instance_id << " already exists ! Please don't repeat create !");
+        return ACLSHMEM_SUCCESS;
     }
-    SHM_LOG_INFO("get master IP value:" << pta_env_ip);
-    return shmem_set_ip_info(uid, sockType, pta_env_ip, pta_env_port, is_from_ifa);
+
+    // aclshmem_instance port selection, if init with uid, skip
+    if (attributes->ip_port[0] != '\0' || attributes->comm_args == nullptr) {
+        ACLSHMEM_CHECK_RET(aclshmemi_instance_port_selection(attributes));
+    }
+
+    // Create aclshmem_instance_ctx
+    aclshmem_instance_ctx *aclshmem_ctx = new aclshmem_instance_ctx{attributes->instance_id, nullptr};
+    if (aclshmem_ctx == nullptr) {
+        SHM_LOG_ERROR("Failed to allocate memory for aclshmem_instance_ctx.");
+        return ACLSHMEM_INNER_ERROR;
+    }
+    aclshmem_ctx_domain[attributes->instance_id] = aclshmem_ctx;
+
+    aclshmem_context *aclshmem_resource_ctx = new aclshmem_context(attributes->instance_id);
+    if (aclshmem_resource_ctx == nullptr) {
+        SHM_LOG_ERROR("Failed to allocate memory for aclshmem_context.");
+        return ACLSHMEM_INNER_ERROR;
+    }
+    aclshmem_resource_domain[attributes->instance_id] = aclshmem_resource_ctx;
+
+    SHM_LOG_WARN("PE: " << attributes->my_pe << " USING SHMEM Multi-Instance Mode ! Now Ctx set to Instance " << instance_id << " !");
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_set_attr_uniqueid_args(int rank_id, int nranks, const shmem_uniqueid_t *uid, shmem_init_attr_t *attr)
+static int aclshmemi_instance_ctx_destroy(uint64_t instance_id)
 {
-    if (attr == nullptr || uid == nullptr) {
-        SHM_LOG_ERROR("set unique id attr/uid is null");
-        return SHMEM_INVALID_PARAM;
+    if (instance_id == 0) {
+        // Do Nothing.
+        return ACLSHMEM_SUCCESS;
     }
 
-    if (rank_id != shm::g_attr.my_rank || nranks != shm::g_attr.n_ranks) {
-        SHM_LOG_ERROR("rankid/nranks invalid, maybe call shmem_set_attr firstly.");
-        return SHMEM_INVALID_PARAM;
+    // if destroy an active context
+    if (instance_id == g_instance_ctx->id) {
+        // Set active context to Instance 0
+        aclshmemx_instance_ctx_set_impl(0);
     }
 
-    if (uid->version != SHMEM_UNIQUEID_VERSION) {
-        SHM_LOG_ERROR("uid version invalid, init unique id with shmem_get_uniqueid firstly.");
-        return SHMEM_INVALID_PARAM;
+    // Release Resource
+    auto it_resource = aclshmem_resource_domain.find(instance_id);
+    if (it_resource == aclshmem_resource_domain.end()) {
+        SHM_LOG_ERROR("Instance " << instance_id << " not exists! Illegal Context Destroy!");
+        return ACLSHMEM_INNER_ERROR;
     }
+    delete it_resource->second;
+    aclshmem_resource_domain.erase(it_resource);
 
-    // extract ip port from inner unique id
-    shmem_uniqueid_inner_t *innerUID = reinterpret_cast<shmem_uniqueid_inner_t *>(const_cast<shmem_uniqueid_t *>(uid));
-
-    // compatibility with shmem_init_attr, init ip_port from unique id
-    std::string ipPort;
-    if (innerUID->addr.type == ADDR_IPv6) {
-        char ipStr[INET6_ADDRSTRLEN] = {0};
-        if (inet_ntop(AF_INET6, &(innerUID->addr.addr.addr6.sin6_addr), ipStr, sizeof(ipStr)) == nullptr) {
-            SHM_LOG_ERROR("inet_ntop failed for IPv6");
-            return SHMEM_INNER_ERROR;
-        }
-        uint16_t port = ntohs(innerUID->addr.addr.addr6.sin6_port);
-        ipPort = "tcp6://[" + std::string(ipStr) + "]:" + std::to_string(port);
-    } else {
-        char ipStr[INET_ADDRSTRLEN] = {0};
-        if (inet_ntop(AF_INET, &(innerUID->addr.addr.addr4.sin_addr), ipStr, sizeof(ipStr)) == nullptr) {
-            SHM_LOG_ERROR("inet_ntop failed for IPv4");
-            return SHMEM_INNER_ERROR;
-        }
-        uint16_t port = ntohs(innerUID->addr.addr.addr4.sin_port);
-        ipPort = "tcp://" + std::string(ipStr) + ":" + std::to_string(port);
+    auto it_ctx = aclshmem_ctx_domain.find(instance_id);
+    if (it_ctx == aclshmem_ctx_domain.end()) {
+        SHM_LOG_ERROR("Instance " << instance_id << " not exists! Illegal Context Destroy!");
+        return ACLSHMEM_INNER_ERROR;
     }
-    std::copy(ipPort.begin(), ipPort.end(), shm::g_ipport);
-    std::copy(ipPort.begin(), ipPort.end(), shm::g_attr.ip_port);
-    std::copy(ipPort.begin(), ipPort.end(), attr->ip_port);
-    shm::g_ipport[ipPort.size()] = '\0';
-    shm::g_attr.ip_port[ipPort.size()] = '\0';
-    attr->ip_port[ipPort.size()] = '\0';
-    attr->option_attr.sockFd = innerUID->inner_sockFd;
-    SHM_LOG_INFO("extract ip port:" << ipPort);
+    delete it_ctx->second;
+    aclshmem_ctx_domain.erase(it_ctx);
 
-    int32_t status = shmem_init_attr(attr);
-    if (status != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("shmem_init_attr failed");
-        return status;
-    }
-    return SHMEM_SUCCESS;
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_init_status(void)
+aclshmem_instance_ctx* aclshmemx_instance_ctx_get()
 {
-    if (!shm::g_state.is_shmem_created)
-        return SHMEM_STATUS_NOT_INITIALIZED;
-    else if (!shm::g_state.is_shmem_initialized)
-        return SHMEM_STATUS_SHM_CREATED;
-    else if (shm::g_state.is_shmem_initialized)
-        return SHMEM_STATUS_IS_INITIALIZED;
-    else
-        return SHMEM_STATUS_INVALID;
+    std::lock_guard<std::mutex> lock(g_aclshmem_ctx_mutex);
+    return g_instance_ctx;
 }
 
-void shmem_rank_exit(int status)
+int aclshmemx_instance_ctx_set(uint64_t instance_id)
 {
-    SHM_LOG_DEBUG("shmem_rank_exit is work ,status: " << status);
-    exit(status);
+    std::lock_guard<std::mutex> lock(g_aclshmem_ctx_mutex);
+    return aclshmemx_instance_ctx_set_impl(instance_id);
 }
 
-int32_t shmem_init_attr(shmem_init_attr_t *attributes)
+// Inner Context set Interface, No Lock.
+int aclshmemx_instance_ctx_set_impl(uint64_t instance_id)
 {
+    if (aclshmem_ctx_domain.find(instance_id) != aclshmem_ctx_domain.end()) {
+        aclshmem_instance_ctx *new_ctx = aclshmem_ctx_domain[instance_id];
+        aclshmem_context *new_context = aclshmem_resource_domain[instance_id];
+        aclshmem_context *current_context = aclshmem_resource_domain[g_instance_ctx->id];
+
+        // Global_vars write back
+        current_context->state                  = g_state;
+        current_context->host_state             = g_state_host;
+        current_context->bootstrap_plugin_hdl   = plugin_hdl;
+        current_context->boot_handle            = g_boot_handle;
+        current_context->dev_mem_manager        = aclshmemi_memory_manager;
+        current_context->host_mem_manager       = aclshmemi_host_memory_manager;
+
+        // Set Global_vars by new_context
+        g_state                                 = new_context->state;
+        g_state_host                            = new_context->host_state;
+        plugin_hdl                              = new_context->bootstrap_plugin_hdl;
+        g_boot_handle                           = new_context->boot_handle;
+        aclshmemi_memory_manager                = new_context->dev_mem_manager;
+        aclshmemi_host_memory_manager           = new_context->host_mem_manager;
+
+        // Set New aclshmem context
+        g_instance_ctx = aclshmem_ctx_domain[instance_id];
+            
+        return ACLSHMEM_SUCCESS;
+    }
+    SHM_LOG_ERROR("Context Set failed ! Can't find instance " << instance_id << " !");
+    return ACLSHMEM_INNER_ERROR;
+}
+
+int32_t aclshmemx_init_attr(aclshmemx_bootstrap_t bootstrap_flags, aclshmemx_init_attr_t *attributes)
+{
+    std::lock_guard<std::mutex> lock(g_aclshmem_ctx_mutex);
     int32_t ret;
+    uint64_t id = attributes->instance_id;
 
-    SHM_ASSERT_RETURN(attributes != nullptr, SHMEM_INVALID_PARAM);
-    SHMEM_CHECK_RET(shmem_set_log_level(shm::WARN_LEVEL), shmem_set_log_level);
-    SHMEM_CHECK_RET(shm::check_attr(attributes), check_attr);
-    SHMEM_CHECK_RET(shm::version_compatible(), version_compatible);
-    SHMEM_CHECK_RET(shm::shmemi_options_init(), shmemi_options_init);
+    // Multi-instance create ctx
+    ACLSHMEM_CHECK_RET(aclshmemi_instance_ctx_create(attributes));
+    ACLSHMEM_CHECK_RET(aclshmemx_instance_ctx_set_impl(id));
 
-    SHMEM_CHECK_RET(shm::shmemi_state_init_attr(attributes), shmemi_state_init_attr);
-    SHMEM_CHECK_RET(shm::shmemi_heap_init(attributes), shmemi_heap_init);
-    SHMEM_CHECK_RET(shm::update_device_state(), update_device_state);
+    // config init
+    SHM_ASSERT_RETURN(attributes != nullptr, ACLSHMEM_INVALID_PARAM);
+    ACLSHMEM_CHECK_RET(aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED, "SHMEM has been initialized, do not call init interface repeatedly!", ACLSHMEM_INNER_ERROR);
+    ACLSHMEM_CHECK_RET(aclshmemx_set_log_level(aclshmem_log::ERROR_LEVEL));
+    ACLSHMEM_CHECK_RET(check_attr(attributes), "An error occurred while checking the initialization attributes. Please check the initialization parameters.");
+    ACLSHMEM_CHECK_RET(version_compatible(), "ACLSHMEM Version mismatch.");
+    // init bootstrap
+    ACLSHMEM_CHECK_RET(aclshmemi_bootstrap_init(bootstrap_flags, attributes));
+    ACLSHMEM_CHECK_RET(aclshmemi_state_init_attr(attributes));
 
-    // heap_size is aligned, use actual local_mem_size to init mm
-    SHMEM_CHECK_RET(shm::memory_manager_initialize(shm::g_state.heap_base, attributes->local_mem_size + SHMEM_EXTRA_SIZE),
-                    memory_manager_initialize);
-    SHMEM_CHECK_RET(shm::shmemi_team_init(shm::g_state.mype, shm::g_state.npes), shmemi_team_init);
-    SHMEM_CHECK_RET(shm::update_device_state(), update_device_state);
-    SHMEM_CHECK_RET(shm::shmemi_sync_init(), shmemi_sync_init);
-    SHMEM_CHECK_RET(smem_shm_register_exit(shm::g_smem_handle, &shmem_rank_exit), smem_shm_register_exit);
-    shm::g_state.is_shmem_initialized = true;
-    SHMEM_CHECK_RET(shm::shmemi_control_barrier_all(), shmemi_control_barrier_all);
-    return SHMEM_SUCCESS;
+    // init backend for memory manager
+    g_init_manager_count++;
+    if (init_manager == nullptr) {
+        init_manager = new aclshmemi_init_backend();
+    } else {
+        SHM_LOG_INFO("init_manager already exists, skipping creation. ");
+    }
+
+    // aclshmem_entity init
+    ACLSHMEM_CHECK_RET(init_manager->bind_aclshmem_entity(attributes, &g_state, &g_boot_handle));
+    ACLSHMEM_CHECK_RET(init_manager->init_device_state());
+    ACLSHMEM_CHECK_RET(init_manager->reserve_heap());
+    ACLSHMEM_CHECK_RET(init_manager->setup_heap());
+
+    // shmem submodules init
+    ACLSHMEM_CHECK_RET(memory_manager_initialize(g_state.heap_base, g_state.heap_size));
+
+#ifdef HAS_ACLRT_MEM_FABRIC_HANDLE
+    if (check_support_d2h()) {
+        // only reserve dramp heap, skip setup_heap for host dram, setup heap when malloc on host
+        ACLSHMEM_CHECK_RET(init_manager->reserve_heap(HOST_SIDE));
+    }
+#endif
+    ACLSHMEM_CHECK_RET(aclshmemi_signal_init());
+    ACLSHMEM_CHECK_RET(aclshmemi_team_init(g_state.mype, g_state.npes));
+    ACLSHMEM_CHECK_RET(aclshmemi_sync_init());
+    g_state.is_aclshmem_initialized = true;
+    ACLSHMEM_CHECK_RET(prof_util_init(&g_host_profs, &g_state));
+    ACLSHMEM_CHECK_RET(update_device_state());
+    ACLSHMEM_CHECK_RET(aclshmemi_control_barrier_all());
+    SHM_LOG_INFO("The ACLSHMEM pe: " << aclshmem_my_pe() << " init success.");
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_set_config_store_tls_key(const char *tls_pk, const uint32_t tls_pk_len,
-    const char *tls_pk_pw, const uint32_t tls_pk_pw_len, const shmem_decrypt_handler decrypt_handler)
+int32_t aclshmem_finalize(uint64_t instance_id)
 {
-    return smem_set_config_store_tls_key(tls_pk, tls_pk_len, tls_pk_pw, tls_pk_pw_len, decrypt_handler);
+    std::lock_guard<std::mutex> lock(g_aclshmem_ctx_mutex);
+    // When aclshmem_finalize, first set context; otherwise we will finalize unknown instance
+    aclshmemx_instance_ctx_set_impl(instance_id);
+
+    SHM_LOG_INFO("The instance : " << instance_id <<  ", The pe: " << aclshmem_my_pe() << " begins to finalize.");
+    if (init_manager == nullptr) {
+        SHM_LOG_INFO("init_manager is null finalize success.");
+        g_state.is_aclshmem_initialized = false;
+        ACLSHMEM_CHECK_RET(aclshmemi_instance_ctx_destroy(instance_id));
+        return ACLSHMEM_SUCCESS;
+    }
+    // shmem submodules finalize
+    ACLSHMEM_CHECK_RET(aclshmemi_team_finalize());
+    ACLSHMEM_CHECK_RET(aclshmemi_signal_finalize());
+    memory_manager_destroy();
+    // shmem basic finalize
+    ACLSHMEM_CHECK_RET(init_manager->remove_heap());
+    ACLSHMEM_CHECK_RET(init_manager->release_heap());
+    ACLSHMEM_CHECK_RET(init_manager->finalize_device_state());
+    SHM_LOG_INFO("release_heap success.");
+#ifdef HAS_ACLRT_MEM_FABRIC_HANDLE
+    if (check_support_d2h()) {
+        ACLSHMEM_CHECK_RET(init_manager->remove_heap(HOST_SIDE));
+        ACLSHMEM_CHECK_RET(init_manager->release_heap(HOST_SIDE));
+    }
+#endif
+    ACLSHMEM_CHECK_RET(init_manager->release_aclshmem_entity(instance_id));
+    if (g_state_host.default_stream != nullptr) {
+        ACLSHMEM_CHECK_RET(aclrtSynchronizeStream(g_state_host.default_stream));
+        ACLSHMEM_CHECK_RET(aclrtDestroyStream(g_state_host.default_stream));
+        g_state_host.default_stream = nullptr;
+    }
+    aclshmemi_bootstrap_finalize();
+
+    // Only When Process have no instance, then release init_manager.
+    g_init_manager_count--;
+    if (g_init_manager_count == 0) {
+        delete init_manager;
+        init_manager = nullptr;
+    }
+    SHM_LOG_INFO("The pe: " << aclshmem_my_pe() << " finalize success.");
+    g_state.is_aclshmem_initialized = false;
+    ACLSHMEM_CHECK_RET(aclshmemi_instance_ctx_destroy(instance_id));
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_set_extern_logger(void (*func)(int level, const char *msg))
+void aclshmem_info_get_version(int *major, int *minor)
 {
-    SHM_ASSERT_RETURN(func != nullptr, SHMEM_INVALID_PARAM);
-    shm::shm_out_logger::Instance().set_extern_log_func(func, true);
-    return smem_set_extern_logger(func);
+    SHM_ASSERT_RET_VOID(major != nullptr && minor != nullptr);
+    *major = ACLSHMEM_MAJOR_VERSION;
+    *minor = ACLSHMEM_MINOR_VERSION;
 }
 
-int32_t shmem_set_log_level(int level)
+void aclshmem_info_get_name(char *name)
+{
+    SHM_ASSERT_RET_VOID(name != nullptr);
+    std::ostringstream oss;
+    oss << "ACLSHMEM v" << ACLSHMEM_VENDOR_MAJOR_VER << "." << ACLSHMEM_VENDOR_MINOR_VER << "." << ACLSHMEM_VENDOR_PATCH_VER;
+    auto version_str = oss.str();
+    size_t i;
+    for (i = 0; i < ACLSHMEM_MAX_NAME_LEN - 1 && version_str[i] != '\0'; i++) {
+        name[i] = version_str[i];
+    }
+    name[i] = '\0';
+}
+
+int32_t aclshmemx_get_uniqueid(aclshmemx_uniqueid_t *uid)
+{
+    int status = aclshmemx_set_log_level(aclshmem_log::ERROR_LEVEL);
+
+    ACLSHMEM_CHECK_RET(aclshmemi_bootstrap_pre_init(ACLSHMEMX_INIT_WITH_UNIQUEID, &g_boot_handle), "Get uniqueid failed during the bootstrap preloading step.");
+
+    aclshmemx_uniqueid_t default_uid{};
+    default_uid.version = ACLSHMEM_UNIQUEID_VERSION;
+    *uid = default_uid;
+    if (g_boot_handle.pre_init_ops) {
+        ACLSHMEM_CHECK_RET(g_boot_handle.pre_init_ops->get_unique_id((void *)uid), "Get uniqueid failed during the get uniqueid step.");
+    } else {
+        SHM_LOG_ERROR("Pre_init_ops is empty, unique_id cannot be obtained.");
+        status = ACLSHMEM_INVALID_PARAM;
+    }
+    return status;
+}
+
+int32_t aclshmemx_set_log_level(int level)
 {
     // use env first, input level secondly, user may change level from env instead call func
     const char *in_level = std::getenv("SHMEM_LOG_LEVEL");
     if (in_level != nullptr) {
         auto tmp_level = std::string(in_level);
         if (tmp_level == "DEBUG") {
-            level = shm::DEBUG_LEVEL;
+            level = aclshmem_log::DEBUG_LEVEL;
         } else if (tmp_level == "INFO") {
-            level = shm::INFO_LEVEL;
+            level = aclshmem_log::INFO_LEVEL;
         } else if (tmp_level == "WARN") {
-            level = shm::WARN_LEVEL;
+            level = aclshmem_log::WARN_LEVEL;
         } else if (tmp_level == "ERROR") {
-            level = shm::ERROR_LEVEL;
+            level = aclshmem_log::ERROR_LEVEL;
         } else if (tmp_level == "FATAL") {
-            level = shm::FATAL_LEVEL;
+            level = aclshmem_log::FATAL_LEVEL;
         }
     }
-    shm::shm_out_logger::Instance().set_log_level(static_cast<shm::log_level>(level));
-    if (smem_set_log_level(level) != SHMEM_SUCCESS) {
-        SHM_LOG_ERROR("Failed to set ock::mf::OutLogger level");
-    }
-    return SHMEM_SUCCESS;
+
+    return aclshmem_log::aclshmem_out_logger::Instance().set_log_level(static_cast<aclshmem_log::log_level>(level));
 }
 
-int32_t shmem_set_conf_store_tls(bool enable, const char *tls_info, const uint32_t tls_info_len)
+int32_t aclshmemx_set_conf_store_tls(bool enable, const char *tls_info, const uint32_t tls_info_len)
 {
-    return smem_set_conf_store_tls(enable, tls_info, tls_info_len);
+    g_boot_handle.tls_enable = enable;
+    g_boot_handle.tls_info = tls_info;
+    g_boot_handle.tls_info_len = tls_info_len;
+
+    return ACLSHMEM_SUCCESS;
 }
 
-int32_t shmem_finalize(void)
+void aclshmem_rank_exit(int status)
 {
-    SHMEM_CHECK_RET(shm::shmemi_team_finalize());
-
-    if (shm::g_state.p2p_heap_host_base != nullptr) {
-        aclrtFree(shm::g_state.p2p_heap_host_base);
-    }
-    if (shm::g_state.sdma_heap_host_base != nullptr) {
-        aclrtFree(shm::g_state.sdma_heap_host_base);
-    }
-    if (shm::g_state.roce_heap_host_base != nullptr) {
-        aclrtFree(shm::g_state.roce_heap_host_base);
-    }
-
-    if (shm::g_state.p2p_heap_device_base != nullptr) {
-        aclrtFree(shm::g_state.p2p_heap_device_base);
-    }
-    if (shm::g_state.sdma_heap_device_base != nullptr) {
-        aclrtFree(shm::g_state.sdma_heap_device_base);
-    }
-    if (shm::g_state.roce_heap_device_base != nullptr) {
-        aclrtFree(shm::g_state.roce_heap_device_base);
-    }
-
-    if (shm::g_smem_handle != nullptr) {
-        int32_t status = smem_shm_destroy(shm::g_smem_handle, 0);
-        if (status != SHMEM_SUCCESS) {
-            SHM_LOG_ERROR("smem_shm_destroy Failed");
-            return SHMEM_SMEM_ERROR;
-        }
-        shm::g_smem_handle = nullptr;
-    }
-    smem_shm_uninit(0);
-    smem_uninit();
-    return SHMEM_SUCCESS;
+    SHM_LOG_DEBUG("aclshmem_rank_exit is work ,status: " << status);
+    exit(status);
 }
 
-void shmem_info_get_version(int *major, int *minor)
+int32_t aclshmemx_set_config_store_tls_key(const char *tls_pk, const uint32_t tls_pk_len,
+    const char *tls_pk_pw, const uint32_t tls_pk_pw_len, const aclshmem_decrypt_handler decrypt_handler)
 {
-    SHM_ASSERT_RET_VOID(major != nullptr && minor != nullptr);
-    *major = SHMEM_MAJOR_VERSION;
-    *minor = SHMEM_MINOR_VERSION;
+    g_boot_handle.tls_pk = tls_pk;
+    g_boot_handle.tls_pk_len = tls_pk_len;
+    g_boot_handle.tls_pk_pw = tls_pk_pw;
+    g_boot_handle.tls_pk_pw_len = tls_pk_pw_len;
+    g_boot_handle.decrypt_handler = decrypt_handler;
+
+    return ACLSHMEM_SUCCESS;
 }
 
-void shmem_info_get_name(char *name)
+int32_t aclshmemx_set_extern_logger(void (*func)(int level, const char *msg))
 {
-    SHM_ASSERT_RET_VOID(name != nullptr);
-    std::ostringstream oss;
-    oss << "SHMEM v" << SHMEM_VENDOR_MAJOR_VER << "." << SHMEM_VENDOR_MINOR_VER << "." << SHMEM_VENDOR_PATCH_VER;
-    auto version_str = oss.str();
-    size_t i;
-    for (i = 0; i < SHMEM_MAX_NAME_LEN - 1 && version_str[i] != '\0'; i++) {
-        name[i] = version_str[i];
+    aclshmem_log::aclshmem_out_logger::Instance().set_extern_log_func(func);
+    return ACLSHMEM_SUCCESS;
+}
+
+void aclshmem_global_exit(int status)
+{
+    if (g_boot_handle.is_bootstraped == true) {
+        g_boot_handle.global_exit(status, &g_boot_handle);
     }
-    name[i] = '\0';
+    SHM_LOG_WARN("Bootstrap not initialized. Global_exit Do nothing. ");
 }
 
-void shmem_global_exit(int status)
+void aclshmemx_show_prof(aclshmem_prof_pe_t **out_profs, bool verbose)
 {
-    smem_shm_global_exit(shm::g_smem_handle, status);
+    // 如果 verbose 为 false 且 out_profs 为 nullptr，直接返回
+    if (!verbose && out_profs == nullptr) {
+        return;
+    }
+    prof_data_print(&g_host_profs, &g_state, out_profs, verbose);
 }

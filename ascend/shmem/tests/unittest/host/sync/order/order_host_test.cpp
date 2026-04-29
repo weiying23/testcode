@@ -1,19 +1,19 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #include <iostream>
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
 
 #include "acl/acl.h"
-#include "shmem_api.h"
+#include "shmem.h"
 #include "shmemi_host_common.h"
 #include "unittest_main_test.h"
 #include "order_kernel.h"
@@ -26,13 +26,13 @@ static void test_quiet_order(int32_t rank_id, int32_t n_ranks, uint64_t local_me
     ASSERT_NE(stream, nullptr);
 
     int total_size = 64;
-    uint64_t *dev_ptr = static_cast<uint64_t *>(shmem_malloc(total_size * sizeof(uint64_t)));
+    uint64_t *dev_ptr = static_cast<uint64_t *>(aclshmem_malloc(total_size * sizeof(uint64_t)));
     ASSERT_EQ(aclrtMemset(dev_ptr, total_size * sizeof(uint64_t), 0, total_size * sizeof(uint64_t)), 0);
 
     std::vector<uint64_t> host_buf(total_size, 0);
 
     std::cout << "[TEST] fence order test rank " << rank_id << std::endl;
-    quiet_order_do(stream, shmemx_get_ffts_config(), (uint8_t *)dev_ptr, rank_id, n_ranks);
+    quiet_order_do(stream, util_get_ffts_config(), (uint8_t *)dev_ptr, rank_id, n_ranks);
 
     ASSERT_EQ(aclrtSynchronizeStream(stream), 0);
     ASSERT_EQ(aclrtMemcpy(host_buf.data(), total_size * sizeof(uint64_t), dev_ptr, total_size * sizeof(uint64_t),
@@ -44,12 +44,9 @@ static void test_quiet_order(int32_t rank_id, int32_t n_ranks, uint64_t local_me
         ASSERT_EQ(host_buf[34U], 0xAAu);
     }
 
-    shmem_free(dev_ptr);
+    aclshmem_free(dev_ptr);
 
     test_finalize(stream, device_id);
-    if (::testing::Test::HasFailure()) {
-        exit(1);
-    }
 }
 
 static void test_fence_order(int32_t rank_id, int32_t n_ranks, uint64_t local_mem_size)
@@ -60,13 +57,13 @@ static void test_fence_order(int32_t rank_id, int32_t n_ranks, uint64_t local_me
     ASSERT_NE(stream, nullptr);
 
     int total_size = 64;
-    uint64_t *addr_dev = static_cast<uint64_t *>(shmem_malloc(total_size * sizeof(uint64_t)));
+    uint64_t *addr_dev = static_cast<uint64_t *>(aclshmem_malloc(total_size * sizeof(uint64_t)));
     ASSERT_EQ(aclrtMemset(addr_dev, total_size * sizeof(uint64_t), 0, total_size * sizeof(uint64_t)), 0);
 
     std::vector<uint64_t> addr_host(total_size, 0);
 
     std::cout << "[TEST] fence order test rank " << rank_id << std::endl;
-    fence_order_do(stream, shmemx_get_ffts_config(), (uint8_t *)addr_dev, rank_id, n_ranks);
+    fence_order_do(stream, util_get_ffts_config(), (uint8_t *)addr_dev, rank_id, n_ranks);
 
     ASSERT_EQ(aclrtSynchronizeStream(stream), 0);
     ASSERT_EQ(aclrtMemcpy(addr_host.data(), total_size * sizeof(uint64_t), addr_dev, total_size * sizeof(uint64_t),
@@ -77,12 +74,9 @@ static void test_fence_order(int32_t rank_id, int32_t n_ranks, uint64_t local_me
         ASSERT_EQ(addr_host[17U], 84u);
         ASSERT_EQ(addr_host[18U], 42u);
     }
-    shmem_free(addr_dev);
+    aclshmem_free(addr_dev);
 
     test_finalize(stream, device_id);
-    if (::testing::Test::HasFailure()) {
-        exit(1);
-    }
 }
 
 TEST(TEST_SYNC_API, test_quiet_order)

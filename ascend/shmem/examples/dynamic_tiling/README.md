@@ -5,7 +5,7 @@
 在 `shmem/` 根目录下执行编译脚本：
 
 ```bash
-bash scripts/build.sh
+bash scripts/build.sh -examples
 ```
 
 #### 2. 运行 Dynamic-Tiling 示例程序
@@ -28,20 +28,20 @@ bash scripts/run.sh [comm_type] [data_type] [test_start_line] [test_collect_rows
 | `device_list` | 指定运行的设备（NPU）编号列表，以逗号分隔 | `0,1`, `4,5,6,7` |
 
 > 📌 **注意**：  
-> - `rankSize`由`device_list`中设备数量自动确定
+> - `peSize`由`device_list`中设备数量自动确定
 > - 精度测试默认按顺序执行test_shapes.csv中定义的所有shape
 > - 性能测试需指定test_start_line和test_collect_rows参数：从第test_start_line个shape开始，每次采集test_collect_rows个测试用例，持续执行直至文件末尾
 
 ##### 示例
 
 - **精度测试示例**：  
-  使用 NPU 0 和 1，运行 **MatMul-AllReduce** 精度测试，数据类型为FP16，`rankSize = 2`：
+  使用 NPU 0 和 1，运行 **MatMul-AllReduce** 精度测试，数据类型为FP16，`peSize = 2`：
   ```bash
   bash scripts/run.sh 0 1 0,1
   ```
 
 - **性能测试示例**：  
-  使用 NPU 4、5、6、7，运行 **AllGather-MatMul** 性能测试，数据类型为 BF16，从 `test_shapes.csv` 第0行开始，每 10 个 shape 采集一次 `msprof` 性能数据，`rankSize = 4`：
+  使用 NPU 4、5、6、7，运行 **AllGather-MatMul** 性能测试，数据类型为 BF16，从 `test_shapes.csv` 第0行开始，每 10 个 shape 采集一次 `msprof` 性能数据，`peSize = 4`：
   ```bash
   bash scripts/run.sh 1 27 0 10 4,5,6,7
   ```

@@ -1,14 +1,16 @@
-#
-# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
-# This file is a part of the CANN Open Software.
-# Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 import os
+import numpy as np
 import torch
+import torch_npu
 from utils import CommType, DataType, tensor_to_file
 
 
@@ -33,7 +35,7 @@ def gen_golden_data():
                                  CommType.MATMUL_REDUCE_SCATTER_PADDING,
                                  CommType.ALLGATHER_MATMUL_WITH_GATHER_RESULT])
     parser.add_argument('out_dtype', type=DataType.from_str, choices=[DataType.FLOAT16, DataType.BF16])
-    parser.add_argument('rank_size', type=int)
+    parser.add_argument('pe_size', type=int)
     parser.add_argument('m', type=int)
     parser.add_argument('n', type=int)
     parser.add_argument('k', type=int)
@@ -47,37 +49,51 @@ def gen_golden_data():
     data_dir = os.path.abspath(args.data_dir)
 
     os.makedirs(data_dir, exist_ok=True)
-    b_all_rank = gen_random_data([k, n], dtype=args.out_dtype.torch_type)
+    b_all_pe = gen_random_data([k, n], dtype=args.out_dtype.torch_type)
 
-    l0c_dtype = torch.float32
     matrix_a_list = []
-    matrix_c_list = []
-    for i in range(args.rank_size):
+    matrix_c_list_fp32 = []
+    matrix_c_list_fp16_npu = []
+    for i in range(args.pe_size):
         a_gm = gen_random_data([m, k], dtype=args.out_dtype.torch_type)
         matrix_a_list.append(a_gm)
-        b_gm = b_all_rank
-        matrix_c = torch.matmul(a_gm.to(l0c_dtype), b_gm.to(l0c_dtype))
-        matrix_c_list.append(matrix_c)
+        b_gm = b_all_pe
+        
+        a_np = a_gm.to(torch.float32).numpy()
+        b_np = b_gm.to(torch.float32).numpy()
+        matrix_c_fp32 = np.matmul(a_np, b_np)
+        matrix_c_list_fp32.append(matrix_c_fp32)
+        
+        a_torch = a_gm.npu()
+        b_torch = b_gm.npu()
+        matrix_c_fp16_npu = torch.matmul(a_torch, b_torch)
+        matrix_c_list_fp16_npu.append(matrix_c_fp16_npu)
+        
         if args.transA:
             a_gm = a_gm.transpose(0, 1).contiguous()
         if args.transB:
             b_gm = b_gm.transpose(0, 1).contiguous()
 
-        a_gm_path = os.path.join(data_dir, f"rank_{i}_a.bin")
-        b_gm_path = os.path.join(data_dir, f"rank_{i}_b.bin")
+        a_gm_path = os.path.join(data_dir, f"pe_{i}_a.bin")
+        b_gm_path = os.path.join(data_dir, f"pe_{i}_b.bin")
         tensor_to_file(a_gm, a_gm_path)
         tensor_to_file(b_gm, b_gm_path)
 
     golden = None
+    torch_output = None
     if (args.comm_type in
         [CommType.ALLGATHER_MATMUL, CommType.ALLGATHER_MATMUL_PADDING, CommType.ALLGATHER_MATMUL_WITH_GATHER_RESULT]):
-        golden = torch.cat(matrix_c_list, dim=0)
+        golden = np.concatenate(matrix_c_list_fp32, axis=0)
+        torch_output = torch.cat([t.cpu() for t in matrix_c_list_fp16_npu], dim=0)
     else:
-        golden = torch.zeros_like(matrix_c_list[0])
-        for i in range(args.rank_size):
-            golden += matrix_c_list[i]
+        golden = np.zeros_like(matrix_c_list_fp32[0])
+        torch_output = torch.zeros_like(matrix_c_list_fp16_npu[0].cpu())
+        for i in range(args.pe_size):
+            golden += matrix_c_list_fp32[i]
+            torch_output += matrix_c_list_fp16_npu[i].cpu()
 
-    tensor_to_file(golden, os.path.join(data_dir, "golden.bin"))
+    tensor_to_file(torch_output, os.path.join(data_dir, "torch_output.bin"))
+    golden.tofile(os.path.join(data_dir, "golden.bin"))
 
     if args.comm_type == CommType.ALLGATHER_MATMUL_WITH_GATHER_RESULT:
         tensor_to_file(torch.cat(matrix_a_list, dim=0).to(torch.float32), os.path.join(data_dir, "gather_a.bin"))

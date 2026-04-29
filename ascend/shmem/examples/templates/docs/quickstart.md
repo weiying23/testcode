@@ -9,7 +9,7 @@
 ### 新增远程访存支持，扩展分层计算能力
 - **Kernel 层**：实现支持通算融合的完整算子，将Matmul计算扩展至多卡并行计算场景。
 - **Block 层**：定义了单个AICore的通信逻辑，可与Catlass中单个AICore的计算逻辑结合，实现灵活的细粒度通算融合组合。
-- **Tile 层**：提供常用步骤的抽象，基于底层的基础 ASHMEM 操作构建。
+- **Tile 层**：提供常用步骤的抽象，基于底层的基础 SHMEM 操作构建。
 
 
 ## 快速使用
@@ -89,7 +89,7 @@ for (int block = 0; block < commLoops; block++) {
         for (int tile = 0; tile < tileLoops; tile++) {
 
             // Catcoc::CommEpilogue::Tile
-            // TileMmad使用指令shmem_mte_get/put_mem_nbi
+            // TileMmad使用指令aclshmem_mte_get/put_nbi
             for (int tileRepeat = 0; tileRepeat < r; tileRepeat++) {
                 for (int tileLength = 0; tileLength < l; tileLength++) {
                     dataCopy.call(dst, src);
@@ -506,7 +506,7 @@ void operator()<AscendC::AIV>(Params &params)
         Catlass::Arch::CrossCoreWaitFlag(flagAicFinishStore[stageId]);
 
         // === 全局屏障：确保所有设备上的任务都到达此点 ===
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
         // 设置原子操作模式：后续写入使用atomic add
         AscendC::SetAtomicAdd<ElementD>();
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -580,7 +580,7 @@ void operator()<AscendC::AIV>(Params &params)
         AscendC::PipeBarrier<PIPE_ALL>();
 
         // === 全局屏障：等待所有设备完成 ReduceScatter ===
-        shmemx_barrier_all_vec();
+        aclshmemx_barrier_all_vec();
         // === 通知 AIC：当前stage的通信已完成，可复用workspace ===
         Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishCompute[stageId]);
     }
@@ -614,12 +614,12 @@ void operator()<AscendC::AIV>(Params &params)
 #include "catlass/gemm/gemm_type.hpp"
 #include "catlass/layout/layout.hpp"
 
-// shmem_host
+// aclshmem_host
 #include "host/shmem_host_def.h"
-#include "host/shmem_host_heap.h"
-#include "host/shmem_host_init.h"
-#include "host/shmem_host_rma.h"
-#include "host/shmem_host_team.h"
+#include "host/mem/shmem_host_heap.h"
+#include "host/init/shmem_host_init.h"
+#include "host/data_plane/shmem_host_rma.h"
+#include "host/team/shmem_host_team.h"
 
 // utils
 #include "utils.h"
@@ -729,10 +729,10 @@ void ShmemMatmulReduceScatter(
     using ArchTag = Catlass::Arch::AtlasA2;
 
     // === 3. 获取分布式通信上下文信息 ===
-    // shmem_my_pe(): 获取当前处理单元（PE）的 rank ID（0 ~ rankSize-1）
-    // shmem_n_pes(): 获取总参与通信的 PE 数量（即 world size）
-    uint32_t rank = shmem_my_pe();
-    uint32_t rankSize = shmem_n_pes();
+    // aclshmem_my_pe(): 获取当前处理单元（PE）的 rank ID（0 ~ rankSize-1）
+    // aclshmem_n_pes(): 获取总参与通信的 PE 数量（即 world size）
+    uint32_t rank = aclshmem_my_pe();
+    uint32_t rankSize = aclshmem_n_pes();
 
     // === 4. 定义各矩阵的内存布局（Layout）===
     // 封装 GEMM 问题尺寸为 Catlass 标准结构体
@@ -845,7 +845,7 @@ void ShmemMatmulReduceScatter(
 ```c++
 int main(int argc, char **argv)
 {
-    int status = SHMEM_SUCCESS;
+    int status = ACLSHMEM_SUCCESS;
     Options options;
     if (options.Parse(argc, argv) != 0) {
         std::cerr << "Invalid arguments\n";
@@ -865,10 +865,14 @@ int main(int argc, char **argv)
     ACL_CHECK(aclInit(nullptr));
     ACL_CHECK(aclrtSetDevice(deviceId));
     ACL_CHECK(aclrtCreateStream(&stream));
-    shmem_init_attr_t *attributes;
-    status = shmem_set_attr(rankId, rankSize, NPU_MALLOC_SPACE, ipPort.c_str(), &attributes);
-    status = shmem_init_attr(attributes);
-    status = shmem_init_status();
+    uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    
+    aclshmemx_uniqueid_t default_flag_uid;
+    aclshmemx_init_attr_t attributes;
+    test_set_attr(rank_id, n_ranks, local_mem_size, ipPort, default_flag_uid, &attributes);
+    status = aclshmemx_init_attr(&attributes);
+
+    status = aclshmemx_init_status();
 
     size_t aSize = static_cast<size_t>(m) * k * sizeof(__fp16);
     size_t bSize = static_cast<size_t>(k) * n * sizeof(__fp16);
@@ -894,14 +898,14 @@ int main(int argc, char **argv)
     uint8_t *dHost;
     ACL_CHECK(aclrtMallocHost((void **)(&dHost), dSize));
 
-    void *symmPtr = shmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
+    void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *symmetricPtr = reinterpret_cast<uint8_t *>(symmPtr);
 
     ACL_CHECK(aclrtSynchronizeStream(stream));
     std::cout << "Before calling MM_RS kernel " << std::endl;
     for (int i = 0; i < 1; i++) {
         ShmemMatmulReduceScatter<<<BLOCK_NUM, nullptr, stream>>>(
-            shmemx_get_ffts_config(),
+            util_get_ffts_config(),
             aDevice, bDevice, dDevice, symmetricPtr,
             m, n, k
         );
@@ -910,12 +914,12 @@ int main(int argc, char **argv)
     std::cout << "After calling MM_RS kernel " << std::endl;
 
     ACL_CHECK(aclrtMemcpy(dHost, dSizeScatter, dDevice, dSizeScatter, ACL_MEMCPY_DEVICE_TO_HOST));
-    WriteFile(options.GetDataPath("shmem_output.bin"), dHost, dSizeScatter, rankId * dSizeScatter);
+    WriteFile(options.GetDataPath("aclshmem_output.bin"), dHost, dSizeScatter, rankId * dSizeScatter);
     if (rankId == 0) {
         std::printf("test finished\n");
     }
 
-    shmem_free(symmPtr);
+    aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
     ACL_CHECK(aclrtFreeHost(bHost));
@@ -925,7 +929,7 @@ int main(int argc, char **argv)
     ACL_CHECK(aclrtFree(dDevice));
 
     std::cout << "[TEST] begin to exit...... rankId: " << rankId << std::endl;
-    status = shmem_finalize();
+    status = aclshmem_finalize();
     ACL_CHECK(aclrtDestroyStream(stream));
     ACL_CHECK(aclrtResetDevice(deviceId));
     ACL_CHECK(aclFinalize());

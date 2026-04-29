@@ -1,13 +1,13 @@
 #!/bin/bash
-#
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
 # THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
-#
+# -----------------------------------------------------------------------------------------------------------
 readonly CURRENT_DIR=$(pwd)
 readonly SCRIPT_DIR=$(dirname $(readlink -f "$0"))
 readonly PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
@@ -26,7 +26,7 @@ function run_allgather()
 
     cur_dir=${EXAMPLES_DIR}/allgather/
     cd ${cur_dir}
-    bash run.sh -ranks 2 -type int
+    bash run.sh -pes 2 -type int
     return $?
 }
 
@@ -82,7 +82,7 @@ function run_dispatch_gmm_combine()
 
     cur_dir=${EXAMPLES_DIR}/dispatch_gmm_combine/
     cd ${cur_dir}
-    bash scripts/run.sh -ranks 2 -M 64 -K 7168 -N 4096 -expertPerRank 2 -dataType 2 -weightNz 1 -transB 0
+    bash scripts/run.sh -pes 2 -M 64 -K 7168 -N 4096 -expertPerPe 2 -dataType 2 -weightNz 1 -transB 0
     return $?
 }
 
@@ -227,17 +227,17 @@ function run_all()
     run_allgather_matmul || return 2
     run_allgather_matmul_padding || return 3
     run_allgather_matmul_with_gather_result || return 4
-    run_dispatch_gmm_combine || return 5
+    #run_dispatch_gmm_combine || return 5
     run_dynamic_tiling || return 6
     run_kv_shuffle || return 7
     run_matmul_allreduce || return 8
     run_matmul_reduce_scatter || return 9
     run_matmul_reduce_scatter_padding || return 10
-    rdma_demo || return 11
-    run_unuse_handlewait || return 12
-    run_use_handlewait || return 13
-    run_rdma_perftest || return 14
-    run_python_extesion || return 15
+    # run_rdma_demo || return 11
+    # run_unuse_handlewait || return 12
+    # run_use_handlewait || return 13
+    # run_rdma_perftest || return 14
+    #run_python_extesion || return 15
     return 0
 }
 

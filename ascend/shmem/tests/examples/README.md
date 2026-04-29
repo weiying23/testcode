@@ -48,10 +48,10 @@ tests/examples/
 -   使用 Python 的 `multiprocessing` 模块，为每个 `rank` 创建一个独立的进程。
 -   每个进程会调用预编译的 C++ 可执行文件 (`EXECUTABLE_PATH`)。
 -   测试所需的参数，包括 `rank`、`world_size`、网络地址以及**数据持久化目录的路径**，都会通过命令行参数传递给 C++ 程序。
--   C++ 程序从指定的数据目录中读取输入，并将计算结果 `shmem_output.bin` 写回到同一目录。
+-   C++ 程序从指定的数据目录中读取输入，并将计算结果 `aclshmem_output.bin` 写回到同一目录。
 
 ### 3.5. 结果验证
--   所有 C++ 进程执行完毕后，主进程会从数据目录中读取 `shmem_output.bin`。
+-   所有 C++ 进程执行完毕后，主进程会从数据目录中读取 `aclshmem_output.bin`。
 -   **动态精度验证**:
     1.  **计算操作量**: 根据 `m, k, n, world_size` 计算出总的浮点运算次数。
     2.  **获取容忍度**: 调用 `utils.py` 中的 `get_rtol()` 函数，传入数据类型和操作量，获得一个动态计算出的误差容忍度 `err`。
@@ -67,7 +67,7 @@ tests/examples/
 2.  **设置可执行文件路径**: 在 `test_fusion_matmul_allreduce.py` 脚本的顶部，确认 `EXECUTABLE_PATH` 变量指向了正确的 C++ 可执行文件路径。
 3.  **运行 Pytest**: 在项目根目录下，直接运行 `pytest` 命令。
     ```bash
-    export LD_LIBRARY_PATH=<path_to_shmem_lib>:<path_to_memfabric_hybrid_lib>:$LD_LIBRARY_PATH
+    export LD_LIBRARY_PATH=<path_to_aclshmem_lib>:$LD_LIBRARY_PATH
     pytest -sv tests/examples/matmul_allreduce/
     ```
     *请将 `<path_to_...>` 替换为实际的库路径。*

@@ -24,13 +24,13 @@
 | 特殊场景           | 无                                                 |
 
 说明：
-支持通过接口 `shmem_set_conf_store_tls` 配置TLS秘钥证书等，进行tls安全连接，建议用户开启TLS加密配置，保证通信安全。系统启动后，建议删除本地密钥证书等信息敏感文件。调用该接口时，传入的文件路径不能包含英文分号、逗号、冒号。
+支持通过接口 `aclshmemx_set_conf_store_tls` 配置TLS秘钥证书等，进行tls安全连接，建议用户开启TLS加密配置，保证通信安全。系统启动后，建议删除本地密钥证书等信息敏感文件。调用该接口时，传入的文件路径不能包含英文分号、逗号、冒号。
 支持通过环境变量 `ACCLINK_CHECK_PERIOD_HOURS`和`ACCLINK_CERT_CHECK_AHEAD_DAYS` 配置证书检查周期与证书过期预警时间
 
 使用接口示例：
 ```c
 // 配置关闭tls:
-shmem_set_conf_store_tls(false, nullptr, 0);
+aclshmemx_set_conf_store_tls(false, nullptr, 0);
 
 // 配置打开tls:
 
@@ -43,17 +43,15 @@ char *tls_info ="                               \
     tlsCrlFile: server_crl1.pem,server_crl2.pem;\
     tlsCaFile: ca.pem1,ca.pem2;                 \
     packagePath: /etc/lib"
-int32_t ret = shmem_set_conf_store_tls(true, tls_info, strlen(tls_info));
+int32_t ret = aclshmemx_set_conf_store_tls(true, tls_info, strlen(tls_info));
 ```
-| 环境变量          | 说明                |
-| ----------------- | ------------------- |
-| SHMEM_MASTER_ADDR | 通信面IP            |
-| SHMEM_MASTER_PORT | 通信面端口          |
-| MASTER_ADDR       | 备用通信面IP        |
-| MASTER_PORT       | 备用通信面端口      |
-| SHMEM_LOG_LEVEL   | shmem日志级别       |
-| SHMEM_HOME_PATH   | shmem安装路径       |
-| VERSION           | 编译whl包默认版本号 |
+| 环境变量             | 说明              |
+|------------------| --------------- |
+| SHMEM_LOG_LEVEL  | shmem日志级别      |
+| SHMEM_HOME_PATH  | shmem安装路径      |
+| VERSION          | 编译whl包默认版本号 |
+| ASCEND_RT_VISIBLE_DEVICES | 指定哪些Device对当前进程可见，支持一次指定一个或多个Device ID。通过该环境变量，可实现不修改应用程序即可调整所用Device的功能。 |
+| SHMEM_CYCLE_PROF_PE  |  用于设置需要进行Profiling采集的PE，pe_id设置范围【0，PEs-1】，需要取消采集请`unset SHMEM_CYCLE_PROF_PE` |
 
 ## 运行用户建议
 
@@ -84,10 +82,9 @@ ASLR（address space layout randomization）开启后能增强漏洞攻击防护
 
 | 类型  |        开源代码地址        | 文件名                  | 公网IP地址/公网URL地址/域名/邮箱地址/压缩文件地址                                           | 用途说明                                      |
 | :---: | :------------------------: | :---------------------- | :------------------------------------------------------------------------------------------ | :-------------------------------------------- |
-| 依赖  |           不涉及           | build.sh                | https://gitee.com/ascend/catlass                                                            | 从gitee下载catlass源码，作用编译依赖          |
+| 依赖  |           不涉及           | build.sh                | https://gitcode.com/cann/catlass.git                                                            | 从gitcode下载catlass源码，作用编译依赖          |
 | 依赖  | https://github.com/doxygen | build.sh                | https://github.com/doxygen/doxygen/releases/download/Release_1_9_6/doxygen-1.9.6.src.tar.gz | 从github下载doxygen-1.9.6源码，作用编译依赖   |
-| 依赖  |           不涉及           | build.sh                | https://gitee.com/mirrors/googletest.git                                                    | 从gitee下载googletest源码，单元测试框架依赖   |
-| 依赖  |           不涉及           | .gitmodules             | https://gitee.com/ascend/memfabric_hybrid.git                                               | 从gitee下载memfabric_hybrid源码，作用编译依赖 |
+| 依赖  |           不涉及           | build.sh                | https://gitcode.com/GitHub_Trending/go/googletest                                                    | 从gitcode下载googletest源码，单元测试框架依赖   |
 | 文档  |           不涉及           | shmemi_device_barrier.h | https://www.inf.ed.ac.uk/teaching/courses/ppls/BarrierPaper.pdf                             | 并行编程语言和系统                            |
 ## 漏洞机制说明
 [漏洞管理](https://gitcode.com/cann/community/blob/master/security/security.md)

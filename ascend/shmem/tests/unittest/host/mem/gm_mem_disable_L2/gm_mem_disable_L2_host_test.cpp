@@ -1,12 +1,12 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
- * CANN Open Software License Agreement Version 2.0 (the "License").
- * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
- * See LICENSE in the root of the software repository for the full text of the License.
- */
+/**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
 #include <iostream>
 #include <string>
 #include <vector>
@@ -14,8 +14,8 @@
 
 #include "acl/acl.h"
 #include "shmemi_host_common.h"
-#include "bfloat16.h"
-#include "fp16_t.h"
+#include "opdev/bfloat16.h"
+#include "opdev/fp16_t.h"
 
 extern int test_gnpu_num;
 extern int test_first_npu;
@@ -45,13 +45,13 @@ static void test_shmemx_mte_put_get(aclrtStream stream, uint8_t *gva, uint32_t r
     ASSERT_EQ(aclrtMemcpy(dev_ptr, input_size, input.data(), input_size, ACL_MEMCPY_HOST_TO_DEVICE), 0);
 
     uint32_t block_dim = 1;
-    void *ptr = shmem_malloc(input_size);
-    test_shmemx_mte_put(block_dim, stream, shmemx_get_ffts_config(), (uint8_t *)ptr, (uint8_t *)dev_ptr);
+    void *ptr = aclshmem_malloc(input_size);
+    test_shmemx_mte_put(block_dim, stream, util_get_ffts_config(), (uint8_t *)ptr, (uint8_t *)dev_ptr);
     ASSERT_EQ(aclrtSynchronizeStream(stream), 0);
 
     ASSERT_EQ(aclrtMemcpy(input.data(), input_size, ptr, input_size, ACL_MEMCPY_DEVICE_TO_HOST), 0);
 
-    test_shmemx_mte_get(block_dim, stream, shmemx_get_ffts_config(), (uint8_t *)ptr, (uint8_t *)dev_ptr);
+    test_shmemx_mte_get(block_dim, stream, util_get_ffts_config(), (uint8_t *)ptr, (uint8_t *)dev_ptr);
     ASSERT_EQ(aclrtSynchronizeStream(stream), 0);
 
     ASSERT_EQ(aclrtMemcpy(input.data(), input_size, dev_ptr, input_size, ACL_MEMCPY_DEVICE_TO_HOST), 0);
@@ -74,12 +74,9 @@ void test_shmemx_mte_mem(int rank_id, int n_ranks, uint64_t local_mem_size)
     test_init(rank_id, n_ranks, local_mem_size, &stream);
     ASSERT_NE(stream, nullptr);
 
-    test_shmemx_mte_put_get(stream, (uint8_t *)shm::g_state.heap_base, rank_id, n_ranks);
+    test_shmemx_mte_put_get(stream, (uint8_t *)g_state.heap_base, rank_id, n_ranks);
     std::cout << "[TEST] begin to exit...... rank_id: " << rank_id << std::endl;
     test_finalize(stream, device_id);
-    if (::testing::Test::HasFailure()) {
-        exit(1);
-    }
 }
 
 TEST(TestMemApi, TestShmemGmDisableL2)

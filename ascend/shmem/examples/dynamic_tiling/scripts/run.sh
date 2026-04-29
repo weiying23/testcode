@@ -1,4 +1,13 @@
 #!/bin/bash
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 set -e
 # usage: bash run.sh [comm_type] [data_type] [test_start_line] [test_collect_rows] [device_list]
 # eg. bash run.sh 0 1 0,1      # 在 0/1 卡上运行 all reduce 精度测试, 数据类型 FP16, rank size = 2
@@ -17,6 +26,7 @@ PARENT_PATH=${PROJECT_ROOT}/examples/dynamic_tiling/
 export WARM_UP_TIMES=10
 export PERF_TEST_CYCLE_TIMES=3
 export SEARCH_PARAMS=0
+export LD_LIBRARY_PATH=${PROJECT_ROOT}/build/lib:${ASCEND_HOME_PATH}/lib64:$LD_LIBRARY_PATH
 
 CSV_FILE="${SCRIPT_DIR}/test_shapes.csv"
 
@@ -51,7 +61,7 @@ esac
 IFS=',' read -ra DEVICE_ID_LIST <<< "$DEVICE_ID_STR"
 RANK_SIZE=${#DEVICE_ID_LIST[@]}
 if [ $RANK_SIZE -gt 8 ]; then
-    echo "Rank size is illegal"
+    echo "PE size is illegal"
     exit 1
 fi
 
@@ -79,9 +89,10 @@ if [ "$TEST_TYPE" = "0" ]; then
         python3 ${UTILS_PATH}/gen_data.py ${COMM_TYPE} ${DATA_TYPE} ${RANK_SIZE} ${M} ${N} ${K} ${TA} ${TB} ${DATA_PATH}
 
         # Set necessary parameters
-        IPPORT="tcp://127.0.0.1:27008"
+        IPPORT="tcp://127.0.0.1:8899"
 
         # Start Process
+        export SHMEM_UID_SESSION_ID=127.0.0.1:8899
         for (( idx =0; idx < ${RANK_SIZE}; idx = idx + 1 )); do
             APP="$EXEC_BIN $COMM_TYPE $DATA_TYPE $RANK_SIZE $idx $IPPORT $M $N $K $TEST_START_LINE $TEST_COLLECT_ROWS $PARENT_PATH $CSV_FILE $DEVICE_ID_STR $DATA_PATH"
             ${APP}&
@@ -91,12 +102,12 @@ if [ "$TEST_TYPE" = "0" ]; then
         wait
 
         if [ "$COMM_TYPE" = "1" ]; then
-            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} ${K}
+            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} ${K} ./output/torch_output.bin
         elif [ "$COMM_TYPE" = "4" ]; then
-            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} ${K}
-            python3 ${UTILS_PATH}/verify_result.py ./output/output_gather_a.bin ./output/gather_a.bin ${DATA_TYPE} ${M} ${N} ${K}
+            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} ${K} ./output/torch_output.bin
+            python3 ${UTILS_PATH}/verify_result.py ./output/output_gather_a.bin ./output/gather_a.bin ${DATA_TYPE} ${M} ${N} ${K} --op_type CV_FUSION
         else
-            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} $((K * RANK_SIZE))
+            python3 ${UTILS_PATH}/verify_result.py ./output/output.bin ./output/golden.bin ${DATA_TYPE} ${M} ${N} $((K * RANK_SIZE)) ./output/torch_output.bin
         fi
 
         ret=$?
@@ -115,11 +126,12 @@ else
         echo "Processing test case: M=${M}, K=${K}, N=${N}, TransA=${TA}, TransB=${TB}"
 
         # Set necessary parameters
-        IPPORT="tcp://127.0.0.1:27009"
+        IPPORT="tcp://127.0.0.1:8899"
 
         OUTPUT_PATH="./output/msprof/start_line${IDX}_run_rows${TEST_COLLECT_ROWS}/"
 
         # Start Process
+        export SHMEM_UID_SESSION_ID=127.0.0.1:8899
         for (( idx =0; idx < ${RANK_SIZE}; idx = idx + 1 )); do
             APP="$EXEC_BIN $COMM_TYPE $DATA_TYPE $RANK_SIZE $idx $IPPORT $M $N $K $TEST_START_LINE $TEST_COLLECT_ROWS $PARENT_PATH $CSV_FILE $DEVICE_ID_STR"
             msprof --application="${APP}" --output="${OUTPUT_PATH}"&
