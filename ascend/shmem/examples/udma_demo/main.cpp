@@ -46,15 +46,64 @@ int init_acl_shmem(
     status |= aclrtCreateStream(&stream);
 
     // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含以下关键字段：
+    // - my_pe: 当前PE编号（进程ID），范围[0, n_pes-1]
+    // - n_pes: 总PE数量（进程总数）
+    // - ip_port: rendezvous地址（TCP socket地址）
+    // - local_mem_size: 对称内存大小（字节）
+    // - option_attr: 可选属性
+    //   .data_op_engine_type: 数据传输引擎类型
+    //   .timeout: 各阶段超时设置
+    // - instance_id: 多实例模式下的实例编号
+    // - comm_args: 通信参数指针
     aclshmemx_init_attr_t attributes;
+
+    // test_set_attr: 辅助函数，填充shmem初始化属性结构体
+    // 参数详解:
+    // - pe_id: 当前PE编号
+    // - n_pes: 总PE数量
+    // - local_mem_size: 对称内存大小
+    // - ipport: rendezvous地址字符串
+    // - default_flag_uid: uniqueid结构体
+    // - &attributes: 属性结构体指针（输出参数）
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
 
     // ACLSHMEM_DATA_OP_UDMA: 设置数据传输引擎为UDMA
-    // UDMA引擎用于高性能片上互联通信，支持AllGather等集合操作
+    // UDMA引擎特点：
+    // - 高性能片上互联通信引擎
+    // - 支持AllGather等集合操作
+    // - 高带宽、低延迟
+    // - 适合大规模数据传输
+    // 与其他引擎对比:
+    // - ACLSHMEM_DATA_OP_MTE: MTE引擎（片上互联，节点内）
+    // - ACLSHMEM_DATA_OP_SDMA: SDMA引擎（片上SDMA单元，节点内）
+    // - ACLSHMEM_DATA_OP_ROCE: RDMA引擎（RoCE网络，跨节点）
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
+
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 执行后完成:
+    // 1. 建立进程间通信通道
+    // 2. 分配对称内存堆
+    // 3. 初始化UDMA通信引擎
+    // 4. 设置PE编号和通信组信息
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     // aclshmem_malloc: 分配对称内存，用于存放通信数据
+    // 参数详解:
+    // - 1024: 对称内存大小（字节）
+    // 返回值: 对称内存指针（GVA格式）
+    // 对称内存核心特点：
+    // 1. 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // 2. PE i可以直接通过GVA地址访问PE j的数据
+    // 3. 用于存放通信数据和同步标志
+    // 注意：
+    // - 必须通过aclshmem_free释放
+    // - 分配大小不能超过初始化时设置的local_mem_size
     ptr = static_cast<uint8_t*>(aclshmem_malloc(1024));
     return status;
 }
@@ -102,12 +151,28 @@ int cleanup_resources(aclrtStream stream, int32_t device_id, uint8_t* ptr, uint8
 {
     int status = 0;
     // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的对称内存指针
+    // 必须与aclshmem_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. 所有PE应同时释放对称内存
     aclshmem_free(ptr);
     if (extra_ptr != nullptr) {
         // aclshmem_free: 释放额外的对称内存
+        // 用于释放信号地址等额外分配的对称内存
         aclshmem_free(extra_ptr);
     }
     // aclshmem_finalize: 终止shmem运行时
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理UDMA通信引擎状态
+    // - 释放内部同步机制资源
+    // 返回值: ACLSHMEM_SUCCESS表示成功
     status |= aclshmem_finalize();
     status |= aclrtDestroyStream(stream);
     status |= aclrtResetDevice(device_id);
@@ -168,9 +233,16 @@ int test_aclshmem_udma_put_signal(int pe_id, int n_pes, uint64_t local_mem_size)
         return status;
     }
 
-    // Allocate signal address space for all PEs
     // aclshmem_malloc: 分配用于存放信号的对称内存
     // 每个PE需要n_pes * sizeof(uint64_t)的空间来存储所有PE的信号值
+    // 参数详解:
+    // - n_pes * sizeof(uint64_t): 对称内存大小
+    //   为每个PE预留一个uint64_t空间存储信号值
+    // 返回值: 对称内存指针（GVA格式）
+    // 信号地址用途：
+    // - 存存PutSignal操作的信号值
+    // - 用于异步操作的同步通知
+    // - 每个PE可以从其他PE的信号地址读取信号值
     uint8_t* sig_addr = static_cast<uint8_t*>(aclshmem_malloc(n_pes * sizeof(uint64_t)));
     // Initialize signal addresses to 0 to avoid dirty data
     std::vector<uint64_t> init_signals(n_pes, 0);

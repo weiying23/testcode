@@ -73,8 +73,13 @@ int group_all_gather(uint64_t instance_id)
 
     // aclshmem_my_pe(): 获取当前实例中的PE编号
     // 多实例模式下，每个实例有自己的PE编号范围
+    // 返回值: 当前实例中的PE编号，范围[0, instance_n_pes-1]
+    // 注意：与全局PE编号不同，这是实例内的相对编号
+    // 示例：如果PE 0和PE 1组成实例1，则在实例1内PE编号为0和1
     int pe_id = aclshmem_my_pe();
     // aclshmem_n_pes(): 获取当前实例中的总PE数量
+    // 返回值: 当前实例中的PE数量
+    // 注意：这是实例内的PE数量，而非全局PE数量
     int n_pes = aclshmem_n_pes();
 
     // magic is used to sync.
@@ -125,6 +130,18 @@ int group_all_gather(uint64_t instance_id)
         int aiv_num = BLOCK_NUM;
         // aclshmem_malloc: 分配对称内存（在指定实例中）
         // 多实例模式下，对称内存属于特定实例
+        // 参数详解:
+        // - aiv_num * SYNC_FLAG_INTERVAL * sizeof(T): 同步缓冲区大小
+        //   用于存放同步标志（magic number等）
+        // - GVA_BUFF_MAX_SIZE / sizeof(T): 数据缓冲区大小
+        //   用于存放实际通信数据
+        // 返回值: 对称内存指针（GVA格式）
+        // 多实例特点：
+        // 1. 每个实例有独立的对称内存空间
+        // 2. 同一PE可以参与多个实例
+        // 3. 不同实例的对称内存地址不同
+        // 4. 实例内的通信操作只影响该实例
+        // 注意：对称内存必须通过aclshmem_free释放
         void *ptr = aclshmem_malloc(aiv_num * SYNC_FLAG_INTERVAL * sizeof(T) + GVA_BUFF_MAX_SIZE / sizeof(T));
 
         // AllGather
@@ -184,11 +201,31 @@ static int aclshmem_instance_create_test(int pe_id, aclshmemx_init_attr_t &attr,
 
         // multi_instance default mode need comm_args is nullptr
         attr.comm_args = nullptr;
+
         // aclshmemx_init_attr: 初始化指定实例的shmem运行时
-        // attr.instance_id决定了实例编号
+        // 参数详解:
+        // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+        //   多实例模式下使用DEFAULT模式
+        // - &attr: 初始化属性结构体指针
+        //   attr.instance_id决定了实例编号
+        // 返回值: ACLSHMEM_SUCCESS表示成功
+        // 多实例初始化特点：
+        // 1. 每个实例通过instance_id标识
+        // 2. 同一PE可以参与多个实例（使用不同instance_id）
+        // 3. 每个实例有独立的对称内存空间
+        // 4. 实例内的通信操作只影响该实例的PE
+        // 执行后完成:
+        // 1. 建立该实例PE间的通信通道
+        // 2. 分配该实例的对称内存堆
+        // 3. 初始化该实例的通信引擎
+        // 4. 设置该实例的PE编号和通信组信息
         status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr);
 
         // aclshmem_malloc: 在指定实例中分配对称内存
+        // 参数详解:
+        // - 1024: 对称内存大小（字节）
+        // 返回值: 对称内存指针（GVA格式）
+        // 分配的内存属于当前实例
         void *ptr = aclshmem_malloc(1024);
         std::vector<uint64_t> copy_arr(1024 / sizeof(uint64_t), 1);
         status = aclrtMemcpy(ptr, 1024, copy_arr.data(), 1024, ACL_MEMCPY_HOST_TO_DEVICE);
@@ -197,6 +234,12 @@ static int aclshmem_instance_create_test(int pe_id, aclshmemx_init_attr_t &attr,
         }
 
         // aclshmem_free: 释放对称内存
+        // 参数: aclshmem_malloc返回的对称内存指针
+        // 必须与aclshmem_malloc配对使用
+        // 执行效果:
+        // - 将对称内存归还到当前实例的Symmetric Heap
+        // - 其他同实例的shmem操作可以重新分配此内存
+        // 注意：释放的是当前实例的对称内存
         aclshmem_free(ptr);
         printf("Instance id : %ld malloc and free success !! \n", attr.instance_id);
 
@@ -210,7 +253,19 @@ static int aclshmem_instance_destroy_test(int dev_id, aclshmemx_init_attr_t &att
     int status = 0;
     if (std::find(dev_list.begin(), dev_list.end(), dev_id) != dev_list.end()) {
         // aclshmem_finalize(instance_id): 终止指定实例的shmem运行时
-        // 参数: attr.instance_id - 要终止的实例编号
+        // 参数详解:
+        // - attr.instance_id: 要终止的实例编号
+        //   每个实例需要单独finalize
+        // 执行效果:
+        // - 释放该实例的对称内存堆
+        // - 关闭该实例的进程间通信通道
+        // - 清理该实例的通信引擎状态
+        // - 释放该实例的内部同步机制资源
+        // 多实例finalize注意：
+        // 1. 每个实例需要单独调用finalize
+        // 2. 实例可以按任意顺序finalize
+        // 3. finalize后该实例不能再执行任何shmem操作
+        // 4. 其他实例不受影响
         status = aclshmem_finalize(attr.instance_id);
     }
     return status;

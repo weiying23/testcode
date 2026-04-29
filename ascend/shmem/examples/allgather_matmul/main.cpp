@@ -86,9 +86,16 @@ void ShmemAllGatherMatmul(
     // Prepare comm address
     // aclshmem_my_pe(): 获取当前PE编号（在Kernel内调用）
     // 返回当前进程在通信组中的编号，用于确定数据分片位置
+    // 在AllGather-Matmul中用于：
+    // 1. 确定本PE的矩阵A分片位置
+    // 2. 计算AllGather的目标PE
+    // 3. 确定矩阵C的输出位置
     uint32_t pe = aclshmem_my_pe();
     // aclshmem_n_pes(): 获取通信组中的总PE数量
     // 用于计算矩阵分块和数据分布
+    // 在AllGather-Matmul中用于：
+    // 1. 计算需要gather的PE数量
+    // 2. 确定矩阵C的总行数（m * peSize）
     uint32_t peSize = aclshmem_n_pes();
 
     Catlass::GemmCoord problemShape{m, n, k};
@@ -260,11 +267,39 @@ int main(int argc, char **argv)
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
     // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含以下关键字段：
+    // - my_pe: 当前PE编号（进程ID），范围[0, n_pes-1]
+    // - n_pes: 总PE数量（进程总数）
+    // - ip_port: rendezvous地址（TCP socket地址）
+    // - local_mem_size: 对称内存大小（字节）
+    // - option_attr: 可选属性
+    //   .data_op_engine_type: 数据传输引擎类型
+    //   .timeout: 各阶段超时设置
+    // - instance_id: 多实例模式下的实例编号
+    // - comm_args: 通信参数指针
     aclshmemx_init_attr_t attributes;
+
     // test_set_attr: 填充初始化属性（PE编号、进程数、内存大小、rendezvous地址）
+    // 参数详解:
+    // - pe_id: 当前PE编号
+    // - n_pes: 总PE数量
+    // - local_mem_size: 对称内存大小（1GB）
+    // - ipport.c_str(): rendezvous地址字符串
+    // - default_flag_uid: uniqueid结构体
+    // - &attributes: 属性结构体指针（输出参数）
     test_set_attr(pe_id, n_pes, local_mem_size, ipport.c_str(), default_flag_uid, &attributes);
+
     // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
-    // 初始化后可以使用对称内存和通信操作
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // AllGather-Matmul场景中的作用：
+    // 1. 建立所有PE之间的通信通道
+    // 2. 分配对称内存堆，用于AllGather数据交换
+    // 3. 初始化通信引擎，支持AllGather集合操作
+    // 4. 设置pe_id和n_pes信息
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     // ACLStream init
@@ -299,8 +334,21 @@ int main(int argc, char **argv)
     ACL_CHECK(aclrtMallocHost(reinterpret_cast<void**>(&cHost), cSize));
 
     // aclshmem_malloc: 分配对称内存（用于通信数据缓冲区）
-    // 参数: (204 * 1024 * 1024) * sizeof(__fp16) - 约400MB的对称内存
-    // 对称内存用于AllGather操作的数据交换
+    // 参数详解:
+    // - (204 * 1024 * 1024) * sizeof(__fp16): 对称内存大小
+    //   约204MB * 2字节 = ~408MB的对称内存
+    // 返回值: 对称内存指针（GVA格式）
+    // 对称内存用途：
+    // - 存存AllGather操作的数据缓冲区
+    // - 存存其他PE的矩阵A数据分片
+    // - 用于AllGather-Matmul融合操作的数据交换
+    // 对称内存核心特点：
+    // 1. 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // 2. PE i可以直接通过GVA地址访问PE j的数据
+    // 3. 用于存放通信数据和同步标志
+    // 注意：
+    // - 必须通过aclshmem_free释放
+    // - 分配大小不能超过local_mem_size
     void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *gmSymmetric = (uint8_t *)symmPtr;
 
@@ -334,7 +382,16 @@ int main(int argc, char **argv)
     }
 
     // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的对称内存指针（symmPtr）
     // 必须与aclshmem_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. 所有PE应同时释放对称内存
+    // 3. 释放前确保AllGather操作已完成
     aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
@@ -347,7 +404,21 @@ int main(int argc, char **argv)
     status = aclrtDestroyStream(stream);
 
     // aclshmem_finalize: 终止shmem运行时
-    // 释放所有shmem资源，包括通信通道、内部状态等
+    // 功能详解：
+    // - 释放对称内存堆（Symmetric Heap）
+    // - 关闭进程间通信通道（TCP socket连接）
+    // - 清理通信引擎状态
+    // - 释放内部同步机制资源（barrier、quiet等）
+    // 执行流程：
+    // 1. 等待所有pending的通信操作完成
+    // 2. 通知其他PE本PE即将退出
+    // 3. 释放所有对称内存资源
+    // 4. 关闭bootstrap通信通道
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 注意：
+    // 1. 每个PE必须调用此函数后才能退出程序
+    // 2. 所有PE应同时调用此函数
+    // 3. 调用后不能再执行任何shmem操作
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

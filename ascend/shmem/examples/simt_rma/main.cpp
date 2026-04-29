@@ -29,8 +29,22 @@ __simt_callee__ inline void test_put_get_mem(
 ) 
 {
     // simt::aclshmem_getmem: SIMT模式下的Get操作（从目标PE获取数据）
-    // 参数: dest(本PE接收地址), source(目标PE发送地址), size(数据大小), pe(目标PE编号)
-    // SIMT模式是线程级并行，适用于细粒度RMA操作
+    // SIMT = Single Instruction Multiple Threads，线程级并行模式
+    // 参数详解:
+    // - (__gm__ void*)res_prev: 目标地址（本PE接收数据的地址，GVA格式）
+    //   __gm__ = Global Memory，表示全局内存地址
+    // - (__gm__ void*)origin: 源地址（目标PE发送数据的地址，GVA格式）
+    // - COPY_SIZE * sizeof(int32_t): 数据大小（字节）
+    // - prev_pe: 目标PE编号（数据来源PE）
+    // 执行流程:
+    // 1. 本PE的线程向prev_pe发起读取请求
+    // 2. prev_pe通过通信引擎发送数据
+    // 3. 本PE的线程接收数据并写入res_prev
+    // SIMT模式特点：
+    // - 线程级并行，每个线程可独立执行RMA操作
+    // - 适合细粒度、小数据量的RMA操作
+    // - 使用simt::命名空间前缀
+    // - 需要配合__simt_callee__或__simt_vf__标记
     simt::aclshmem_getmem(
         (__gm__ void*)res_prev,
         (__gm__ void*)origin,
@@ -38,7 +52,15 @@ __simt_callee__ inline void test_put_get_mem(
         prev_pe
     );
     // simt::aclshmem_putmem: SIMT模式下的Put操作（发送数据到目标PE）
-    // 参数: dest(目标PE接收地址), source(本PE发送地址), size(数据大小), pe(目标PE编号)
+    // 参数详解:
+    // - (__gm__ void*)res_next: 目标地址（目标PE接收数据的地址，GVA格式）
+    // - (__gm__ void*)origin: 源地址（本PE发送数据的地址，GVA格式）
+    // - COPY_SIZE * sizeof(int32_t): 数据大小（字节）
+    // - next_pe: 目标PE编号（接收数据的PE）
+    // 执行流程:
+    // 1. 本PE的线程读取origin数据
+    // 2. 通过通信引擎将数据发送到next_pe
+    // 3. next_pe接收数据并写入res_next
     simt::aclshmem_putmem(
         (__gm__ void*)res_next,
         (__gm__ void*)origin,
@@ -93,8 +115,13 @@ __simt_vf__ __launch_bounds__(1024) inline void demo_call_simt(
 )
 {
     // simt::aclshmem_my_pe(): SIMT模式下获取当前PE编号
+    // 返回值: 当前PE编号，范围[0, n_pes-1]
+    // SIMT模式下每个线程都可以调用此函数获取PE编号
+    // 用于确定通信目标（prev_pe和next_pe）
     int32_t mype = simt::aclshmem_my_pe();
     // simt::aclshmem_n_pes(): SIMT模式下获取总PE数量
+    // 返回值: 总PE数量
+    // 用于计算环形拓扑中的邻居PE编号
     int32_t npes = simt::aclshmem_n_pes();
 
     int32_t prev_pe = (mype - 1 + npes) % npes;
@@ -201,7 +228,17 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
     ACL_CHECK_WITH_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes), ERROR_LOG("aclshmemx_init failed"), return -1);
 
     // aclshmemx_malloc: 分配对称内存（SIMT模式使用aclshmemx_前缀）
-    // 对称内存用于存放RMA操作的数据
+    // 参数详解:
+    // - data_bytes: 对称内存大小（字节）
+    // 返回值: 对称内存指针（GVA格式）
+    // SIMT模式的对称内存特点：
+    // - 使用aclshmemx_前缀的API（与aclshmem_前缀区分）
+    // - 内存分配在Device端（默认DEVICE_SIDE）
+    // - 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // - 线程级RMA操作可以访问其他PE的对称内存
+    // 注意：
+    // - 必须通过aclshmemx_free释放
+    // - SIMT模式下使用aclshmemx_malloc而非aclshmem_malloc
     int32_t* origin_device = (int32_t*)aclshmemx_malloc(data_bytes);
     int32_t* res_prev_device = (int32_t*)aclshmemx_malloc(data_bytes);
     int32_t* res_next_device = (int32_t*)aclshmemx_malloc(data_bytes);
@@ -224,11 +261,24 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
     );
 
     // 4. 执行同步与计算
-    // aclshmem_barrier_all: 全局屏障同步，确保所有PE的数据初始化完成
+    // aclshmem_barrier_all: 全局屏同步，确保所有PE的数据初始化完成
+    // 功能详解：
+    // - 所有PE都调用此函数后才能继续执行
+    // - 执行流程：
+    //   1. 当前PE到达屏，标记自己已完成初始化
+    //   2. 等待所有其他PE也到达屏
+    //   3. 所有PE都到达后，一起释放继续执行
+    // - 用途：
+    //   * 确保所有PE的数据都已拷贝到对称内存
+    //   * 用于SIMT kernel执行前的同步
+    //   * 保证数据一致性
+    // - 注意：必须所有PE都调用此函数，否则会造成死锁
     aclshmem_barrier_all();
     run_demo_mem(stream, origin_device, res_prev_device, res_next_device, debug_device);
     ACL_CHECK_WITH_RET(aclrtSynchronizeStream(stream), ERROR_LOG("stream sync failed"), return -1);
-    // aclshmem_barrier_all: 全局屏障同步，确保所有PE的RMA操作完成
+    // aclshmem_barrier_all: 全局屏同步，确保所有PE的RMA操作完成
+    // 确保所有PE都完成了simt::put/get操作后再进行结果拷贝
+    // 在结果校验前执行，保证数据一致性
     aclshmem_barrier_all();
 
     // 5. 拷贝回 Host 进行校验
@@ -272,10 +322,36 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
 
 
     // aclshmemx_free: 释放对称内存（SIMT模式）
+    // 参数: aclshmemx_malloc返回的对称内存指针
+    // 必须与aclshmemx_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. SIMT模式下使用aclshmemx_free而非aclshmem_free
+    // 3. 所有PE应同时释放对称内存
     aclshmemx_free(origin_device);
     aclshmemx_free(res_prev_device);
     aclshmemx_free(res_next_device);
-    // aclshmem_finalize: 终止shmem运行时
+
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理通信引擎状态
+    // - 释放内部同步机制资源
+    // 执行流程：
+    // 1. 等待所有pending的RMA操作完成
+    // 2. 通知其他PE本PE即将退出
+    // 3. 释放所有对称内存资源
+    // 4. 关闭bootstrap通信通道
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 注意：
+    // 1. 每个PE必须调用此函数后才能退出程序
+    // 2. 所有PE应同时调用此函数
+    // 3. 调用后不能再执行任何shmem操作
     aclshmem_finalize();
 
     aclrtFreeHost(origin_host);

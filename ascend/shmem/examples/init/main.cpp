@@ -22,43 +22,79 @@
 
 #ifdef RUN_WITH_UNIQUEID
 int run_main(int argc, char* argv[]) {
+    // 参数检查：确保命令行参数数量正确
     if (argc < 1) {
         std::cerr << "Usage: " << argv[0] << " <pe> <pe_size>" << std::endl;
         return 1;
     }
+
+    // MPI_Init: 初始化MPI运行时环境
+    // 在UNIQUEID模式下，MPI用于广播uniqueid信息给所有进程
     MPI_Init(nullptr, nullptr);
-    int g_npu = atoi(argv[1]);
-    int pe;
-    int pe_size;
+
+    // 解析命令行参数
+    int g_npu = atoi(argv[1]);  // 节点内NPU总数
+
+    // 定义进程编号和总数变量
+    int pe;      // 当前进程编号（从MPI获取）
+    int pe_size; // 总进程数（从MPI获取）
+
+    // MPI_Comm_rank: 获取当前进程在MPI_COMM_WORLD通信组中的编号
+    // 返回值范围: [0, pe_size-1]
     MPI_Comm_rank(MPI_COMM_WORLD, &pe);
+
+    // MPI_Comm_size: 获取MPI_COMM_WORLD通信组中的总进程数
     MPI_Comm_size(MPI_COMM_WORLD, &pe_size);
+
     int status = ACLSHMEM_SUCCESS;
 
+    // aclInit: 初始化ACL（Ascend Computing Language）运行时环境
+    // 参数: nullptr表示使用默认配置
+    // 必须在任何ACL API调用之前执行
     aclInit(nullptr);
+
+    // 计算物理设备ID：pe % g_npu
+    // 将逻辑进程编号映射到物理NPU设备
     int device_id = pe % g_npu;
+
+    // aclrtSetDevice: 设置当前进程使用的NPU设备
+    // 将进程绑定到指定NPU，后续所有ACL操作都在该设备上执行
     aclrtSetDevice(device_id);
 
-    // aclshmemx_init_attr_t: shmem初始化属性结构体，包含PE编号、进程数、内存大小等配置
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含PE编号、进程数、内存大小、引擎类型等配置
     aclshmemx_init_attr_t attributes;
-    // aclshmemx_uniqueid_t: 唯一ID结构体，用于进程间rendezvous（握手连接）
-    // ACLSHMEM_UNIQUEID_INITIALIZER: 唯一ID的默认初始化值
+
+    // aclshmemx_uniqueid_t: 唯一ID结构体
+    // 用于进程间rendezvous（握手连接）
+    // ACLSHMEM_UNIQUEID_INITIALIZER: uniqueid的默认初始化值
     aclshmemx_uniqueid_t uid = ACLSHMEM_UNIQUEID_INITIALIZER;
 
+    // 定义对称内存大小：1GB
+    // 对称内存是所有PE在同一虚拟地址上的相同大小内存
     int64_t local_mem_size = 1024 * 1024 * 1024;
+
+    // aclshmemx_get_uniqueid: 生成用于进程间rendezvous的唯一ID
+    // 仅由PE 0调用，其他PE需要通过MPI或socket等方式获取此ID
+    // uniqueid包含：监听地址、端口、通信通道标识符等
     if (pe == 0) {
-        // aclshmemx_get_uniqueid: 仅由PE 0调用，生成用于rendezvous的唯一ID
-        // 其他PE需要通过MPI或socket等方式获取此ID
         status = aclshmemx_get_uniqueid(&uid);
     }
 
+    // MPI_Bcast: MPI广播操作
+    // PE 0将uniqueid广播给所有其他PE
+    // 参数: &uid(数据), sizeof(aclshmemx_uniqueid_t)(大小), MPI_UINT8_T(类型), 0(根进程), MPI_COMM_WORLD(通信组)
     MPI_Bcast(&uid, sizeof(aclshmemx_uniqueid_t), MPI_UINT8_T, 0, MPI_COMM_WORLD);
-    // aclshmemx_set_attr_uniqueid_args: 使用唯一ID设置初始化属性
+
+    // aclshmemx_set_attr_uniqueid_args: 使用uniqueid设置初始化属性
     // 参数: my_pe(当前PE编号), n_pes(总PE数), local_mem_size(对称内存大小), uid指针, attributes指针
     status = aclshmemx_set_attr_uniqueid_args(pe, pe_size,
                                                 local_mem_size,
                                                 &uid, &attributes);
+
     // aclshmemx_init_attr: 初始化shmem运行时
     // ACLSHMEMX_INIT_WITH_UNIQUEID: 使用唯一ID模式进行进程间rendezvous连接
+    // 执行后：建立进程间TCP连接、分配对称内存堆、初始化通信引擎、设置PE编号和通信组信息
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
 
     if (status != ACLSHMEM_SUCCESS) {

@@ -83,9 +83,12 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
     if ASCEND_IS_AIV {
         // aclshmem_my_pe(): 获取当前PE编号（在Kernel内调用）
         // 返回当前进程在通信组中的编号，范围 [0, n_pes-1]
+        // 用于确定本PE的数据位置和通信目标
         int my_pe = aclshmem_my_pe();
+
         // aclshmem_n_pes(): 获取通信组中的总PE数量
         // 返回参与通信的进程总数
+        // 用于计算数据分布和循环范围
         int n_pes = aclshmem_n_pes();
 
         // Define temporary UB buffer for SDMA operations
@@ -113,39 +116,59 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
             return;
         }
         for (int i = 0; i < n_pes; i++) {
+            // 跳过自己，不需要向自己发送数据
             if (i == my_pe) {
                 continue;
             }
             if (is_put) {
                 // aclshmemx_sdma_put_nbi: 非阻塞SDMA Put操作（发送数据到目标PE）
-                // 参数:
-                //   - dst: 目标地址（目标PE的对称内存地址，GVA格式）
-                //   - src: 源地址（本PE的对称内存地址）
-                //   - tmp_buff: UB缓冲区（用于SDMA引擎中转）
-                //   - ub_size: UB缓冲区大小
-                //   - base_per_core: 要传输的数据长度（字节）
-                //   - i: 目标PE编号
-                //   - EVENT_ID0: 事件ID（用于同步）
-                // SDMA引擎通过片上SDMA单元进行数据传输，适用于节点内通信
+                // SDMA引擎使用片上SDMA单元进行节点内NPU间通信
+                // 参数详解:
+                // - gva + data_length * my_pe + data_offset: 目标地址（目标PE的对称内存地址，GVA格式）
+                //   GVA = Global Virtual Address，所有PE看到的相同虚拟地址
+                // - gva + data_length * my_pe + data_offset: 源地址（本PE的对称内存地址）
+                // - tmp_buff: UB缓冲区地址（用于SDMA引擎中转数据）
+                //   UB = Unified Buffer，AI Core内部的临时存储区
+                // - ub_size: UB缓冲区大小（字节），通常为64B或更小
+                // - base_per_core: 要传输的数据长度（字节）
+                // - i: 目标PE编号（接收数据的PE）
+                // - EVENT_ID0: 事件ID（用于硬件同步）
+                //   用于跟踪SDMA操作的完成状态
+                // 执行流程:
+                // 1. SDMA引擎从源地址读取数据到UB缓冲区
+                // 2. 通过片上互联将数据发送到目标PE
+                // 3. 目标PE的SDMA引擎接收数据并写入目标地址
+                // 非阻塞特性: 函数立即返回，不等待传输完成
                 aclshmemx_sdma_put_nbi(gva + data_length * my_pe + data_offset, gva + data_length * my_pe + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             } else {
                 // aclshmemx_sdma_get_nbi: 非阻塞SDMA Get操作（从目标PE拉取数据）
-                // 参数:
-                //   - dst: 目标地址（本PE的接收地址）
-                //   - src: 源地址（目标PE的发送地址）
-                //   - tmp_buff: UB缓冲区
-                //   - ub_size: UB缓冲区大小
-                //   - base_per_core: 数据长度
-                //   - i: 目标PE编号
-                //   - EVENT_ID0: 事件ID
+                // 参数详解:
+                // - gva + data_length * i + data_offset: 目标地址（本PE的接收地址，GVA格式）
+                // - gva + data_length * i + data_offset: 源地址（目标PE的发送地址）
+                // - tmp_buff: UB缓冲区地址
+                // - ub_size: UB缓冲区大小
+                // - base_per_core: 数据长度
+                // - i: 目标PE编号（数据来源PE）
+                // - EVENT_ID0: 事件ID
+                // 执行流程:
+                // 1. 本PE的SDMA引擎向目标PE发起读取请求
+                // 2. 目标PE通过片上互联发送数据
+                // 3. 本PE的SDMA引擎接收数据并写入目标地址
                 aclshmemx_sdma_get_nbi(gva + data_length * i + data_offset, gva + data_length * i + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             }
         }
         // aclshmemx_sdma_quiet: 等待所有SDMA操作完成
-        // 参数: tmp_buff(UB缓冲区), ub_size(缓冲区大小), EVENT_ID0(事件ID)
-        // 确保所有之前发起的sdma_put_nbi/sdma_get_nbi操作已完成
+        // 参数:
+        // - tmp_buff: UB缓冲区地址
+        // - ub_size: UB缓冲区大小
+        // - EVENT_ID0: 事件ID（与put/get操作使用相同ID）
+        // 执行效果:
+        // - 阻塞直到所有之前发起的sdma_put_nbi/sdma_get_nbi操作完成
+        // - 确保数据已完全传输到目标地址
+        // - 相当于同步屏障，保证数据一致性
+        // 必须在put/get操作后调用，否则数据可能未完全传输
         aclshmemx_sdma_quiet(tmp_buff, ub_size, EVENT_ID0);
     }
 }
@@ -264,11 +287,16 @@ int test_allgather_sdma(int my_pe, int n_pes)
     CHECK_RET(aclrtMalloc(reinterpret_cast<void **>(&device_dump), ALL_DUMPSIZE, ACL_MEM_MALLOC_HUGE_FIRST));
 #endif
 
-    // aclshmem_malloc: 分配对称内存（symmetric heap）
-    // 参数: 请求的内存大小（字节）
-    // 返回: 对称内存指针（GVA格式）
-    // 对称内存是shmem的核心：所有PE拥有相同大小的内存，且地址相同
-    // PE i可以直接通过GVA地址访问PE j的数据
+    // aclshmem_malloc: 分配对称内存（Symmetric Heap）
+    // 参数: (128 * 1024 * 1024) * sizeof(T) - 约128MB的对称内存
+    // 返回值: 对称内存指针（GVA格式）
+    // 对称内存核心特点：
+    // - 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // - PE i可以直接通过GVA地址访问PE j的数据
+    // - 用于存放通信数据和同步标志
+    // - 必须通过aclshmem_free释放，不能使用aclrtFree
+    // GVA = Global Virtual Address，全局虚拟地址
+    // 示例：如果PE 0在地址ptr存放数据X，PE 1可以通过相同的ptr地址读取到X
     void *gva = aclshmem_malloc((128 * 1024 * 1024) * sizeof(T));
 
     // 初始化数据
@@ -284,9 +312,18 @@ int test_allgather_sdma(int my_pe, int n_pes)
     allgather_kernel<T>(n_blocks, stream, reinterpret_cast<uint8_t *>(gva), trans_size, device_dump, false, true);
 
     CHECK_RET(aclrtSynchronizeStream(stream));
+
     // aclshmem_barrier_all: 全局屏障同步
-    // 所有PE都调用此函数后才能继续执行
-    // 确保所有PE的通信操作都已完成，用于结果验证前的同步
+    // 功能：所有PE都调用此函数后才能继续执行
+    // 执行流程：
+    // 1. 当前PE到达屏障，标记自己已完成
+    // 2. 等待所有其他PE也到达屏障
+    // 3. 所有PE都到达后，一起释放继续执行
+    // 用途：
+    // - 确保所有PE的通信操作都已完成
+    // - 用于结果验证前的同步
+    // - 保证数据一致性
+    // 注意：必须所有PE都调用此函数，否则会造成死锁
     aclshmem_barrier_all();
 
 #if defined(ENABLE_ASCENDC_DUMP)
@@ -311,9 +348,12 @@ int test_allgather_sdma(int my_pe, int n_pes)
     }
 
     CHECK_RET(aclrtFreeHost(y_host));
+
     // aclshmem_free: 释放对称内存
-    // 参数: aclshmem_malloc返回的指针
+    // 参数: aclshmem_malloc返回的对称内存指针
     // 必须与aclshmem_malloc配对使用
+    // 注意：不能使用aclrtFree释放对称内存，必须使用aclshmem_free
+    // 释放后，该内存块可以被其他shmem操作重新分配
     aclshmem_free(gva);
 
     std::cout << " Pe " << my_pe << "Finised !! Result Correct !!" << std::endl;
@@ -333,19 +373,79 @@ int main(int argc, char *argv[])
     f_npu = atoi(argv[INDEX6]);
     data_type = argv[INDEX7];
 
-    // Acl && Shmem init
+    // ========== ACL && Shmem 初始化 ==========
+    // 计算物理设备ID：my_pe % g_npus + f_npu
+    // my_pe: 当前进程的逻辑编号
+    // g_npus: 节点内NPU总数
+    // f_npu: NPU编号偏移量（物理设备ID的起点）
     int32_t device_id = my_pe % g_npus + f_npu;
+
+    // aclInit: 初始化ACL（Ascend Computing Language）运行时环境
+    // 参数: nullptr表示使用默认配置
+    // 必须在调用任何ACL API之前执行
+    // 初始化CANN软件栈，加载驱动，准备NPU资源
     CHECK_RET(aclInit(nullptr));
+
+    // aclrtSetDevice: 设置当前进程使用的NPU设备
+    // 参数: device_id - 物理NPU设备编号
+    // 将进程绑定到指定的NPU，后续所有ACL操作在该设备上执行
+    // 设置设备上下文，准备计算资源
     CHECK_RET(aclrtSetDevice(device_id));
 
+    // 定义对称内存大小：1GB
+    // 对称内存是所有PE在同一虚拟地址上的相同大小内存
+    // 用于存放通信数据和同步标志
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含以下关键字段：
+    // - my_pe: 当前PE编号
+    // - n_pes: 总PE数量
+    // - ip_port: rendezvous地址（TCP socket地址）
+    // - local_mem_size: 对称内存大小
+    // - option_attr: 可选属性（引擎类型、超时等）
+    //   .data_op_engine_type: 数据传输引擎类型
+    //   .timeout: 各阶段超时设置
     aclshmemx_init_attr_t attributes;
+
+    // test_set_attr: 辅助函数，填充shmem初始化属性结构体
+    // 参数详解:
+    // - my_pe: 当前PE编号（进程ID）
+    // - n_pes: 总PE数量（进程总数）
+    // - local_mem_size: 对称内存大小（字节）
+    // - ipport: rendezvous地址字符串，如"tcp://127.0.0.1:8998"
+    //   PE 0监听此地址，其他PE连接到此地址进行握手
+    // - &attributes: 属性结构体指针（输出参数）
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
     // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎类型为SDMA
-    // SDMA引擎使用片上SDMA单元进行节点内NPU间通信
-    // 其他引擎类型: ACLSHMEM_DATA_OP_MTE(MTE引擎), ACLSHMEM_DATA_OP_ROCE(RDMA引擎), ACLSHMEM_DATA_OP_UDMA(UDMA引擎)
+    // SDMA引擎特点：
+    // - 使用片上SDMA单元进行数据传输
+    // - 仅支持节点内NPU间通信（不支持跨节点）
+    // - 高带宽、低延迟
+    // - 适合大规模数据传输
+    // 其他可选引擎类型:
+    // - ACLSHMEM_DATA_OP_MTE: MTE引擎（片上互联，节点内）
+    // - ACLSHMEM_DATA_OP_ROCE: RDMA引擎（RoCE网络，跨节点）
+    // - ACLSHMEM_DATA_OP_UDMA: UDMA引擎（高性能互联）
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+
+    // aclshmemx_init_attr: 初始化shmem运行时
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   表示使用默认socket/bootstrap模式，不需要MPI
+    //   可选模式:
+    //   * ACLSHMEMX_INIT_WITH_DEFAULT: TCP socket模式（推荐）
+    //   * ACLSHMEMX_INIT_WITH_MPI: 使用MPI进行初始化
+    //   * ACLSHMEMX_INIT_WITH_UNIQUEID: 使用唯一ID模式
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功，否则返回错误码
+    // 执行后完成：
+    // 1. 建立进程间通信通道（TCP socket连接）
+    // 2. 分配对称内存堆（Symmetric Heap）
+    // 3. 初始化SDMA通信引擎
+    // 4. 设置PE编号和通信组信息
+    // 5. 创建内部同步机制（barrier、quiet等）
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 
     if (std::string(data_type) == "int") {

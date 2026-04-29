@@ -99,7 +99,18 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
         }
         // aclshmemx_sdma_notify_record: 记录SDMA完成通知
         // 用于通知其他PE数据传输已完成
-        // 与aclrtWaitAndResetNotify配合使用进行同步
+        // 参数详解:
+        // - tmp_buff: UB缓冲区地址（用于通知记录）
+        // - ub_size: UB缓冲区大小
+        // - EVENT_ID0: 事件ID（与put/get操作使用相同ID）
+        // 执行效果:
+        // - 在指定事件上记录完成通知
+        // - 其他PE可以通过aclrtWaitAndResetNotify等待此通知
+        // - 用于异步SDMA操作的同步
+        // 使用场景：
+        // - 与aclrtWaitAndResetNotify配合使用进行同步
+        // - 替代aclshmemx_sdma_quiet，提供更细粒度的同步控制
+        // - 适合需要精确控制同步时机的场景
         aclshmemx_sdma_notify_record(tmp_buff, ub_size, EVENT_ID0);
     }
 }
@@ -256,6 +267,20 @@ int test_allgather_sdma(int my_pe, int n_pes)
 
     // aclshmem_malloc: 分配对称内存
     // 用于存放AllGather操作的通信数据
+    // 参数详解:
+    // - (128 * 1024 * 1024) * sizeof(T): 对称内存大小
+    //   约128MB * sizeof(T)的对称内存
+    // 返回值: 对称内存指针（GVA格式）
+    // 对称内存用途：
+    // - 存存AllGather操作的数据
+    // - 存存其他PE的数据分片
+    // 对称内存核心特点：
+    // 1. 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // 2. PE i可以直接通过GVA地址访问PE j的数据
+    // 3. 用于存放通信数据和同步标志
+    // 注意：
+    // - 必须通过aclshmem_free释放
+    // - 分配大小不能超过local_mem_size
     void *gva = aclshmem_malloc((128 * 1024 * 1024) * sizeof(T));
 
     // 初始化数据
@@ -273,12 +298,26 @@ int test_allgather_sdma(int my_pe, int n_pes)
 
     for(int i = 0; i < total_block_num * sub_block_num; i++) {
         // aclrtWaitAndResetNotify: 等待并重置通知
-        // 参数: notify_arr[i](通知ID), stream, timeout
-        // 与aclshmemx_sdma_notify_record配合使用
+        // 参数详解:
+        // - g_state_host.notify_arr[i]: 通知ID（硬件通知对象）
+        // - g_state_host.default_stream: ACL流
+        // - 0: timeout（0表示无限等待）
+        // 执行效果:
+        // - 阻塞直到收到对应的notify_record通知
+        // - 收到通知后自动重置通知状态
+        // - 用于等待特定SDMA操作完成
+        // 与notify_record配合使用：
+        // - notify_record在Kernel中记录完成通知
+        // - wait_notify在Host端等待完成通知
+        // - 提供细粒度的异步操作同步控制
         CHECK_RET(aclrtWaitAndResetNotify(g_state_host.notify_arr[i], g_state_host.default_stream, 0));
     }
-    // aclshmem_barrier_all: 全局屏障同步
-    // 所有PE调用后才能继续执行
+    // aclshmem_barrier_all: 全局屏同步
+    // 功能详解：
+    // - 所有PE都调用此函数后才能继续执行
+    // - 确保所有notify操作都已完成
+    // - 用于copy_demo前的同步
+    // 注意：必须所有PE都调用此函数
     aclshmem_barrier_all();
     copy_demo<T>(1, g_state_host.default_stream, ptr, ptr_A, n_pes * trans_size * sizeof(T));
 
@@ -308,6 +347,18 @@ int test_allgather_sdma(int my_pe, int n_pes)
     std::cout << "Pe " << pe_id << " has " << unexpected_count << " unexpected values." << std::endl;
 
     CHECK_RET(aclrtFreeHost(y_host));
+
+    // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的对称内存指针（gva）
+    // 必须与aclshmem_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. 所有PE应同时释放对称内存
+    // 3. 释放前确保所有SDMA操作已完成
     aclshmem_free(gva);
 
     CHECK_RET(aclrtDestroyStream(stream));
@@ -335,8 +386,30 @@ int main(int argc, char *argv[])
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
     // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎为SDMA
-    // SDMA引擎用于节点内NPU间通信
+    // SDMA引擎特点：
+    // - 使用片上SDMA单元进行数据传输
+    // - 仅支持节点内NPU间通信（不支持跨节点）
+    // - 高带宽、低延迟
+    // - 适合大规模数据传输
+    // - 支持notify_record/wait_notify同步机制
+    // 其他可选引擎类型:
+    // - ACLSHMEM_DATA_OP_MTE: MTE引擎（片上互联，节点内）
+    // - ACLSHMEM_DATA_OP_ROCE: RDMA引擎（RoCE网络，跨节点）
+    // - ACLSHMEM_DATA_OP_UDMA: UDMA引擎（高性能互联）
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+
+    // aclshmemx_init_attr: 初始化shmem运行时
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 执行后完成:
+    // 1. 建立进程间通信通道
+    // 2. 分配对称内存堆
+    // 3. 初始化SDMA通信引擎
+    // 4. 设置PE编号和通信组信息
+    // 5. 初始化notify机制（notify_arr等）
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 
     if (std::string(data_type) == "int") {
@@ -352,6 +425,22 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理SDMA通信引擎状态
+    // - 释放notify机制资源（notify_arr等）
+    // 执行流程：
+    // 1. 等待所有pending的SDMA操作完成
+    // 2. 通知其他PE本PE即将退出
+    // 3. 释放所有对称内存资源
+    // 4. 关闭bootstrap通信通道
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 注意：
+    // 1. 每个PE必须调用此函数后才能退出程序
+    // 2. 所有PE应同时调用此函数
+    // 3. 调用后不能再执行任何shmem操作
     CHECK_RET(aclshmem_finalize());
     CHECK_RET(aclrtResetDevice(device_id));
     CHECK_RET(aclFinalize());
