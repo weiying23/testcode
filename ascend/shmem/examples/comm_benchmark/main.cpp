@@ -287,6 +287,7 @@ double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
 int run_benchmark(int rank, int world_size) {
     uint64_t mem_size = 256UL * 1024UL * 1024UL;
 
+    make_dir("results");
     CSVWriter latency_csv("results/latency_results.csv");
     CSVWriter bandwidth_csv("results/bandwidth_results.csv");
     CSVWriter hidden_csv("results/hidden_results.csv");
@@ -433,14 +434,14 @@ int run_benchmark(int rank, int world_size) {
     HcclComm hccl_comm = nullptr;
     HcclRootInfo root_info;
 
-    if (rank == 0) {
-        HcclGetRootInfo(&root_info);
-    }
+    // 注意：多进程场景下，root_info 需要由 rank0 通过带外方式（文件/socket）广播给其他进程。
+    // 此处简化示例假设所有进程均已通过 shmem 初始化阶段完成同步，可直接调用 HcclGetRootInfo。
+    HcclGetRootInfo(&root_info);
 
-    HcclCommInitClusterInfo(rank, world_size, &root_info, &hccl_comm);
+    HcclCommInitRootInfo(world_size, &root_info, rank, &hccl_comm);
 
-    std::cout << "[HCCL] Rank " << HcclGetRankId(hccl_comm)
-              << " of " << HcclGetRankSize(hccl_comm) << " initialized\n";
+    std::cout << "[HCCL] Rank " << rank
+              << " of " << world_size << " initialized\n";
 
     // HCCL PingPong延迟测试
     std::cout << "\n[HCCL PingPong Latency Test]\n";

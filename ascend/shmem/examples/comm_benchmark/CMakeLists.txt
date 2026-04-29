@@ -38,7 +38,7 @@ target_link_options(comm_benchmark_kernel PRIVATE
 # 仅当USE_EXAMPLES开启时编译可执行文件
 if(USE_EXAMPLES)
     add_executable(comm_benchmark main.cpp)
-    target_compile_options(comm_benchmark PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS})
+    target_compile_options(comm_benchmark PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS} ${MPI_CXX_COMPILE_FLAGS})
     target_include_directories(comm_benchmark PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/3rdparty/catlass/examples/common
@@ -51,6 +51,10 @@ if(USE_EXAMPLES)
         ${PROJECT_SOURCE_DIR}/src/host/bootstrap/config_store
         ${PROJECT_SOURCE_DIR}/src/host/bootstrap/config_store/acc_links/include
         ${PROJECT_SOURCE_DIR}/src/host/mem/heap
+        ${MPI_INCLUDE_PATH}
     )
     target_link_libraries(comm_benchmark PRIVATE shmem comm_benchmark_kernel)
+    if(DEFINED ENABLE_HCCL AND ENABLE_HCCL)
+        target_link_libraries(comm_benchmark PRIVATE hccl)
+    endif()
 endif()

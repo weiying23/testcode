@@ -27,7 +27,7 @@ namespace benchmark {
 
 // ========== HCCL开关配置 ==========
 // HCCL需要CANN环境支持，取消注释启用HCCL测试
-#define ENABLE_HCCL
+// #define ENABLE_HCCL
 
 #ifdef ENABLE_HCCL
 #define BENCHMARK_HCCL_AVAILABLE 1

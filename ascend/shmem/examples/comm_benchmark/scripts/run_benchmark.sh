@@ -6,7 +6,7 @@
 
 CURRENT_DIR=$(pwd)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-PROJECT_ROOT=$(dirname $(dirname "$SCRIPT_DIR"))
+PROJECT_ROOT=$(dirname $(dirname $(dirname "$SCRIPT_DIR")))
 
 # 参数解析
 IFS=',' read -ra DEVICE_ID_LIST <<< "$1"
@@ -27,6 +27,7 @@ source ${PROJECT_ROOT}/install/set_env.sh
 
 IPPORT="tcp://127.0.0.1:8789"
 EXEC_BIN=${PROJECT_ROOT}/build/bin/comm_benchmark
+G_NPUS=8
 
 # 创建结果目录
 mkdir -p ${SCRIPT_DIR}/../results
@@ -43,7 +44,7 @@ echo "========================================"
 for (( idx = 0; idx < ${RANK_SIZE}; idx = idx + 1 )); do
     device_id=${DEVICE_ID_LIST[$idx]}
     echo "Starting Rank ${idx} on Device ${device_id}"
-    ${EXEC_BIN} ${RANK_SIZE} ${idx} ${IPPORT} ${RANK_SIZE} 0 ${device_id} &
+    ${EXEC_BIN} ${RANK_SIZE} ${idx} ${IPPORT} ${G_NPUS} 0 ${device_id} &
 done
 
 # 等待所有进程完成

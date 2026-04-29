@@ -10,7 +10,7 @@
 constexpr uint32_t MAGIC_VAL = 12345;
 constexpr uint32_t MAGIC_VAL_BW = 10;
 
-// ========== RDMA PingPong延迟测试Kernel ==========<
+// ========== RDMA PingPong延迟测试Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -28,7 +28,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     AscendC::LocalTensor<uint32_t> ubLocal = buf.GetWithOffset<uint32_t>(UB_ALIGN_SIZE / sizeof(uint32_t), 0);
 
     int64_t rank = aclshmem_my_pe();
-    int64_t rank_size = aclshmem_n_pes();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
     GM_ADDR src_addr = gva + rank * msg_size;
@@ -79,7 +78,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     }
 }
 
-// ========== RDMA带宽测试Kernel ==========<
+// ========== RDMA带宽测试Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -96,7 +95,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     AscendC::LocalTensor<uint8_t> ubLocal = buf.GetWithOffset<uint8_t>(UB_ALIGN_SIZE_64, 0);
 
     int64_t rank = aclshmem_my_pe();
-    int64_t rank_size = aclshmem_n_pes();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
     GM_ADDR src_addr = gva + rank * msg_size;
@@ -116,7 +114,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     }
 }
 
-// ========== MTE PingPong延迟测试Kernel ==========<
+// ========== MTE PingPong延迟测试Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -202,7 +200,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     }
 }
 
-// ========== MTE带宽测试Kernel ==========<
+// ========== MTE带宽测试Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -241,7 +239,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
     }
 }
 
-// ========== 通信隐藏测试Kernel ==========<
+// ========== 通信隐藏测试Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void hidden_comm_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -294,7 +292,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void hidden_comm_k
     }
 }
 
-// ========== MatMul计算Kernel ==========<
+// ========== MatMul计算Kernel ==========
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void matmul_compute_kernel(
     GM_ADDR A,
     GM_ADDR B,
@@ -326,7 +324,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void matmul_comput
     *(__gm__ int64_t*)(result_buffer) = end_cycle - start_cycle;
 }
 
-// ========== Host端调用接口 ==========<
+// ========== Host端调用接口 ==========
 void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
                                    uint64_t ffts_config, uint8_t* gva,
                                    int64_t msg_size, int64_t iterations,
