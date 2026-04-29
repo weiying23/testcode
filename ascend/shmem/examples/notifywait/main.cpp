@@ -86,13 +86,20 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
                 continue;
             }
             if (is_put) {
+                // aclshmemx_sdma_put_nbi: 非阻塞SDMA Put操作
+                // 将数据从本PE发送到目标PE
                 aclshmemx_sdma_put_nbi(gva + data_length * my_pe + data_offset, gva + data_length * my_pe + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             } else {
+                // aclshmemx_sdma_get_nbi: 非阻塞SDMA Get操作
+                // 从目标PE拉取数据到本PE
                 aclshmemx_sdma_get_nbi(gva + data_length * i + data_offset, gva + data_length * i + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             }
         }
+        // aclshmemx_sdma_notify_record: 记录SDMA完成通知
+        // 用于通知其他PE数据传输已完成
+        // 与aclrtWaitAndResetNotify配合使用进行同步
         aclshmemx_sdma_notify_record(tmp_buff, ub_size, EVENT_ID0);
     }
 }
@@ -161,15 +168,30 @@ __global__ __aicore__ void allgather_sdma_tensor(GM_ADDR gva, int elem_size, GM_
 template <typename T>
 __global__ __aicore__ void device_copy(GM_ADDR src, GM_ADDR dst, int message_length)
 {
+    // aclshmemi_get_state(): 获取shmem运行时状态（在Kernel内调用）
+    // 返回设备端状态结构体，包含UB地址、同步ID等配置信息
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
 
+    // 从状态结构体获取UB缓冲区地址和大小
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint32_t copy_ub_size = device_state->mte_config.ub_size;
     int64_t my_pe = aclshmem_my_pe();
     AscendC::TEventID copy_event_id = (AscendC::TEventID)device_state->mte_config.sync_id;
+    // aclshmemx_mte_put_nbi: 非阻塞MTE Put操作
+    // 参数:
+    //   - dst: 目标地址（目标PE的GVA地址）
+    //   - src: 源地址（本PE的GVA地址）
+    //   - copy_ub: UB缓冲区地址（用于MTE引擎中转）
+    //   - copy_ub_size: UB缓冲区大小
+    //   - message_length: 数据长度（字节）
+    //   - my_pe: 目标PE编号（此处为自身，用于本地拷贝测试）
+    //   - copy_event_id: 同步事件ID
+    // MTE引擎使用片上MTE单元进行数据传输
     aclshmemx_mte_put_nbi(reinterpret_cast<__gm__ char *>(dst), reinterpret_cast<__gm__ char *>(src),
                           reinterpret_cast<__ubuf__ char *>(copy_ub),
                           copy_ub_size, message_length, my_pe, copy_event_id);
+    // aclshmem_quiet: 等待所有shmem通信操作完成
+    // 阻塞直到所有之前发起的put/get操作完成
     aclshmem_quiet();
 }
 
@@ -232,6 +254,8 @@ int test_allgather_sdma(int my_pe, int n_pes)
     CHECK_RET(aclrtMalloc(reinterpret_cast<void **>(&device_dump), ALL_DUMPSIZE, ACL_MEM_MALLOC_HUGE_FIRST));
 #endif
 
+    // aclshmem_malloc: 分配对称内存
+    // 用于存放AllGather操作的通信数据
     void *gva = aclshmem_malloc((128 * 1024 * 1024) * sizeof(T));
 
     // 初始化数据
@@ -248,8 +272,13 @@ int test_allgather_sdma(int my_pe, int n_pes)
     allgather_kernel<T>(total_block_num, stream, ptr, trans_size, device_dump, false, true);
 
     for(int i = 0; i < total_block_num * sub_block_num; i++) {
+        // aclrtWaitAndResetNotify: 等待并重置通知
+        // 参数: notify_arr[i](通知ID), stream, timeout
+        // 与aclshmemx_sdma_notify_record配合使用
         CHECK_RET(aclrtWaitAndResetNotify(g_state_host.notify_arr[i], g_state_host.default_stream, 0));
     }
+    // aclshmem_barrier_all: 全局屏障同步
+    // 所有PE调用后才能继续执行
     aclshmem_barrier_all();
     copy_demo<T>(1, g_state_host.default_stream, ptr, ptr_A, n_pes * trans_size * sizeof(T));
 
@@ -305,6 +334,8 @@ int main(int argc, char *argv[])
     aclshmemx_init_attr_t attributes;
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
+    // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎为SDMA
+    // SDMA引擎用于节点内NPU间通信
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 

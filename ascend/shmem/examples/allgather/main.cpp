@@ -114,6 +114,9 @@ int test_aclshmem_all_gather(int pe_id, int n_pes)
 
         // sync Buffer + data Buffer
         int aiv_num = BLOCK_NUM;
+        // aclshmem_malloc: 分配对称内存（symmetric heap），所有PE在同一地址拥有相同大小的内存块
+        // 参数: 请求的内存大小（字节），返回指向对称内存的指针
+        // 对称内存是shmem通信的核心：PE i可以通过知道PE j的地址直接访问PE j的内存
         void *ptr = aclshmem_malloc(aiv_num * SYNC_FLAG_INTERVAL * sizeof(T) + GVA_BUFF_MAX_SIZE / sizeof(T));
 
         // AllGather
@@ -151,6 +154,8 @@ int test_aclshmem_all_gather(int pe_id, int n_pes)
         status = aclrtFreeHost(output_host);
         status = aclrtFreeHost(golden_host);
 
+        // aclshmem_free: 释放对称内存，必须与aclshmem_malloc配对使用
+        // 参数: aclshmem_malloc返回的指针
         aclshmem_free(ptr);
         aclrtFree(input_ptr);
         aclrtFree(output_ptr);
@@ -185,8 +190,12 @@ int main(int argc, char *argv[])
     status = aclrtSetDevice(device_id);
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体，用于配置PE编号、进程数、内存大小、网络地址等
     aclshmemx_init_attr_t attributes;
+    // test_set_attr: 辅助函数，填充初始化属性（my_pe: 当前PE编号，n_pes: 总PE数，local_mem_size: 对称内存大小，ipport: rendezvous地址）
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时，ACLSHMEMX_INIT_WITH_DEFAULT表示使用socket/bootstrap默认模式
+    // 参数: 初始化模式标志 + 属性结构体指针
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     if (std::string(data_type) == "int") {
@@ -198,6 +207,8 @@ int main(int argc, char *argv[])
     } else if (std::string(data_type) == "bfloat16_t") {
         status = test_aclshmem_all_gather<bfloat16>(pe_id, n_pes);
     }
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源（包括对称内存、通信通道等）
+    // 每个PE必须调用此函数后才能退出程序
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

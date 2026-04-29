@@ -71,13 +71,17 @@ int group_all_gather(uint64_t instance_id)
     }
     outFile << "M,N,Time(us)\n";
 
+    // aclshmem_my_pe(): 获取当前实例中的PE编号
+    // 多实例模式下，每个实例有自己的PE编号范围
     int pe_id = aclshmem_my_pe();
+    // aclshmem_n_pes(): 获取当前实例中的总PE数量
     int n_pes = aclshmem_n_pes();
 
     // magic is used to sync.
     int magic = 1;
 
     for (int i = 0; i < test_cases.size(); i++) {
+        // aclshmem_my_pe(): 获取当前PE编号
         if (aclshmem_my_pe() == 0) {
             printf("Instance %lu, Case: %d Started. \n", instance_id, test_cases[i]);
         }
@@ -119,6 +123,8 @@ int group_all_gather(uint64_t instance_id)
 
         // sync Buffer + data Buffer
         int aiv_num = BLOCK_NUM;
+        // aclshmem_malloc: 分配对称内存（在指定实例中）
+        // 多实例模式下，对称内存属于特定实例
         void *ptr = aclshmem_malloc(aiv_num * SYNC_FLAG_INTERVAL * sizeof(T) + GVA_BUFF_MAX_SIZE / sizeof(T));
 
         // AllGather
@@ -143,6 +149,7 @@ int group_all_gather(uint64_t instance_id)
             }
         }
 
+        // aclshmem_free: 释放对称内存
         aclshmem_free(ptr);
         aclrtFree(output_ptr);
         aclrtFree(input_ptr);
@@ -177,8 +184,11 @@ static int aclshmem_instance_create_test(int pe_id, aclshmemx_init_attr_t &attr,
 
         // multi_instance default mode need comm_args is nullptr
         attr.comm_args = nullptr;
+        // aclshmemx_init_attr: 初始化指定实例的shmem运行时
+        // attr.instance_id决定了实例编号
         status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr);
 
+        // aclshmem_malloc: 在指定实例中分配对称内存
         void *ptr = aclshmem_malloc(1024);
         std::vector<uint64_t> copy_arr(1024 / sizeof(uint64_t), 1);
         status = aclrtMemcpy(ptr, 1024, copy_arr.data(), 1024, ACL_MEMCPY_HOST_TO_DEVICE);
@@ -186,6 +196,7 @@ static int aclshmem_instance_create_test(int pe_id, aclshmemx_init_attr_t &attr,
             printf("aclshmem_malloc failed !! \n");
         }
 
+        // aclshmem_free: 释放对称内存
         aclshmem_free(ptr);
         printf("Instance id : %ld malloc and free success !! \n", attr.instance_id);
 
@@ -198,6 +209,8 @@ static int aclshmem_instance_destroy_test(int dev_id, aclshmemx_init_attr_t &att
 {
     int status = 0;
     if (std::find(dev_list.begin(), dev_list.end(), dev_id) != dev_list.end()) {
+        // aclshmem_finalize(instance_id): 终止指定实例的shmem运行时
+        // 参数: attr.instance_id - 要终止的实例编号
         status = aclshmem_finalize(attr.instance_id);
     }
     return status;

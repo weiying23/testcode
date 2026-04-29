@@ -79,9 +79,14 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     aclrtStream stream = nullptr;
     status = aclrtCreateStream(&stream);
 
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(rank, world_size, mem_size, ipport, default_flag_uid, &attributes);
 
+    // 根据引擎类型设置数据传输引擎:
+    // ACLSHMEM_DATA_OP_ROCE: RDMA引擎（跨节点通信）
+    // ACLSHMEM_DATA_OP_MTE: MTE引擎（节点内通信）
+    // ACLSHMEM_DATA_OP_SDMA: SDMA引擎（节点内通信）
     switch (engine) {
         case EngineType::RDMA:
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
@@ -96,7 +101,10 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
     }
 
+    // aclshmemx_set_conf_store_tls: 设置配置存储TLS（可选）
     aclshmemx_set_conf_store_tls(false, nullptr, 0);
+    // aclshmemx_init_attr: 初始化shmem运行时
+    // BENCHMARK_INIT_FLAG根据是否启用MPI选择初始化模式
     status = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
 
     return status;
@@ -104,6 +112,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
 
 void finalize_environment(int rank) {
     int32_t device_id = rank % g_npus + f_npu;
+    // aclshmem_finalize: 终止shmem运行时
     aclshmem_finalize();
     aclrtResetDevice(device_id);
     aclFinalize();
@@ -313,6 +322,9 @@ int run_benchmark(int rank, int world_size) {
 
         uint64_t ffts_config = util_get_ffts_config();
 
+        // aclshmem_malloc: 分配对称内存（用于通信数据缓冲区）
+        // 参数: mem_size - 请求的内存大小（256MB）
+        // 返回: 对称内存指针（GVA格式）
         uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
 
         // PingPong延迟测试
@@ -397,6 +409,7 @@ int run_benchmark(int rank, int world_size) {
             }
         }
 
+        // aclshmem_free: 释放对称内存
         aclshmem_free(gva);
         aclrtDestroyStream(stream);
         finalize_environment(rank);

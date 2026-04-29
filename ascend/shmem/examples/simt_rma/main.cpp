@@ -28,12 +28,17 @@ __simt_callee__ inline void test_put_get_mem(
     int32_t prev_pe, int32_t next_pe
 ) 
 {
+    // simt::aclshmem_getmem: SIMT模式下的Get操作（从目标PE获取数据）
+    // 参数: dest(本PE接收地址), source(目标PE发送地址), size(数据大小), pe(目标PE编号)
+    // SIMT模式是线程级并行，适用于细粒度RMA操作
     simt::aclshmem_getmem(
-        (__gm__ void*)res_prev, 
+        (__gm__ void*)res_prev,
         (__gm__ void*)origin,
-        COPY_SIZE * sizeof(int32_t), 
+        COPY_SIZE * sizeof(int32_t),
         prev_pe
     );
+    // simt::aclshmem_putmem: SIMT模式下的Put操作（发送数据到目标PE）
+    // 参数: dest(目标PE接收地址), source(本PE发送地址), size(数据大小), pe(目标PE编号)
     simt::aclshmem_putmem(
         (__gm__ void*)res_next,
         (__gm__ void*)origin,
@@ -85,9 +90,11 @@ __simt_vf__ __launch_bounds__(1024) inline void demo_call_simt(
     __gm__ int32_t* res_prev,
     __gm__ int32_t* res_next,
     __gm__ uint64_t* dbg
-) 
+)
 {
+    // simt::aclshmem_my_pe(): SIMT模式下获取当前PE编号
     int32_t mype = simt::aclshmem_my_pe();
+    // simt::aclshmem_n_pes(): SIMT模式下获取总PE数量
     int32_t npes = simt::aclshmem_n_pes();
 
     int32_t prev_pe = (mype - 1 + npes) % npes;
@@ -187,10 +194,14 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
 
     // 3. 初始化 ACLSHMEM 并申请对称堆空间
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(my_pe, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时（使用默认socket模式）
     ACL_CHECK_WITH_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes), ERROR_LOG("aclshmemx_init failed"), return -1);
 
+    // aclshmemx_malloc: 分配对称内存（SIMT模式使用aclshmemx_前缀）
+    // 对称内存用于存放RMA操作的数据
     int32_t* origin_device = (int32_t*)aclshmemx_malloc(data_bytes);
     int32_t* res_prev_device = (int32_t*)aclshmemx_malloc(data_bytes);
     int32_t* res_next_device = (int32_t*)aclshmemx_malloc(data_bytes);
@@ -213,9 +224,11 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
     );
 
     // 4. 执行同步与计算
+    // aclshmem_barrier_all: 全局屏障同步，确保所有PE的数据初始化完成
     aclshmem_barrier_all();
     run_demo_mem(stream, origin_device, res_prev_device, res_next_device, debug_device);
     ACL_CHECK_WITH_RET(aclrtSynchronizeStream(stream), ERROR_LOG("stream sync failed"), return -1);
+    // aclshmem_barrier_all: 全局屏障同步，确保所有PE的RMA操作完成
     aclshmem_barrier_all();
 
     // 5. 拷贝回 Host 进行校验
@@ -257,10 +270,12 @@ int test_aclshmem_rma_mem(int my_pe, int n_pes)
         printf("[FAILURE] PE %d: Verification failed for RMA transfers.\n", my_pe);
     }
 
-    
+
+    // aclshmemx_free: 释放对称内存（SIMT模式）
     aclshmemx_free(origin_device);
     aclshmemx_free(res_prev_device);
     aclshmemx_free(res_next_device);
+    // aclshmem_finalize: 终止shmem运行时
     aclshmem_finalize();
 
     aclrtFreeHost(origin_host);

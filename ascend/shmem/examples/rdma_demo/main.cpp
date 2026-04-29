@@ -39,12 +39,18 @@ int test_aclshmem_team_all_gather(int pe_id, int n_pes, uint64_t local_mem_size)
     status |= aclrtSetDevice(device_id);
     status |= aclrtCreateStream(&stream);
 
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
 
+    // ACLSHMEM_DATA_OP_ROCE: 设置数据传输引擎为RDMA（RoCE协议）
+    // RDMA引擎用于跨节点NPU间通信，通过RoCE网络进行远程直接内存访问
+    // 支持跨节点的高速低延迟数据传输
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
+    // aclshmem_malloc: 分配对称内存
+    // 用于存放AllGather操作的数据
     uint8_t *ptr = static_cast<uint8_t*>(aclshmem_malloc(1024));
 
     // 初始化数据
@@ -54,15 +60,24 @@ int test_aclshmem_team_all_gather(int pe_id, int n_pes, uint64_t local_mem_size)
         input[i] = (pe_id + num10);
     }
 
+    // aclshmem_my_pe(): 获取当前PE编号
+    // 用于计算数据在对称内存中的偏移位置
     status |= aclrtMemcpy(ptr + aclshmem_my_pe() * trans_size * sizeof(int32_t), trans_size * sizeof(int32_t),
         input.data(), trans_size * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE);
 
     // AllGather
     allgather_demo(1, stream, (uint8_t *)ptr, trans_size * sizeof(int32_t));
+    // aclshmem_handle_t: 操作句柄结构体，用于等待特定操作完成
     aclshmem_handle_t handle;
+    // ACLSHMEM_TEAM_WORLD: 全局通信组ID，包含所有PE
     handle.team_id = ACLSHMEM_TEAM_WORLD;
+    // aclshmemx_handle_wait: 等待handle指定的操作完成
+    // 参数: handle(操作句柄), stream(ACL流)
+    // 用于异步操作的同步等待
     aclshmemx_handle_wait(handle, stream);
     status |= aclrtSynchronizeStream(stream);
+    // aclshmemi_control_barrier_all: 内部屏障同步函数
+    // 确保所有PE的通信操作完成
     aclshmemi_control_barrier_all();
 
     // 结果校验打印
@@ -84,7 +99,9 @@ int test_aclshmem_team_all_gather(int pe_id, int n_pes, uint64_t local_mem_size)
     std::cout << "check transport result success, relative pe=" << pe_id << std::endl;
     // 去初始化
     status |= aclrtFreeHost(y_host);
+    // aclshmem_free: 释放对称内存
     aclshmem_free(ptr);
+    // aclshmem_finalize: 终止shmem运行时
     status |= aclshmem_finalize();
     status |= aclrtDestroyStream(stream);
     status |= aclrtResetDevice(device_id);

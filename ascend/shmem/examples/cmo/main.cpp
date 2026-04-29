@@ -120,9 +120,19 @@ __global__ __aicore__ void copy_perftest(GM_ADDR trash_gm,
     start_cmo_cycle = start_cycle;
     
     if (is_block_prefetch != 0) {
+        // aclshmemx_cmo_nbi: 非阻塞Cache管理操作（CMO）
+        // 参数:
+        //   - addr: 要预取的目标地址（GM地址）
+        //   - size: 预取数据大小（字节）
+        //   - CMO_TYPE_PREFETCH: 预取类型（将数据预取到L2缓存）
+        //   - tmp_buff: UB缓冲区
+        //   - ub_size: UB缓冲区大小
+        //   - EVENT_ID0: 同步事件ID
+        // CMO操作用于优化数据访问性能，减少内存访问延迟
         aclshmemx_cmo_nbi(reinterpret_cast<__gm__  uint8_t *>(copy_gm + cmo_size * block_id), cmo_size,
                             ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, tmp_buff, ub_size, EVENT_ID0);
     } else {
+        // 对垃圾区域进行预取（用于性能对比测试）
         aclshmemx_cmo_nbi(reinterpret_cast<__gm__  uint8_t *>(trash_gm + cmo_size * block_id), cmo_size,
                             ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, tmp_buff, ub_size, EVENT_ID0);
     }
@@ -245,6 +255,7 @@ int copy_test(aclrtStream stream,
     } else if (prefetch_type == CMOEXAMPLE::DEVICE_PREFETCH) {
         cmo_pretech_kernel(reinterpret_cast<uint8_t *>(cache_gm_ptr), cache_gm_size, stream);
         CHECK_RET(aclrtSynchronizeStream(stream));
+        // aclshmem_barrier_all: 全局屏障同步，确保所有PE的预取操作完成
         aclshmem_barrier_all();
     } else if (prefetch_type == CMOEXAMPLE::DEVICE_BLOCK_PREFETCH) {
         is_device_block_prefetch = 1;
@@ -252,13 +263,14 @@ int copy_test(aclrtStream stream,
         CHECK_RET(aclrtCmoAsync(cache_gm_ptr, cache_gm_size, ACL_RT_CMO_TYPE_PREFETCH, stream));
     }
 
-    copy_perftest_kernel<T>(n_blocks, stream, 
-        reinterpret_cast<uint8_t *>(trash_gm_ptr), 
-        reinterpret_cast<uint8_t *>(cache_gm_ptr), 
-        reinterpret_cast<uint8_t *>(device_dump), 
-        reinterpret_cast<uint8_t *>(res_ptr), 
+    copy_perftest_kernel<T>(n_blocks, stream,
+        reinterpret_cast<uint8_t *>(trash_gm_ptr),
+        reinterpret_cast<uint8_t *>(cache_gm_ptr),
+        reinterpret_cast<uint8_t *>(device_dump),
+        reinterpret_cast<uint8_t *>(res_ptr),
         copypad_size, copypad_times, is_device_block_prefetch);
     CHECK_RET(aclrtSynchronizeStream(stream));
+    // aclshmem_barrier_all: 全局屏障同步
     aclshmem_barrier_all();
 
     aclrtMemcpy(res_host, res_size, res_ptr, res_size, ACL_MEMCPY_DEVICE_TO_HOST);
@@ -485,10 +497,13 @@ int main(int argc, char *argv[])
     CHECK_RET(aclrtSetDevice(device_id));
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
+    // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎为SDMA
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 
     if (std::string(data_type) == "int") {
@@ -506,6 +521,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // aclshmem_finalize: 终止shmem运行时
     CHECK_RET(aclshmem_finalize());
     CHECK_RET(aclrtResetDevice(device_id));
     CHECK_RET(aclFinalize());

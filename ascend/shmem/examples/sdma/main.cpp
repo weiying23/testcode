@@ -81,7 +81,11 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
     AscendC::InitDump(false, dump, ALL_DUMPSIZE);
 #endif
     if ASCEND_IS_AIV {
+        // aclshmem_my_pe(): 获取当前PE编号（在Kernel内调用）
+        // 返回当前进程在通信组中的编号，范围 [0, n_pes-1]
         int my_pe = aclshmem_my_pe();
+        // aclshmem_n_pes(): 获取通信组中的总PE数量
+        // 返回参与通信的进程总数
         int n_pes = aclshmem_n_pes();
 
         // Define temporary UB buffer for SDMA operations
@@ -113,13 +117,35 @@ __global__ __aicore__ void allgather_sdma(GM_ADDR gva, int elem_size, GM_ADDR du
                 continue;
             }
             if (is_put) {
+                // aclshmemx_sdma_put_nbi: 非阻塞SDMA Put操作（发送数据到目标PE）
+                // 参数:
+                //   - dst: 目标地址（目标PE的对称内存地址，GVA格式）
+                //   - src: 源地址（本PE的对称内存地址）
+                //   - tmp_buff: UB缓冲区（用于SDMA引擎中转）
+                //   - ub_size: UB缓冲区大小
+                //   - base_per_core: 要传输的数据长度（字节）
+                //   - i: 目标PE编号
+                //   - EVENT_ID0: 事件ID（用于同步）
+                // SDMA引擎通过片上SDMA单元进行数据传输，适用于节点内通信
                 aclshmemx_sdma_put_nbi(gva + data_length * my_pe + data_offset, gva + data_length * my_pe + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             } else {
+                // aclshmemx_sdma_get_nbi: 非阻塞SDMA Get操作（从目标PE拉取数据）
+                // 参数:
+                //   - dst: 目标地址（本PE的接收地址）
+                //   - src: 源地址（目标PE的发送地址）
+                //   - tmp_buff: UB缓冲区
+                //   - ub_size: UB缓冲区大小
+                //   - base_per_core: 数据长度
+                //   - i: 目标PE编号
+                //   - EVENT_ID0: 事件ID
                 aclshmemx_sdma_get_nbi(gva + data_length * i + data_offset, gva + data_length * i + data_offset,
                     tmp_buff, ub_size, base_per_core, i, EVENT_ID0);
             }
         }
+        // aclshmemx_sdma_quiet: 等待所有SDMA操作完成
+        // 参数: tmp_buff(UB缓冲区), ub_size(缓冲区大小), EVENT_ID0(事件ID)
+        // 确保所有之前发起的sdma_put_nbi/sdma_get_nbi操作已完成
         aclshmemx_sdma_quiet(tmp_buff, ub_size, EVENT_ID0);
     }
 }
@@ -238,6 +264,11 @@ int test_allgather_sdma(int my_pe, int n_pes)
     CHECK_RET(aclrtMalloc(reinterpret_cast<void **>(&device_dump), ALL_DUMPSIZE, ACL_MEM_MALLOC_HUGE_FIRST));
 #endif
 
+    // aclshmem_malloc: 分配对称内存（symmetric heap）
+    // 参数: 请求的内存大小（字节）
+    // 返回: 对称内存指针（GVA格式）
+    // 对称内存是shmem的核心：所有PE拥有相同大小的内存，且地址相同
+    // PE i可以直接通过GVA地址访问PE j的数据
     void *gva = aclshmem_malloc((128 * 1024 * 1024) * sizeof(T));
 
     // 初始化数据
@@ -253,6 +284,9 @@ int test_allgather_sdma(int my_pe, int n_pes)
     allgather_kernel<T>(n_blocks, stream, reinterpret_cast<uint8_t *>(gva), trans_size, device_dump, false, true);
 
     CHECK_RET(aclrtSynchronizeStream(stream));
+    // aclshmem_barrier_all: 全局屏障同步
+    // 所有PE都调用此函数后才能继续执行
+    // 确保所有PE的通信操作都已完成，用于结果验证前的同步
     aclshmem_barrier_all();
 
 #if defined(ENABLE_ASCENDC_DUMP)
@@ -277,6 +311,9 @@ int test_allgather_sdma(int my_pe, int n_pes)
     }
 
     CHECK_RET(aclrtFreeHost(y_host));
+    // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的指针
+    // 必须与aclshmem_malloc配对使用
     aclshmem_free(gva);
 
     std::cout << " Pe " << my_pe << "Finised !! Result Correct !!" << std::endl;
@@ -305,6 +342,9 @@ int main(int argc, char *argv[])
     aclshmemx_init_attr_t attributes;
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
+    // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎类型为SDMA
+    // SDMA引擎使用片上SDMA单元进行节点内NPU间通信
+    // 其他引擎类型: ACLSHMEM_DATA_OP_MTE(MTE引擎), ACLSHMEM_DATA_OP_ROCE(RDMA引擎), ACLSHMEM_DATA_OP_UDMA(UDMA引擎)
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 
@@ -321,6 +361,8 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 包括对称内存、通信通道、内部状态等
     CHECK_RET(aclshmem_finalize());
     CHECK_RET(aclrtResetDevice(device_id));
     CHECK_RET(aclFinalize());

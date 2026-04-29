@@ -33,23 +33,32 @@ int run_main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &pe);
     MPI_Comm_size(MPI_COMM_WORLD, &pe_size);
     int status = ACLSHMEM_SUCCESS;
-    
+
     aclInit(nullptr);
     int device_id = pe % g_npu;
     aclrtSetDevice(device_id);
-    
+
+    // aclshmemx_init_attr_t: shmem初始化属性结构体，包含PE编号、进程数、内存大小等配置
     aclshmemx_init_attr_t attributes;
+    // aclshmemx_uniqueid_t: 唯一ID结构体，用于进程间rendezvous（握手连接）
+    // ACLSHMEM_UNIQUEID_INITIALIZER: 唯一ID的默认初始化值
     aclshmemx_uniqueid_t uid = ACLSHMEM_UNIQUEID_INITIALIZER;
-    
+
     int64_t local_mem_size = 1024 * 1024 * 1024;
     if (pe == 0) {
+        // aclshmemx_get_uniqueid: 仅由PE 0调用，生成用于rendezvous的唯一ID
+        // 其他PE需要通过MPI或socket等方式获取此ID
         status = aclshmemx_get_uniqueid(&uid);
     }
 
     MPI_Bcast(&uid, sizeof(aclshmemx_uniqueid_t), MPI_UINT8_T, 0, MPI_COMM_WORLD);
-    status = aclshmemx_set_attr_uniqueid_args(pe, pe_size, 
-                                                local_mem_size, 
+    // aclshmemx_set_attr_uniqueid_args: 使用唯一ID设置初始化属性
+    // 参数: my_pe(当前PE编号), n_pes(总PE数), local_mem_size(对称内存大小), uid指针, attributes指针
+    status = aclshmemx_set_attr_uniqueid_args(pe, pe_size,
+                                                local_mem_size,
                                                 &uid, &attributes);
+    // aclshmemx_init_attr: 初始化shmem运行时
+    // ACLSHMEMX_INIT_WITH_UNIQUEID: 使用唯一ID模式进行进程间rendezvous连接
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
 
     if (status != ACLSHMEM_SUCCESS) {
@@ -155,14 +164,18 @@ int uid_multi_instance_create(int pe_id, std::vector<int> &dev_list, uint64_t in
         aclshmemx_uniqueid_t uid = ACLSHMEM_UNIQUEID_INITIALIZER;
 
         if (local_pe_id == 0) {
+            // aclshmemx_get_uniqueid: PE 0生成唯一ID用于子组通信组的rendezvous
             status = aclshmemx_get_uniqueid(&uid);
         }
 
         MPI_Bcast(&uid, sizeof(aclshmemx_uniqueid_t), MPI_UINT8_T, 0, split_comm);
+        // instance_id: 多实例ID，允许同一PE参与多个不同的通信组
+        // 每个实例有独立的对称内存空间和通信通道
         attr.instance_id = instance_id;
         status = aclshmemx_set_attr_uniqueid_args(
             local_pe_id, pe_size, local_mem_size, &uid, &attr);
 
+        // ACLSHMEMX_INIT_WITH_UNIQUEID: 使用唯一ID模式初始化子组通信实例
         status = aclshmemx_init_attr(
             ACLSHMEMX_INIT_WITH_UNIQUEID, &attr);
 
@@ -186,6 +199,9 @@ int uid_multi_instance_create(int pe_id, std::vector<int> &dev_list, uint64_t in
 int uid_multi_instance_destroy(int pe_id, std::vector<int> &dev_list, uint64_t instance_id) {
     int status = 0;
     if (std::find(dev_list.begin(), dev_list.end(), pe_id) != dev_list.end()) {
+        // aclshmem_finalize(instance_id): 终止指定实例的shmem运行时
+        // 参数: instance_id - 要终止的实例ID
+        // 多实例模式下，每个实例需要单独finalize
         status = aclshmem_finalize(instance_id);
         if (status == ACLSHMEM_SUCCESS) {
             std::cout << "pe " << pe_id << ": shmem finalize instance "<< instance_id << " init SUCCESS" << std::endl;
@@ -249,15 +265,23 @@ int run_main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &pe);
     MPI_Comm_size(MPI_COMM_WORLD, &pe_size);
     int status = ACLSHMEM_SUCCESS;
-    
+
     aclInit(nullptr);
     int device_id = pe % g_npu;
     aclrtSetDevice(device_id);
-    
+
     uint64_t local_mem_size = 1024 * 1024 * 1024;
+    // aclshmemx_init_attr_t结构体直接初始化：
+    // my_pe: 当前PE编号
+    // n_pes: 总PE数
+    // ip_port: rendezvous地址（MPI模式下可为空）
+    // local_mem_size: 对称内存大小
+    // option_attr: 包含版本号、数据引擎类型（ACLSHMEM_DATA_OP_MTE）、超时配置等
     aclshmemx_init_attr_t attributes = {
         pe, pe_size, "", local_mem_size, {0, ACLSHMEM_DATA_OP_MTE, 120, 120, 120}};
-    
+
+    // ACLSHMEMX_INIT_WITH_MPI: 使用MPI作为bootstrap进行进程间通信
+    // 此模式需要MPI运行时支持，shmem会使用MPI_Comm进行进程协调
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_MPI, &attributes);
 
     if (status != ACLSHMEM_SUCCESS) {
@@ -287,6 +311,8 @@ int run_main(int argc, char* argv[]) {
 int32_t test_set_attr(int32_t my_pe, int32_t n_pes, uint64_t local_mem_size, const char *ip_port,
                        aclshmemx_uniqueid_t *default_flag_uid, aclshmemx_init_attr_t *attributes)
 {
+    // 设置ip_port（rendezvous地址）：用于进程间建立连接的TCP地址
+    // ACLSHMEM_MAX_IP_PORT_LEN: ip_port的最大长度限制
     size_t ip_len = 0;
     if (ip_port != nullptr) {
         ip_len = std::min(strlen(ip_port), (size_t)(ACLSHMEM_MAX_IP_PORT_LEN - 1));
@@ -297,13 +323,23 @@ int32_t test_set_attr(int32_t my_pe, int32_t n_pes, uint64_t local_mem_size, con
         }
     }
 
+    // attr_version: 属性版本号，格式为 (1 << 16) + sizeof(aclshmemx_init_attr_t)
     int attr_version = (1 << 16) + sizeof(aclshmemx_init_attr_t);
+    // 设置属性字段：
+    // my_pe: 当前PE编号（进程ID）
+    // n_pes: 总PE数量（进程总数）
+    // local_mem_size: 对称内存大小
+    // option_attr: 可选属性，包含引擎类型和超时设置
+    //   - attr_version: 版本号
+    //   - ACLSHMEM_DATA_OP_MTE: 使用MTE引擎（片上互联传输引擎）
+    //   - DEFAULT_TIMEOUT: 各阶段超时时间
     attributes->my_pe = my_pe;
     attributes->n_pes = n_pes;
     attributes->ip_port[ip_len] = '\0';
     attributes->local_mem_size = local_mem_size;
-    attributes->option_attr = {attr_version, ACLSHMEM_DATA_OP_MTE, DEFAULT_TIMEOUT, 
+    attributes->option_attr = {attr_version, ACLSHMEM_DATA_OP_MTE, DEFAULT_TIMEOUT,
                                DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
+    // comm_args: 通信参数指针，此处用于传递uniqueid（DEFAULT模式下可为nullptr）
     attributes->comm_args = reinterpret_cast<void *>(default_flag_uid);
 
     return ACLSHMEM_SUCCESS;
@@ -323,16 +359,21 @@ int run_main(int argc, char* argv[]) {
     int pe = f_pe + device_id;
     int f_npu = atoi(argv[6]);
     std::cout << pe << pe_size << ipport << std::endl;
+    // ACLSHMEM_UNIQUEID_INITIALIZER: uniqueid的默认初始化值
     aclshmemx_uniqueid_t default_flag_uid = ACLSHMEM_UNIQUEID_INITIALIZER;
     aclshmemx_init_attr_t attributes;
 
     int status = ACLSHMEM_SUCCESS;
     aclInit(nullptr);
     aclrtSetDevice(device_id);
-    
+
     uint64_t local_mem_size = 1024 * 1024 * 1024;
+    // test_set_attr: 填充初始化属性结构体
     test_set_attr(pe, pe_size, local_mem_size, ipport.c_str(), &default_flag_uid, &attributes);
-      
+
+    // ACLSHMEMX_INIT_WITH_DEFAULT: 使用默认socket/bootstrap模式
+    // 不需要MPI或uniqueid，进程通过ip_port（TCP地址）进行rendezvous连接
+    // PE 0监听端口，其他PE连接到该端口进行握手
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     if (status != ACLSHMEM_SUCCESS) {

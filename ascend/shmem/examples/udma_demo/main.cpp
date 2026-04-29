@@ -45,12 +45,16 @@ int init_acl_shmem(
     status |= aclrtSetDevice(device_id);
     status |= aclrtCreateStream(&stream);
 
+    // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
 
+    // ACLSHMEM_DATA_OP_UDMA: 设置数据传输引擎为UDMA
+    // UDMA引擎用于高性能片上互联通信，支持AllGather等集合操作
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
+    // aclshmem_malloc: 分配对称内存，用于存放通信数据
     ptr = static_cast<uint8_t*>(aclshmem_malloc(1024));
     return status;
 }
@@ -97,10 +101,13 @@ bool validate_result(uint8_t* ptr, int n_pes, uint32_t trans_size)
 int cleanup_resources(aclrtStream stream, int32_t device_id, uint8_t* ptr, uint8_t* extra_ptr = nullptr)
 {
     int status = 0;
+    // aclshmem_free: 释放对称内存
     aclshmem_free(ptr);
     if (extra_ptr != nullptr) {
+        // aclshmem_free: 释放额外的对称内存
         aclshmem_free(extra_ptr);
     }
+    // aclshmem_finalize: 终止shmem运行时
     status |= aclshmem_finalize();
     status |= aclrtDestroyStream(stream);
     status |= aclrtResetDevice(device_id);
@@ -162,6 +169,8 @@ int test_aclshmem_udma_put_signal(int pe_id, int n_pes, uint64_t local_mem_size)
     }
 
     // Allocate signal address space for all PEs
+    // aclshmem_malloc: 分配用于存放信号的对称内存
+    // 每个PE需要n_pes * sizeof(uint64_t)的空间来存储所有PE的信号值
     uint8_t* sig_addr = static_cast<uint8_t*>(aclshmem_malloc(n_pes * sizeof(uint64_t)));
     // Initialize signal addresses to 0 to avoid dirty data
     std::vector<uint64_t> init_signals(n_pes, 0);
