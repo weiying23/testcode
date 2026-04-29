@@ -44,11 +44,54 @@ int test_aclshmem_udma_atomic_add(int pe_id, int n_pes, uint64_t local_mem_size)
     status |= aclrtCreateStream(&stream);
 
     aclshmemx_init_attr_t attributes;
+
+    // test_set_attr: 辅助函数，填充shmem初始化属性结构体
+    // 参数详解:
+    // - pe_id: 当前PE编号
+    // - n_pes: 总PE数量
+    // - local_mem_size: 对称内存大小（1GB）
+    // - ipport: rendezvous地址字符串
+    // - default_flag_uid: uniqueid结构体
+    // - &attributes: 属性结构体指针（输出参数）
     test_set_attr(pe_id, n_pes, local_mem_size, ipport, default_flag_uid, &attributes);
 
+    // ACLSHMEM_DATA_OP_UDMA: 设置数据传输引擎为UDMA
+    // UDMA引擎特点：
+    // - 高性能片上互联通信引擎
+    // - 支持Atomic操作（Atomic Add等）
+    // - 高带宽、低延迟
+    // - 适合原子操作场景
+    // Atomic Add执行流程：
+    // 1. 每个PE向目标地址发送原子加法操作
+    // 2. 目标地址的值被原子性地增加
+    // 3. 所有PE完成后，目标地址值为所有PE贡献之和
+    // 其他可选引擎类型:
+    // - ACLSHMEM_DATA_OP_MTE: MTE引擎（片上互联，节点内）
+    // - ACLSHMEM_DATA_OP_SDMA: SDMA引擎（片上SDMA单元，节点内）
+    // - ACLSHMEM_DATA_OP_ROCE: RDMA引擎（RoCE网络，跨节点）
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
+
+    // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // UDMA Atomic Add场景中的作用：
+    // 1. 建立所有PE之间的通信通道
+    // 2. 分配对称内存堆，用于Atomic操作数据
+    // 3. 初始化UDMA通信引擎（支持Atomic操作）
+    // 4. 设置pe_id和n_pes信息
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
+    // aclshmem_malloc: 分配对称内存，用于Atomic Add操作的目标地址
+    // 参数详解:
+    // - 1024: 对称内存大小（字节）
+    // 返回值: 对称内存指针（GVA格式）
+    // Atomic Add场景中对称内存的用途：
+    // - 存存Atomic Add操作的目标值
+    // - 所有PE向同一个地址进行原子加法操作
+    // - 结果为所有PE的贡献之和
     uint8_t *ptr = static_cast<uint8_t *>(aclshmem_malloc(1024));
 
     // Initialize input data.
@@ -71,6 +114,16 @@ int test_aclshmem_udma_atomic_add(int pe_id, int n_pes, uint64_t local_mem_size)
     // Launch the udma atomic add kernel.
     launch_udma_atomic_add(1, stream, (uint8_t *)ptr, dump, trans_size * sizeof(int32_t));
     status |= aclrtSynchronizeStream(stream);
+
+    // aclshmem_barrier_all: 全局屏同步，确保所有PE的Atomic Add操作完成
+    // 功能详解：
+    // - 所有PE都调用此函数后才能继续执行
+    // - 确保所有PE的Atomic Add操作都已完成
+    // - 用于结果校验前的同步
+    // Atomic Add场景中的作用：
+    // - 确保所有PE的原子加法操作都已完成
+    // - 保证最终结果的正确性
+    // - 防止数据竞争和结果不一致
     aclshmem_barrier_all();
 #if defined(ENABLE_ASCENDC_DUMP)
     Adx::AdumpPrintWorkSpace(dump, DEBUG_DUMP_SIZE, stream, "udma_atomic_add");
@@ -90,7 +143,26 @@ int test_aclshmem_udma_atomic_add(int pe_id, int n_pes, uint64_t local_mem_size)
 
     // Release resources.
     status |= aclrtFreeHost(y_host);
+
+    // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的对称内存指针（ptr）
+    // 必须与aclshmem_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. 释放前确保Atomic Add操作已完成
     aclshmem_free(ptr);
+
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理UDMA通信引擎状态
+    // - 释放Atomic操作相关资源
+    // 返回值: ACLSHMEM_SUCCESS表示成功
     status |= aclshmem_finalize();
     status |= aclrtDestroyStream(stream);
     status |= aclrtResetDevice(device_id);

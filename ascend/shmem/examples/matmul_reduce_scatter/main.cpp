@@ -73,6 +73,11 @@ void ShmemMatmulReduceScatter(
 
     uint32_t peIdx = aclshmem_my_pe();
     // aclshmem_n_pes(): 获取总PE数量，用于ReduceScatter结果分块
+    // 返回值: 总PE数量
+    // 在Matmul-ReduceScatter中的用途：
+    // 1. 计算结果矩阵的分块大小（m / peSize）
+    // 2. 确定每个PE负责的行数范围
+    // 3. 计算通信组的数据分布和循环范围
     uint32_t peSize = aclshmem_n_pes();
 
     Catlass::GemmCoord problemShape{m, n, k};
@@ -243,12 +248,46 @@ int main(int argc, char **argv)
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
 
     // aclshmemx_uniqueid_t: 唯一ID结构体，用于进程间rendezvous
+    // 包含以下字段：
+    // - my_pe: 当前PE编号
+    // - n_pes: 总PE数量
+    // 用于DEFAULT模式下的通信参数传递
     aclshmemx_uniqueid_t default_flag_uid;
+
     // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含以下关键字段：
+    // - my_pe: 当前PE编号（进程ID），范围[0, n_pes-1]
+    // - n_pes: 总PE数量（进程总数）
+    // - ip_port: rendezvous地址（TCP socket地址）
+    // - local_mem_size: 对称内存大小（字节）
+    // - option_attr: 可选属性
+    //   .data_op_engine_type: 数据传输引擎类型
+    //   .timeout: 各阶段超时设置
+    // - instance_id: 多实例模式下的实例编号
+    // - comm_args: 通信参数指针
     aclshmemx_init_attr_t attributes;
+
+    // test_set_attr: 辅助函数，填充shmem初始化属性结构体
+    // 参数详解:
+    // - pe_id: 当前PE编号
+    // - n_pes: 总PE数量
+    // - local_mem_size: 对称内存大小（1GB）
+    // - ipPort.c_str(): rendezvous地址字符串
+    // - default_flag_uid: uniqueid结构体
+    // - &attributes: 属性结构体指针（输出参数）
     test_set_attr(pe_id, n_pes, local_mem_size, ipPort.c_str(), default_flag_uid, &attributes);
 
     // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // Matmul-ReduceScatter场景中的作用：
+    // 1. 建立所有PE之间的通信通道
+    // 2. 分配对称内存堆，用于ReduceScatter数据交换
+    // 3. 初始化通信引擎，支持ReduceScatter集合操作
+    // 4. 设置pe_id和n_pes信息
     status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
 
     // ACLStream init
@@ -281,6 +320,26 @@ int main(int argc, char **argv)
 
     // aclshmem_malloc: 分配对称内存（用于ReduceScatter通信缓冲区）
     // ReduceScatter需要对称内存来存储中间结果和进行数据交换
+    // 参数详解:
+    // - (204 * 1024 * 1024) * sizeof(__fp16): 对称内存大小
+    //   约204MB * 2字节 = ~408MB的对称内存
+    // 返回值: 对称内存指针（GVA格式）
+    // Matmul-ReduceScatter场景中对称内存的用途：
+    // - 存存ReduceScatter操作的中间结果
+    //   每个PE将矩阵乘法结果按行分块scatter到对应PE
+    // - 用于ReduceScatter融合通信的数据交换
+    // Matmul-ReduceScatter执行流程：
+    // 1. 各PE独立执行本地矩阵乘法：C = A × B
+    // 2. 执行ReduceScatter：每个PE将结果矩阵按行分块
+    //    PE i负责第i行的数据和reduce
+    // 3. 每个PE得到最终结果的一部分（m/peSize行）
+    // 对称内存核心特点：
+    // 1. 所有PE在同一虚拟地址上拥有相同大小的内存块
+    // 2. PE i可以直接通过GVA地址访问PE j的数据
+    // 3. 用于存放通信数据和同步标志
+    // 注意：
+    // - 必须通过aclshmem_free释放
+    // - 分配大小不能超过local_mem_size
     void *symmPtr = aclshmem_malloc((204 * 1024 * 1024) * sizeof(__fp16));
     uint8_t *symmetricPtr = reinterpret_cast<uint8_t *>(symmPtr);
 
@@ -304,6 +363,16 @@ int main(int argc, char **argv)
     }
 
     // aclshmem_free: 释放对称内存
+    // 参数: aclshmem_malloc返回的对称内存指针（symmPtr）
+    // 必须与aclshmem_malloc配对使用
+    // 执行效果:
+    // - 将对称内存归还到Symmetric Heap
+    // - 其他shmem操作可以重新分配此内存
+    // - 释放后该地址不再可用于通信
+    // 重要提示：
+    // 1. 不能使用aclrtFree释放对称内存
+    // 2. 所有PE应同时释放对称内存
+    // 3. 释放前确保ReduceScatter操作已完成
     aclshmem_free(symmPtr);
 
     ACL_CHECK(aclrtFreeHost(aHost));
@@ -315,7 +384,22 @@ int main(int argc, char **argv)
 
     status = aclrtDestroyStream(stream);
 
-    // aclshmem_finalize: 终止shmem运行时
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理通信引擎状态
+    // - 释放内部同步机制资源
+    // 执行流程：
+    // 1. 等待所有pending的ReduceScatter操作完成
+    // 2. 通知其他PE本PE即将退出
+    // 3. 释放所有对称内存资源
+    // 4. 关闭bootstrap通信通道
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 注意：
+    // 1. 每个PE必须调用此函数后才能退出程序
+    // 2. 所有PE应同时调用此函数
+    // 3. 调用后不能再执行任何shmem操作
     status = aclshmem_finalize();
     status = aclrtResetDevice(device_id);
     status = aclFinalize();

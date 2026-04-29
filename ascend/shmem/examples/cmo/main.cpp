@@ -121,22 +121,48 @@ __global__ __aicore__ void copy_perftest(GM_ADDR trash_gm,
     
     if (is_block_prefetch != 0) {
         // aclshmemx_cmo_nbi: 非阻塞Cache管理操作（CMO）
-        // 参数:
-        //   - addr: 要预取的目标地址（GM地址）
-        //   - size: 预取数据大小（字节）
-        //   - CMO_TYPE_PREFETCH: 预取类型（将数据预取到L2缓存）
-        //   - tmp_buff: UB缓冲区
-        //   - ub_size: UB缓冲区大小
-        //   - EVENT_ID0: 同步事件ID
-        // CMO操作用于优化数据访问性能，减少内存访问延迟
+        // CMO = Cache Management Operation，用于优化数据访问性能
+        // 参数详解:
+        // - reinterpret_cast<__gm__ uint8_t *>(copy_gm + cmo_size * block_id):
+        //   要预取的目标地址（GM地址），每个block预取自己的数据块
+        // - cmo_size: 预取数据大小（字节）
+        // - ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH: CMO操作类型
+        //   CMO_TYPE_PREFETCH表示预取操作，将数据从内存加载到L2缓存
+        //   其他CMO类型：
+        //   * CMO_TYPE_CLEAN: 清除缓存，将脏数据写回内存
+        //   * CMO_TYPE_INVALIDATE: 使缓存无效
+        //   * CMO_TYPE_CLEAN_INVALIDATE: 清除并使缓存无效
+        // - tmp_buff: UB缓冲区地址（用于CMO引擎中转）
+        // - ub_size: UB缓冲区大小（64B）
+        // - EVENT_ID0: 同步事件ID（用于跟踪CMO操作完成）
+        // 执行流程:
+        // 1. CMO引擎发起预取请求
+        // 2. 从内存地址读取数据到L2缓存
+        // 3. 预取完成后释放事件ID
+        // 非阻塞特性: 函数立即返回，需要配合quiet等待完成
+        // 性能优化用途：
+        // - 提前将数据加载到L2缓存，减少后续访问延迟
+        // - 适合已知数据访问模式的场景
+        // - 可以与数据拷贝操作重叠执行
         aclshmemx_cmo_nbi(reinterpret_cast<__gm__  uint8_t *>(copy_gm + cmo_size * block_id), cmo_size,
                             ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, tmp_buff, ub_size, EVENT_ID0);
     } else {
         // 对垃圾区域进行预取（用于性能对比测试）
+        // 预取trash_gm区域，模拟无有效数据预取的场景
         aclshmemx_cmo_nbi(reinterpret_cast<__gm__  uint8_t *>(trash_gm + cmo_size * block_id), cmo_size,
                             ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, tmp_buff, ub_size, EVENT_ID0);
     }
     send_cmo_cycle = AscendC::GetSystemCycle();
+    // aclshmemx_sdma_quiet: 等待所有SDMA操作完成（包括CMO操作）
+    // 参数详解:
+    // - tmp_buff: UB缓冲区地址
+    // - ub_size: UB缓冲区大小
+    // - EVENT_ID0: 事件ID（与cmo_nbi使用相同ID）
+    // 执行效果:
+    // - 阻塞直到所有之前发起的CMO操作完成
+    // - 确保预取数据已加载到L2缓存
+    // - 相当于同步屏障，保证数据一致性
+    // 必须在cmo_nbi后调用，否则预取可能未完成
     aclshmemx_sdma_quiet(tmp_buff, ub_size, EVENT_ID0);
     end_cmo_cycle = AscendC::GetSystemCycle();
 
@@ -210,8 +236,23 @@ __global__ __aicore__ void cmo_pretech(GM_ADDR src, uint32_t size)
     constexpr uint32_t ub_size = 64;  // 64B for temporary buffer
     __ubuf__ uint8_t *tmp_buff = reinterpret_cast<__ubuf__ uint8_t *>(uint64_t(ub_offset));
 
+    // aclshmemx_cmo_nbi: 非阻塞Cache管理操作（CMO）- 预取操作
+    // 参数详解:
+    // - reinterpret_cast<__gm__ uint8_t *>(src): 要预取的目标地址（GM地址）
+    // - size: 预取数据大小（字节）
+    // - ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH: CMO操作类型（预取）
+    // - tmp_buff: UB缓冲区地址
+    // - ub_size: UB缓冲区大小
+    // - EVENT_ID0: 同步事件ID
+    // 执行效果:
+    // - 将数据从src地址预取到L2缓存
+    // - 减少后续数据访问延迟
+    // - Host端调用，用于整体数据预取
     aclshmemx_cmo_nbi(reinterpret_cast<__gm__  uint8_t *>(src), size,
                     ACLSHMEMCMOTYPE::CMO_TYPE_PREFETCH, tmp_buff, ub_size, EVENT_ID0);
+
+    // aclshmemx_sdma_quiet: 等待CMO预取操作完成
+    // 确保数据已加载到L2缓存后再继续执行
     aclshmemx_sdma_quiet(tmp_buff, ub_size, EVENT_ID0);
 }
 
@@ -255,7 +296,12 @@ int copy_test(aclrtStream stream,
     } else if (prefetch_type == CMOEXAMPLE::DEVICE_PREFETCH) {
         cmo_pretech_kernel(reinterpret_cast<uint8_t *>(cache_gm_ptr), cache_gm_size, stream);
         CHECK_RET(aclrtSynchronizeStream(stream));
-        // aclshmem_barrier_all: 全局屏障同步，确保所有PE的预取操作完成
+        // aclshmem_barrier_all: 全局屏同步，确保所有PE的预取操作完成
+        // 功能详解：
+        // - 所有PE都调用此函数后才能继续执行
+        // - 确保所有PE的CMO预取操作都已完成
+        // - 用于Device端预取后的同步
+        // 注意：必须所有PE都调用此函数
         aclshmem_barrier_all();
     } else if (prefetch_type == CMOEXAMPLE::DEVICE_BLOCK_PREFETCH) {
         is_device_block_prefetch = 1;
@@ -270,7 +316,11 @@ int copy_test(aclrtStream stream,
         reinterpret_cast<uint8_t *>(res_ptr),
         copypad_size, copypad_times, is_device_block_prefetch);
     CHECK_RET(aclrtSynchronizeStream(stream));
-    // aclshmem_barrier_all: 全局屏障同步
+    // aclshmem_barrier_all: 全局屏同步
+    // 功能详解：
+    // - 所有PE都调用此函数后才能继续执行
+    // - 确保所有PE的copy测试都已完成
+    // - 用于性能测试结果收集前的同步
     aclshmem_barrier_all();
 
     aclrtMemcpy(res_host, res_size, res_ptr, res_size, ACL_MEMCPY_DEVICE_TO_HOST);
@@ -498,12 +548,42 @@ int main(int argc, char *argv[])
 
     uint64_t local_mem_size = 1024UL * 1024UL * 1024;
     // aclshmemx_init_attr_t: shmem初始化属性结构体
+    // 包含以下关键字段：
+    // - my_pe: 当前PE编号（进程ID），范围[0, n_pes-1]
+    // - n_pes: 总PE数量（进程总数）
+    // - ip_port: rendezvous地址（TCP socket地址）
+    // - local_mem_size: 对称内存大小（字节）
+    // - option_attr: 可选属性
+    //   .data_op_engine_type: 数据传输引擎类型
+    //   .timeout: 各阶段超时设置
+    // - instance_id: 多实例模式下的实例编号
+    // - comm_args: 通信参数指针
     aclshmemx_init_attr_t attributes;
     CHECK_RET(test_set_attr(my_pe, n_pes, local_mem_size, ipport, &attributes));
 
     // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎为SDMA
+    // SDMA引擎特点：
+    // - 使用片上SDMA单元进行数据传输
+    // - 仅支持节点内NPU间通信（不支持跨节点）
+    // - 高带宽、低延迟
+    // - 支持CMO（Cache Management Operation）操作
+    // 其他可选引擎类型:
+    // - ACLSHMEM_DATA_OP_MTE: MTE引擎（片上互联，节点内）
+    // - ACLSHMEM_DATA_OP_ROCE: RDMA引擎（RoCE网络，跨节点）
+    // - ACLSHMEM_DATA_OP_UDMA: UDMA引擎（高性能互联）
     attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+
     // aclshmemx_init_attr: 初始化shmem运行时（默认socket模式）
+    // 参数详解:
+    // - ACLSHMEMX_INIT_WITH_DEFAULT: 初始化模式标志
+    //   使用TCP socket进行进程间rendezvous
+    // - &attributes: 初始化属性结构体指针
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // CMO场景中的作用：
+    // 1. 建立所有PE之间的通信通道
+    // 2. 分配对称内存堆（CMO测试不需要大量对称内存）
+    // 3. 初始化SDMA通信引擎（支持CMO操作）
+    // 4. 设置my_pe和n_pes信息
     CHECK_RET(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes));
 
     if (std::string(data_type) == "int") {
@@ -521,7 +601,22 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // aclshmem_finalize: 终止shmem运行时
+    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
+    // 功能详解：
+    // - 释放对称内存堆
+    // - 关闭进程间通信通道
+    // - 清理SDMA通信引擎状态
+    // - 释放CMO操作相关资源
+    // 执行流程：
+    // 1. 等待所有pending的SDMA/CMO操作完成
+    // 2. 通知其他PE本PE即将退出
+    // 3. 释放所有对称内存资源
+    // 4. 关闭bootstrap通信通道
+    // 返回值: ACLSHMEM_SUCCESS表示成功
+    // 注意：
+    // 1. 每个PE必须调用此函数后才能退出程序
+    // 2. 所有PE应同时调用此函数
+    // 3. 调用后不能再执行任何shmem操作
     CHECK_RET(aclshmem_finalize());
     CHECK_RET(aclrtResetDevice(device_id));
     CHECK_RET(aclFinalize());
