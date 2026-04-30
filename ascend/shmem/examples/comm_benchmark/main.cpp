@@ -124,7 +124,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                          int iterations, int warmup) {
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
-    aclrtMalloc(&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
     launch_rdma_pingpong_latency(1, stream, ffts_config, gva,
                                   msg_size, iterations, warmup, result_buffer);
@@ -150,7 +150,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                  uint8_t* gva, size_t msg_size, int iterations) {
     uint8_t* result_buffer;
-    aclrtMalloc(&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
     launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
     aclrtSynchronizeStream(stream);
@@ -174,7 +174,7 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                        int iterations, int warmup) {
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
-    aclrtMalloc(&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
     launch_mte_pingpong_latency(1, stream, ffts_config, gva,
                                  msg_size, iterations, warmup, result_buffer);
@@ -200,7 +200,7 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                 uint8_t* gva, size_t msg_size, int iterations) {
     uint8_t* result_buffer;
-    aclrtMalloc(&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
     launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
     aclrtSynchronizeStream(stream);
@@ -256,15 +256,15 @@ double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
                          uint8_t* gva, size_t msg_size, int iterations,
                          ComputeConfig compute_cfg) {
     uint8_t* result_buffer;
-    aclrtMalloc(&result_buffer, iterations * sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc((void**)&result_buffer, iterations * sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
     uint8_t* matmul_A, *matmul_B, *matmul_C;
     size_t A_size = compute_cfg.M * compute_cfg.K * sizeof(float);
     size_t B_size = compute_cfg.K * compute_cfg.N * sizeof(float);
     size_t C_size = compute_cfg.M * compute_cfg.N * sizeof(float);
-    aclrtMalloc(&matmul_A, A_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(&matmul_B, B_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(&matmul_C, C_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>(&matmul_A), A_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>&matmul_B, B_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>&matmul_C, C_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
     launch_hidden_comm(1, stream, ffts_config, gva, msg_size, iterations,
                        matmul_A, matmul_B, matmul_C,
