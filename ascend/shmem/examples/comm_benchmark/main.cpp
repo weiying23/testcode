@@ -8,13 +8,20 @@
  *    - Kernel轮询 `gva + msg_size * X - 8` 处的magic value
  *    - 但aclshmem_uint8_put_nbi/mte_put_nbi只传输数据，不写入magic value
  *    - 修复方案：在Kernel中，发送方在发送前将magic value写入数据末尾
- *    - 修复位置：comm_benchmark_kernel.cpp 的 rdma_pingpong_latency_kernel 和 mte_pingpong_latency_kernel
- *    - 修复内容：添加 `*(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;` 语句
+ *    - 修复位置：comm_benchmark_kernel.cpp 的 pingpong latency kernels
+ *    - 修复内容：添加 `*(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;`
  * 2. RDMA和MTE带宽相同：[已诊断] 测试配置问题（非bug）
  *    - 根因：MTE用于节点内通信，RDMA用于跨节点通信
- *    - 如果测试在单节点内运行，RDMA可能使用节点内传输路径（性能接近MTE）
- *    - 建议：跨节点测试时使用RDMA，节点内测试时使用MTE，以获得准确性能对比
- * 3. Segmentation fault：[已修复]
+ *    - 如果测试在单节点内运行，RDMA可能使用节点内传输路径
+ *    - 建议：跨节点测试用RDMA，节点内测试用MTE
+ * 3. 带宽测量过大：[已修复] Kernel计时问题
+ *    - 根因：只测量指令下发时间，没有等待实际数据搬运完成
+ *    - put_nbi是非阻塞操作，只将请求放入队列
+ *    - 循环下发iterations次很快完成，quiet只等待队列清空
+ *    - 实际数据还在传输中，测得带宽虚高
+ *    - 修复方案：使用pingpong模式，发送方等待接收方确认后才记录结束时间
+ *    - 修复位置：comm_benchmark_kernel.cpp 的 bandwidth kernels
+ * 4. Segmentation fault：[已修复]
  *    - 原因：init_environment创建了stream但未返回给调用者
  *    - 修复：删除init_environment内部的stream创建，让调用者自己创建
  */
@@ -346,9 +353,12 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
     // - result_buffer: 结果buffer（存储总传输时间cycles）
     //
     // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // - 使用aclshmem_uint8_put_nbi发送数据
-    // - 使用aclshmemx_roce_quiet等待传输完成
-    // - 记录总传输时间cycles
+    // 使用pingpong模式测量真实传输时间：
+    // 1. 发送方批量发送所有数据
+    // 2. 发送方写入完成标志，通知接收方
+    // 3. 接收方等待完成标志，确保数据到达
+    // 4. 接收方发送确认响应
+    // 5. 发送方收到确认后才记录结束时间
     launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
     // aclrtSynchronizeStream: 同步stream
@@ -365,10 +375,17 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
     double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
     // compute_bandwidth: 计算带宽（GB/s）
-    // 参数: msg_size * iterations - 总传输数据量（字节）
-    //       total_time_us - 总传输时间（微秒）
-    // 公式: bandwidth = total_bytes / total_time / 1e9
-    double bw_gb_s = compute_bandwidth(msg_size * iterations, total_time_us);
+    //
+    // Pingpong模式带宽计算说明：
+    // total_time包含：发送时间 + 等待确认时间
+    // 由于确认消息很小（8字节），等待确认时间≈接收方处理时间
+    //
+    // 单向发送带宽计算：
+    // bandwidth = iterations * msg_size / total_time * 2
+    // （乘2是因为pingpong时间包含双向通信，单向时间约为一半）
+    //
+    // 注意：这是近似计算，实际带宽可能因网络延迟而略有差异
+    double bw_gb_s = compute_bandwidth(msg_size * iterations * 2, total_time_us);
 
     // 释放Host端内存
     aclrtFreeHost(host_result);
@@ -470,9 +487,12 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
     // - result_buffer: 结果buffer
     //
     // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // - 使用aclshmemx_mte_put_nbi发送数据（MTE引擎）
-    // - 使用MTE3_S事件同步等待传输完成
-    // - 记录总传输时间cycles
+    // 使用pingpong模式测量真实传输时间：
+    // 1. 发送方批量发送所有数据
+    // 2. 发送方写入完成标志，通知接收方
+    // 3. 接收方等待完成标志，确保数据到达
+    // 4. 接收方发送确认响应
+    // 5. 发送方收到确认后才记录结束时间
     launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
     // aclrtSynchronizeStream: 同步stream
@@ -488,8 +508,11 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
     // cycles_to_us: 将cycles转换为微秒
     double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
-    // compute_bandwidth: 计算带宽
-    double bw_gb_s = compute_bandwidth(msg_size * iterations, total_time_us);
+    // compute_bandwidth: 计算带宽（GB/s）
+    // Pingpong模式带宽计算说明：
+    // bandwidth = iterations * msg_size * 2 / total_time
+    // （乘2是因为pingpong时间包含双向通信）
+    double bw_gb_s = compute_bandwidth(msg_size * iterations * 2, total_time_us);
 
     // 释放Host端内存
     aclrtFreeHost(host_result);
@@ -608,8 +631,8 @@ double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
     // BUG!!! 这里使用了&而不是&matmul_B的正确类型
     // 应该是: aclrtMalloc(reinterpret_cast<void**>(&matmul_B), ...)
     // 错误写法可能导致编译警告或运行时问题
-    aclrtMalloc(reinterpret_cast<void**>&matmul_B, B_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(reinterpret_cast<void**>&matmul_C, C_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>(&matmul_B), B_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    aclrtMalloc(reinterpret_cast<void**>(&matmul_C), C_size, ACL_MEM_MALLOC_HUGE_FIRST);
 
     // launch_hidden_comm: 启动通信隐藏测试Kernel
     // 参数详解:

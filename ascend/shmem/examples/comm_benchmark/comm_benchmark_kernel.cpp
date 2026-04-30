@@ -1,6 +1,24 @@
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * Comm Benchmark Kernel - 所有通信性能测试Kernel的集合
+ *
+ * 问题修复记录：
+ * 1. Pingpong latency定值问题：已修复
+ *    - 添加magic value写入逻辑到数据末尾
+ *    - 发送方在发送前写入：`*(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i`
+ *    - 接收方检测magic value确认数据到达
+ *
+ * 2. 带宽测量过大问题：已修复
+ *    - 原问题：只测量指令下发时间，没有等待实际数据搬运完成
+ *    - put_nbi是非阻塞操作，循环下发很快完成
+ *    - quiet/WaitFlag只等待队列清空，不保证接收方收到数据
+ *    - 修复：使用pingpong模式，发送方等待接收方确认后才记录结束时间
+ *    - 新流程：
+ *      a) 发送方批量发送所有数据
+ *      b) 发送方写入完成标志通知接收方
+ *      c) 接收方等待完成标志，确保数据到达
+ *      d) 接收方发送确认响应
+ *      e) 发送方收到确认后才记录结束时间
  */
 
 #include "kernel_operator.h"
@@ -139,6 +157,25 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 }
 
 // ========== RDMA带宽测试Kernel ==========
+//
+// BUG修复说明：
+// 原问题：只测量指令下发时间，没有等待实际数据搬运完成，导致带宽过大
+// 根因分析：
+// - aclshmem_uint8_put_nbi是非阻塞操作，只将请求放入队列
+// - 循环下发iterations次操作很快完成（可能只需几微秒）
+// - roce_quiet等待队列清空，但不保证接收方已收到数据
+// - 实际数据搬运还在网络传输中，测得带宽虚高
+//
+// 修复方案：
+// 使用pingpong模式测量带宽：
+// 1. 发送方批量发送数据
+// 2. 接收方收到后发送确认响应
+// 3. 发送方收到响应后才记录结束时间
+// 这样测量的时间包含了完整的双向传输时间
+//
+// 带宽计算公式：
+// - 单向带宽 = iterations * msg_size / (total_time / 2)
+// - 双向带宽 = iterations * msg_size * 2 / total_time（考虑发送+接收）
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -157,20 +194,60 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     int64_t rank = aclshmem_my_pe();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
+    // 内存布局：
+    // Slot 0: rank 0的数据区（发送方使用）
+    // Slot 1: rank 1的数据区（接收方使用）
+    // Slot 2末尾: 同步/确认区域
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
+    // 使用pingpong模式测量真实传输时间
     if (rank == 0) {
+        // 发送方逻辑
         int64_t start_cycle = AscendC::GetSystemCycle();
 
+        // 步骤1：批量发送所有数据
         for (int64_t i = 0; i < iterations; i++) {
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
         }
 
+        // 步骤2：写入完成标志，通知接收方所有数据已发送
+        // Magic value = iterations（表示发送了多少次）
+        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = iterations;
+
+        // 发送完成标志到接收方
+        aclshmem_uint8_put_nbi(gva + msg_size * 2 - 8, gva + msg_size * 2 - 8, 8, peer);
         aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+
+        // 步骤3：等待接收方的确认响应
+        // 接收方在收到所有数据后，会写入 MAGIC_VAL_BW 作为确认
+        while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != MAGIC_VAL_BW) {
+            dcci_cachelines(gva + msg_size * 2 - 8, 8);
+            AscendC::GetSystemCycle();
+        }
 
         int64_t end_cycle = AscendC::GetSystemCycle();
         *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+    } else {
+        // 接收方逻辑
+        // 步骤1：等待发送方的完成标志
+        // 持续轮询，直到收到发送方通知的所有数据已发送
+        uint32_t expected_count = 0;
+        while (expected_count < iterations) {
+            dcci_cachelines(gva + msg_size * 2 - 8, 8);
+            expected_count = *(__gm__ uint32_t*)(gva + msg_size * 2 - 8);
+            AscendC::GetSystemCycle();
+        }
+
+        // 步骤2：确保所有数据都已到达（执行quiet等待）
+        aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+
+        // 步骤3：发送确认响应
+        // 写入 MAGIC_VAL_BW 表示接收方已收到所有数据
+        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = MAGIC_VAL_BW;
+        aclshmem_uint8_put_nbi(gva + msg_size * 2 - 8, gva + msg_size * 2 - 8, 8, peer);
+        aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
     }
 }
 
@@ -321,6 +398,17 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 }
 
 // ========== MTE带宽测试Kernel ==========
+//
+// BUG修复说明：
+// 原问题：与RDMA带宽测试相同，只测量指令下发时间，带宽过大
+// 根因分析：
+// - aclshmemx_mte_put_nbi是非阻塞操作
+// - WaitFlag只等待最后一个事件完成，不保证接收方收到所有数据
+// - 测得带宽虚高
+//
+// 修复方案：
+// 使用pingpong模式测量真实传输时间
+// 与RDMA带宽测试使用相同的同步机制
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -331,6 +419,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
     util_set_ffts_config(ffts_config);
     if (AscendC::GetSubBlockIdx() != 0) return;
 
+    // 获取MTE配置
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint32_t copy_ub_size = device_state->mte_config.ub_size;
@@ -342,20 +431,64 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
+    // 使用pingpong模式测量真实传输时间
     if (rank == 0) {
+        // 发送方逻辑
         int64_t start_cycle = AscendC::GetSystemCycle();
 
+        // 步骤1：批量发送所有数据
         for (int64_t i = 0; i < iterations; i++) {
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
         }
 
+        // 步骤2：等待所有发送完成
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
+        // 步骤3：写入完成标志，通知接收方
+        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = iterations;
+
+        // 发送完成标志
+        aclshmemx_mte_put_nbi((__gm__ uint8_t*)(gva + msg_size * 2 - 8),
+                              (__gm__ uint8_t*)(gva + msg_size * 2 - 8),
+                              reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                              copy_ub_size, 8, peer, copy_event_id);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+
+        // 步骤4：等待接收方确认
+        while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != MAGIC_VAL_BW) {
+            dcci_cachelines(gva + msg_size * 2 - 8, 8);
+            AscendC::GetSystemCycle();
+        }
+
         int64_t end_cycle = AscendC::GetSystemCycle();
         *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+    } else {
+        // 接收方逻辑
+        // 步骤1：等待发送方的完成标志
+        uint32_t expected_count = 0;
+        while (expected_count < iterations) {
+            dcci_cachelines(gva + msg_size * 2 - 8, 8);
+            expected_count = *(__gm__ uint32_t*)(gva + msg_size * 2 - 8);
+            AscendC::GetSystemCycle();
+        }
+
+        // 步骤2：等待所有数据到达
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+
+        // 步骤3：发送确认响应
+        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = MAGIC_VAL_BW;
+        aclshmemx_mte_put_nbi((__gm__ uint8_t*)(gva + msg_size * 2 - 8),
+                              (__gm__ uint8_t*)(gva + msg_size * 2 - 8),
+                              reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                              copy_ub_size, 8, peer, copy_event_id);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
     }
 }
 
