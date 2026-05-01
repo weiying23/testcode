@@ -3,27 +3,31 @@
  * Comm Benchmark主程序 - NPU通信性能对比测试
  *
  * 问题诊断与修复状态：
- * 1. MTE latency是定值：[已修复] Kernel实现问题
- *    - 根因：Pingpong机制中的magic value从未被写入
- *    - Kernel轮询 `gva + msg_size * X - 8` 处的magic value
- *    - 但aclshmem_uint8_put_nbi/mte_put_nbi只传输数据，不写入magic value
- *    - 修复方案：在Kernel中，发送方在发送前将magic value写入数据末尾
- *    - 修复位置：comm_benchmark_kernel.cpp 的 pingpong latency kernels
- *    - 修复内容：添加 `*(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;`
- * 2. RDMA和MTE带宽相同：[已诊断] 测试配置问题（非bug）
- *    - 根因：MTE用于节点内通信，RDMA用于跨节点通信
- *    - 如果测试在单节点内运行，RDMA可能使用节点内传输路径
- *    - 建议：跨节点测试用RDMA，节点内测试用MTE
- * 3. 带宽测量过大：[已修复] Kernel计时问题
- *    - 根因：只测量指令下发时间，没有等待实际数据搬运完成
- *    - put_nbi是非阻塞操作，只将请求放入队列
- *    - 循环下发iterations次很快完成，quiet只等待队列清空
- *    - 实际数据还在传输中，测得带宽虚高
- *    - 修复方案：使用pingpong模式，发送方等待接收方确认后才记录结束时间
- *    - 修复位置：comm_benchmark_kernel.cpp 的 bandwidth kernels
+ * 1. Pingpong latency定值：[已修复]
+ *    - 根因：Kernel未写入magic value到数据末尾
+ *    - 修复：发送方在发送前写入 magic value
+ *    - 位置：comm_benchmark_kernel.cpp 的 pingpong latency kernels
+ *
+ * 2. 带宽测量过大：[已修复 - 参考最佳实现]
+ *    - 根因：原实现只测量指令下发时间
+ *    - 最佳实现参考：rdma_perftest/rdma_perftest_kernel.cpp
+ *    - 新同步机制：
+ *      a) 发送方批量发送 → quiet（保证数据到达）
+ *      b) 发送方发送通知消息（内容来自 src_addr 前4字节）
+ *      c) 接收方轮询通知 → 发送确认（不调用 quiet）
+ *      d) 发送方轮询确认 → 记录结束时间
+ *    - 关键改进：
+ *      * 使用单独通知消息（不破坏数据）
+ *      * 接收方不调用 quiet（无意义）
+ *      * 数据初始化：Host端初始化 src_addr = pe_id + MAGIC_VAL
+ *
+ * 3. RDMA/MTE带宽相同：[已诊断] 测试配置问题（非bug）
+ *    - MTE用于节点内，RDMA用于跨节点
+ *    - 单节点测试时两者可能相近
+ *
  * 4. Segmentation fault：[已修复]
- *    - 原因：init_environment创建了stream但未返回给调用者
- *    - 修复：删除init_environment内部的stream创建，让调用者自己创建
+ *    - init_environment内部创建stream但未返回
+ *    - 修复：删除内部stream创建
  */
 
 #include <iostream>
@@ -327,75 +331,55 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 }
 
 /**
- * ========== RDMA带宽测试 ==========
+ * ========== RDMA带宽测试（改进版）==========
  *
- * 关于RDMA和MTE带宽可能相同的说明：
- * - 这不是bug，而是测试配置问题
- * - RDMA用于跨节点通信（RoCE网络），应配置跨节点测试
- * - MTE用于节点内通信（片上互联），应配置节点内测试
- * - 如果RDMA带宽与MTE相近，说明测试可能运行在单节点内
- * - 建议：使用不同的测试场景来区分性能差异
+ * 改进内容：
+ * 1. 多轮测试取平均（提高稳定性）
+ * 2. 正确的带宽计算（单向带宽，不乘2）
+ *
+ * 带宽计算公式：
+ * - bandwidth = iterations * msg_size / total_time
+ * - 注意：不乘2，因为这是单向带宽测试（发送方测量发送时间）
  */
 StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
-                                 uint8_t* gva, size_t msg_size, int iterations) {
-    // 分配结果buffer：只存储总时间cycles
+                                 uint8_t* gva, size_t msg_size, int iterations,
+                                 int warmup_rounds, int test_rounds) {
+    // 分配结果buffer
     uint8_t* result_buffer;
     aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
-    // launch_rdma_bandwidth: 启动RDMA带宽测试Kernel
-    // 参数详解:
-    // - 1: block_dim
-    // - stream: ACL流
-    // - ffts_config: FFTS配置地址
-    // - gva: 对称内存地址（用于存放带宽测试数据）
-    // - msg_size: 每次传输的消息大小（字节）
-    // - iterations: 传输迭代次数
-    // - result_buffer: 结果buffer（存储总传输时间cycles）
-    //
-    // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // 使用pingpong模式测量真实传输时间：
-    // 1. 发送方批量发送所有数据
-    // 2. 发送方写入完成标志，通知接收方
-    // 3. 接收方等待完成标志，确保数据到达
-    // 4. 接收方发送确认响应
-    // 5. 发送方收到确认后才记录结束时间
-    launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
+    std::vector<double> bandwidths;
 
-    // aclrtSynchronizeStream: 同步stream
-    aclrtSynchronizeStream(stream);
+    // 多轮测试取平均
+    for (int round = 0; round < warmup_rounds + test_rounds; round++) {
+        // launch_rdma_bandwidth: 启动RDMA带宽测试Kernel
+        // block_dim = 1（单核测试）
+        launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
-    // 分配Host端内存，接收结果
-    int64_t* host_result;
-    aclrtMallocHost((void**)&host_result, sizeof(int64_t));
+        aclrtSynchronizeStream(stream);
 
-    // aclrtMemcpy: 拷贝结果到Host
-    aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
+        int64_t* host_result;
+        aclrtMallocHost((void**)&host_result, sizeof(int64_t));
+        aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
-    // cycles_to_us: 将cycles转换为微秒
-    double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
+        double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
-    // compute_bandwidth: 计算带宽（GB/s）
-    //
-    // Pingpong模式带宽计算说明：
-    // total_time包含：发送时间 + 等待确认时间
-    // 由于确认消息很小（8字节），等待确认时间≈接收方处理时间
-    //
-    // 单向发送带宽计算：
-    // bandwidth = iterations * msg_size / total_time * 2
-    // （乘2是因为pingpong时间包含双向通信，单向时间约为一半）
-    //
-    // 注意：这是近似计算，实际带宽可能因网络延迟而略有差异
-    double bw_gb_s = compute_bandwidth(msg_size * iterations * 2, total_time_us);
+        // 带宽计算（单向带宽）
+        // 总数据量 = iterations * msg_size
+        double bw_gb_s = compute_bandwidth(iterations * msg_size, total_time_us);
 
-    // 释放Host端内存
-    aclrtFreeHost(host_result);
+        // 跳过 warmup 轮次
+        if (round >= warmup_rounds) {
+            bandwidths.push_back(bw_gb_s);
+        }
 
-    // 释放Device端内存
+        aclrtFreeHost(host_result);
+    }
+
     aclrtFree(result_buffer);
 
-    // 返回带宽统计结果
-    // 注意：带宽测试只测量总时间，标准差等信息设为0
-    return {bw_gb_s, 0, bw_gb_s, bw_gb_s, bw_gb_s};
+    // 计算统计结果（平均带宽、标准差等）
+    return compute_stats(bandwidths);
 }
 
 /**
@@ -460,7 +444,11 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 }
 
 /**
- * ========== MTE带宽测试 ==========
+ * ========== MTE带宽测试（改进版）==========
+ *
+ * 改进内容：
+ * 1. 多轮测试取平均（提高稳定性）
+ * 2. 正确的带宽计算（单向带宽，不乘2）
  *
  * 关于RDMA和MTE带宽相同的说明：
  * - 这不是bug，而是测试配置问题
@@ -468,60 +456,56 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
  * - RDMA用于跨节点通信（RoCE网络）
  * - 如果测试在单节点内运行，RDMA可能使用节点内传输路径
  * - 建议：跨节点测试时使用RDMA，节点内测试时使用MTE，以获得准确性能对比
- * - 要区分性能差异，请确保RDMA测试配置为跨节点场景
  */
 StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
-                                uint8_t* gva, size_t msg_size, int iterations) {
+                                uint8_t* gva, size_t msg_size, int iterations,
+                                int warmup_rounds, int test_rounds) {
     // 分配结果buffer
     uint8_t* result_buffer;
     aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
 
-    // launch_mte_bandwidth: 启动MTE带宽测试Kernel
-    // 参数详解:
-    // - 1: block_dim
-    // - stream: ACL流
-    // - ffts_config: FFTS配置地址
-    // - gva: 对称内存地址
-    // - msg_size: 每次传输的消息大小
-    // - iterations: 传输迭代次数
-    // - result_buffer: 结果buffer
-    //
-    // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // 使用pingpong模式测量真实传输时间：
-    // 1. 发送方批量发送所有数据
-    // 2. 发送方写入完成标志，通知接收方
-    // 3. 接收方等待完成标志，确保数据到达
-    // 4. 接收方发送确认响应
-    // 5. 发送方收到确认后才记录结束时间
-    launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
+    std::vector<double> bandwidths;
 
-    // aclrtSynchronizeStream: 同步stream
-    aclrtSynchronizeStream(stream);
+    // 多轮测试取平均
+    for (int round = 0; round < warmup_rounds + test_rounds; round++) {
+        // launch_mte_bandwidth: 启动MTE带宽测试Kernel
+        // block_dim = 1（单核测试）
+        //
+        // Kernel 内部流程：
+        // 发送方：
+        //   1. 批量发送 iterations 次数据（aclshmemx_mte_put_nbi）
+        //   2. WaitFlag 等待 MTE3_S 事件（发送完成）
+        //   3. 发送通知消息到 notify_addr
+        //   4. 轮询 ack_addr 等待确认
+        // 接收方：
+        //   1. 轮询 notify_addr 等待通知
+        //   2. 发送确认到 ack_addr
+        launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
-    // 分配Host端内存
-    int64_t* host_result;
-    aclrtMallocHost((void**)&host_result, sizeof(int64_t));
+        aclrtSynchronizeStream(stream);
 
-    // aclrtMemcpy: 拷贝结果到Host
-    aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
+        int64_t* host_result;
+        aclrtMallocHost((void**)&host_result, sizeof(int64_t));
+        aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
-    // cycles_to_us: 将cycles转换为微秒
-    double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
+        double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
-    // compute_bandwidth: 计算带宽（GB/s）
-    // Pingpong模式带宽计算说明：
-    // bandwidth = iterations * msg_size * 2 / total_time
-    // （乘2是因为pingpong时间包含双向通信）
-    double bw_gb_s = compute_bandwidth(msg_size * iterations * 2, total_time_us);
+        // 带宽计算（单向带宽）
+        // 总数据量 = iterations * msg_size
+        double bw_gb_s = compute_bandwidth(iterations * msg_size, total_time_us);
 
-    // 释放Host端内存
-    aclrtFreeHost(host_result);
+        // 跳过 warmup 轮次
+        if (round >= warmup_rounds) {
+            bandwidths.push_back(bw_gb_s);
+        }
 
-    // 释放Device端内存
+        aclrtFreeHost(host_result);
+    }
+
     aclrtFree(result_buffer);
 
-    // 返回带宽统计结果
-    return {bw_gb_s, 0, bw_gb_s, bw_gb_s, bw_gb_s};
+    // 计算统计结果（平均带宽、标准差等）
+    return compute_stats(bandwidths);
 }
 
 /**
@@ -778,21 +762,39 @@ int run_benchmark(int rank, int world_size) {
             // 根据消息大小设置迭代次数
             int iterations = (msg_size <= 8 * 1024 * 1024) ? 1000 : 100;
 
+            // warmup和正式测试轮次
+            int warmup_rounds = 3;
+            int test_rounds = 10;
+
+            // ========== 数据初始化 ==========
+            // 初始化 src_addr 的数据，使得通知消息内容是 pe_id + MAGIC_VAL
+            constexpr uint32_t BW_MAGIC_VAL = 10;
+            uint32_t* bw_init_data;
+            aclrtMallocHost((void**)&bw_init_data, msg_size);
+            for (size_t i = 0; i < msg_size / sizeof(uint32_t); i++) {
+                bw_init_data[i] = rank + BW_MAGIC_VAL;
+            }
+            aclrtMemcpy(gva + rank * msg_size, msg_size, bw_init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
+            aclrtFreeHost(bw_init_data);
+
             // 打印测试头信息
             print_test_header({rank, world_size, engine, TestType::BANDWIDTH,
                                msg_size, iterations, 0, ipport});
+            std::cout << "WarmupRounds: " << warmup_rounds << ", TestRounds: " << test_rounds << "\n";
 
             StatsResult result;
             if (engine == EngineType::RDMA) {
                 // test_rdma_bandwidth: 执行RDMA带宽测试
-                result = test_rdma_bandwidth(stream, ffts_config, gva, msg_size, iterations);
+                result = test_rdma_bandwidth(stream, ffts_config, gva, msg_size,
+                                              iterations, warmup_rounds, test_rounds);
             } else if (engine == EngineType::MTE) {
                 // test_mte_bandwidth: 执行MTE带宽测试
-                // 问题：如果带宽与RDMA相同，需要检查Kernel是否正确使用了MTE引擎
-                result = test_mte_bandwidth(stream, ffts_config, gva, msg_size, iterations);
+                result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
+                                             iterations, warmup_rounds, test_rounds);
             }
 
-            std::cout << "Bandwidth: " << result.mean << " GB/s\n";
+            std::cout << "Bandwidth: " << result.mean << " +/- " << result.std
+                      << " GB/s (min=" << result.min << ", max=" << result.max << ")\n";
 
             // bandwidth_csv.write_row: 将结果写入CSV文件
             bandwidth_csv.write_row(engine_name(engine), "bandwidth",

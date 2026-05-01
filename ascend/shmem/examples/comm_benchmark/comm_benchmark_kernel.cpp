@@ -156,35 +156,33 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     }
 }
 
-// ========== RDMA带宽测试Kernel ==========
+// ========== RDMA带宽测试Kernel（支持多核聚合）==========
 //
-// BUG修复说明：
-// 原问题：只测量指令下发时间，没有等待实际数据搬运完成，导致带宽过大
-// 根因分析：
-// - aclshmem_uint8_put_nbi是非阻塞操作，只将请求放入队列
-// - 循环下发iterations次操作很快完成（可能只需几微秒）
-// - roce_quiet等待队列清空，但不保证接收方已收到数据
-// - 实际数据搬运还在网络传输中，测得带宽虚高
+// 改进说明：
+// 1. 支持多核聚合带宽测试（block_dim 可配置：1, 8, 16, 32）
+// 2. 每个 AIV 核心独立发送数据，测量聚合带宽
+// 3. 只有 Core 0 执行同步操作（quiet + 通知 + 等待确认）
 //
-// 修复方案：
-// 使用pingpong模式测量带宽：
-// 1. 发送方批量发送数据
-// 2. 接收方收到后发送确认响应
-// 3. 发送方收到响应后才记录结束时间
-// 这样测量的时间包含了完整的双向传输时间
+// 多核聚合测试说明：
+// - block_dim = 1: 单核带宽基准
+// - block_dim = 8/16/32: 多核并行，测量聚合带宽
+// - 每个 AIV 核心发送 iterations 次 msg_size 数据
+// - 总传输量 = block_dim * iterations * msg_size
 //
-// 带宽计算公式：
-// - 单向带宽 = iterations * msg_size / (total_time / 2)
-// - 双向带宽 = iterations * msg_size * 2 / total_time（考虑发送+接收）
+// 内存布局：
+// - 每个 PE 有 block_dim 个数据 slot
+// - PE i 的 Core j 数据位于 gva + i * msg_size * block_dim + j * msg_size
+// - 同步区域位于所有数据之后
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
     int64_t msg_size,
     int64_t iterations,
+    int64_t block_dim,
     GM_ADDR result_buffer) {
 
     util_set_ffts_config(ffts_config);
-    if (AscendC::GetSubBlockIdx() != 0) return;
+    // 多核模式下，所有 Core 都执行（不再使用 return）
 
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECOUT> buf;
@@ -192,63 +190,74 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     AscendC::LocalTensor<uint8_t> ubLocal = buf.GetWithOffset<uint8_t>(UB_ALIGN_SIZE_64, 0);
 
     int64_t rank = aclshmem_my_pe();
-    uint32_t peer = (rank == 0) ? 1 : 0;
+    int64_t rank_size = aclshmem_n_pes();
+    int64_t core_idx = AscendC::GetBlockIdx();  // 当前核心编号
+    uint32_t peer;
 
-    // 内存布局：
-    // Slot 0: rank 0的数据区（发送方使用）
-    // Slot 1: rank 1的数据区（接收方使用）
-    // Slot 2末尾: 同步/确认区域
-    GM_ADDR src_addr = gva + rank * msg_size;
+    // 多核数据布局：
+    // 每个 PE 有 block_dim 个数据区域
+    // PE i 的 Core j 数据位于 gva + i * msg_size * block_dim + j * msg_size
+    GM_ADDR src_addr = gva + rank * msg_size * block_dim + core_idx * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 使用pingpong模式测量真实传输时间
+    // 同步区域（位于所有数据区域之后）
+    // 总数据区域大小 = rank_size * msg_size * block_dim
+    int64_t sync_base_offset = rank_size * msg_size * block_dim;
+    GM_ADDR notify_addr = gva + sync_base_offset + 8;
+    GM_ADDR ack_addr = gva + sync_base_offset + 16;
+
     if (rank == 0) {
         // 发送方逻辑
+        peer = 1;
+
+        // 所有 Core 都执行数据发送
         int64_t start_cycle = AscendC::GetSystemCycle();
 
-        // 步骤1：批量发送所有数据
         for (int64_t i = 0; i < iterations; i++) {
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
         }
 
-        // 步骤2：写入完成标志，通知接收方所有数据已发送
-        // Magic value = iterations（表示发送了多少次）
-        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = iterations;
-
-        // 发送完成标志到接收方
-        aclshmem_uint8_put_nbi(gva + msg_size * 2 - 8, gva + msg_size * 2 - 8, 8, peer);
-        aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
-
-        // 步骤3：等待接收方的确认响应
-        // 接收方在收到所有数据后，会写入 MAGIC_VAL_BW 作为确认
-        while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != MAGIC_VAL_BW) {
-            dcci_cachelines(gva + msg_size * 2 - 8, 8);
-            AscendC::GetSystemCycle();
+        // 只有 Core 0 执行同步操作
+        if (core_idx == 0) {
+            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            aclshmem_uint8_put_nbi(notify_addr, src_addr, sizeof(uint32_t), peer);
+            while (*(__gm__ uint32_t*)(ack_addr) != peer + MAGIC_VAL) {
+                dcci_cachelines(ack_addr, sizeof(uint32_t));
+                AscendC::GetSystemCycle();
+            }
         }
 
+        AscendC::PipeBarrier<PIPE_ALL>();
         int64_t end_cycle = AscendC::GetSystemCycle();
-        *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+        // 只有 Core 0 记录结果
+        if (core_idx == 0) {
+            *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+        }
 
     } else {
         // 接收方逻辑
-        // 步骤1：等待发送方的完成标志
-        // 持续轮询，直到收到发送方通知的所有数据已发送
-        uint32_t expected_count = 0;
-        while (expected_count < iterations) {
-            dcci_cachelines(gva + msg_size * 2 - 8, 8);
-            expected_count = *(__gm__ uint32_t*)(gva + msg_size * 2 - 8);
-            AscendC::GetSystemCycle();
+        peer = 0;
+
+        // 只有 Core 0 执行同步操作
+        if (core_idx == 0) {
+            while (*(__gm__ uint32_t*)(notify_addr) != peer + MAGIC_VAL) {
+                dcci_cachelines(notify_addr, sizeof(uint32_t));
+                AscendC::GetSystemCycle();
+            }
+            aclshmem_uint8_put_nbi(ack_addr, src_addr, sizeof(uint32_t), peer);
         }
 
-        // 步骤2：确保所有数据都已到达（执行quiet等待）
-        aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
-
-        // 步骤3：发送确认响应
-        // 写入 MAGIC_VAL_BW 表示接收方已收到所有数据
-        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = MAGIC_VAL_BW;
-        aclshmem_uint8_put_nbi(gva + msg_size * 2 - 8, gva + msg_size * 2 - 8, 8, peer);
-        aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
+}
+
+void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
+                            uint64_t ffts_config, uint8_t* gva,
+                            int64_t msg_size, int64_t iterations,
+                            uint8_t* result_buffer) {
+    rdma_bandwidth_kernel<<<block_dim, nullptr, stream>>>(
+        ffts_config, gva, msg_size, iterations, block_dim, result_buffer);
 }
 
 // ========== MTE PingPong延迟测试Kernel ==========
@@ -397,27 +406,28 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     }
 }
 
-// ========== MTE带宽测试Kernel ==========
+// ========== MTE带宽测试Kernel（支持多核聚合）==========
 //
-// BUG修复说明：
-// 原问题：与RDMA带宽测试相同，只测量指令下发时间，带宽过大
-// 根因分析：
-// - aclshmemx_mte_put_nbi是非阻塞操作
-// - WaitFlag只等待最后一个事件完成，不保证接收方收到所有数据
-// - 测得带宽虚高
+// 改进说明（与 RDMA 带宽测试相同）：
+// 1. 支持多核聚合带宽测试（block_dim 可配置）
+// 2. 每个 AIV 核心独立发送数据，测量聚合带宽
+// 3. 只有 Core 0 执行同步操作
 //
-// 修复方案：
-// 使用pingpong模式测量真实传输时间
-// 与RDMA带宽测试使用相同的同步机制
+// 多核聚合测试说明：
+// - block_dim = 1: 单核带宽基准
+// - block_dim = 8/16/32: 多核并行，测量聚合带宽
+// - 每个 AIV 核心发送 iterations 次 msg_size 数据
+// - 总传输量 = block_dim * iterations * msg_size
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
     int64_t msg_size,
     int64_t iterations,
+    int64_t block_dim,
     GM_ADDR result_buffer) {
 
     util_set_ffts_config(ffts_config);
-    if (AscendC::GetSubBlockIdx() != 0) return;
+    // 多核模式下，所有 Core 都执行
 
     // 获取MTE配置
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
@@ -426,70 +436,84 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
     AscendC::TEventID copy_event_id = (AscendC::TEventID)device_state->mte_config.sync_id;
 
     int64_t rank = aclshmem_my_pe();
-    uint32_t peer = (rank == 0) ? 1 : 0;
+    int64_t rank_size = aclshmem_n_pes();
+    int64_t core_idx = AscendC::GetBlockIdx();
+    uint32_t peer;
 
-    GM_ADDR src_addr = gva + rank * msg_size;
+    // 多核数据布局
+    GM_ADDR src_addr = gva + rank * msg_size * block_dim + core_idx * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 使用pingpong模式测量真实传输时间
+    // 同步区域
+    int64_t sync_base_offset = rank_size * msg_size * block_dim;
+    GM_ADDR notify_addr = gva + sync_base_offset + 8;
+    GM_ADDR ack_addr = gva + sync_base_offset + 16;
+
     if (rank == 0) {
         // 发送方逻辑
+        peer = 1;
+
         int64_t start_cycle = AscendC::GetSystemCycle();
 
-        // 步骤1：批量发送所有数据
+        // 所有 Core 都执行数据发送
         for (int64_t i = 0; i < iterations; i++) {
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
         }
 
-        // 步骤2：等待所有发送完成
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+        // 只有 Core 0 执行同步操作
+        if (core_idx == 0) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
-        // 步骤3：写入完成标志，通知接收方
-        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = iterations;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)notify_addr, (__gm__ uint8_t*)src_addr,
+                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                                  copy_ub_size, sizeof(uint32_t), peer, copy_event_id);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
-        // 发送完成标志
-        aclshmemx_mte_put_nbi((__gm__ uint8_t*)(gva + msg_size * 2 - 8),
-                              (__gm__ uint8_t*)(gva + msg_size * 2 - 8),
-                              reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                              copy_ub_size, 8, peer, copy_event_id);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
-        // 步骤4：等待接收方确认
-        while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != MAGIC_VAL_BW) {
-            dcci_cachelines(gva + msg_size * 2 - 8, 8);
-            AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(ack_addr) != peer + MAGIC_VAL) {
+                dcci_cachelines(ack_addr, sizeof(uint32_t));
+                AscendC::GetSystemCycle();
+            }
         }
 
+        AscendC::PipeBarrier<PIPE_ALL>();
         int64_t end_cycle = AscendC::GetSystemCycle();
-        *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+        if (core_idx == 0) {
+            *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+        }
 
     } else {
         // 接收方逻辑
-        // 步骤1：等待发送方的完成标志
-        uint32_t expected_count = 0;
-        while (expected_count < iterations) {
-            dcci_cachelines(gva + msg_size * 2 - 8, 8);
-            expected_count = *(__gm__ uint32_t*)(gva + msg_size * 2 - 8);
-            AscendC::GetSystemCycle();
+        peer = 0;
+
+        // 只有 Core 0 执行同步操作
+        if (core_idx == 0) {
+            while (*(__gm__ uint32_t*)(notify_addr) != peer + MAGIC_VAL) {
+                dcci_cachelines(notify_addr, sizeof(uint32_t));
+                AscendC::GetSystemCycle();
+            }
+
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)ack_addr, (__gm__ uint8_t*)src_addr,
+                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                                  copy_ub_size, sizeof(uint32_t), peer, copy_event_id);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
         }
 
-        // 步骤2：等待所有数据到达
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
-        // 步骤3：发送确认响应
-        *(__gm__ uint32_t*)(gva + msg_size * 2 - 8) = MAGIC_VAL_BW;
-        aclshmemx_mte_put_nbi((__gm__ uint8_t*)(gva + msg_size * 2 - 8),
-                              (__gm__ uint8_t*)(gva + msg_size * 2 - 8),
-                              reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                              copy_ub_size, 8, peer, copy_event_id);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
+}
+
+void launch_mte_bandwidth(uint32_t block_dim, void* stream,
+                           uint64_t ffts_config, uint8_t* gva,
+                           int64_t msg_size, int64_t iterations,
+                           uint8_t* result_buffer) {
+    mte_bandwidth_kernel<<<block_dim, nullptr, stream>>>(
+        ffts_config, gva, msg_size, iterations, block_dim, result_buffer);
 }
 
 // ========== 通信隐藏测试Kernel ==========
@@ -600,14 +624,6 @@ void launch_mte_pingpong_latency(uint32_t block_dim, void* stream,
                                   int64_t warmup, uint8_t* result_buffer) {
     mte_pingpong_latency_kernel<<<1, nullptr, stream>>>(
         ffts_config, gva, msg_size, iterations, warmup, result_buffer);
-}
-
-void launch_mte_bandwidth(uint32_t block_dim, void* stream,
-                           uint64_t ffts_config, uint8_t* gva,
-                           int64_t msg_size, int64_t iterations,
-                           uint8_t* result_buffer) {
-    mte_bandwidth_kernel<<<1, nullptr, stream>>>(
-        ffts_config, gva, msg_size, iterations, result_buffer);
 }
 
 void launch_hidden_comm(uint32_t block_dim, void* stream,
