@@ -23,6 +23,53 @@
 #include "hccl/hccl_types.h"
 #endif
 
+// ========== 调试宏定义 ==========
+#define DEBUG_LOG(rank, fmt, ...) \
+    do { \
+        fprintf(stderr, "[DEBUG][Rank %d] %s:%d: " fmt "\n", \
+                rank, __func__, __LINE__, ##__VA_ARGS__); \
+    } while(0)
+
+#define CHECK_ACL_STATUS(rank, call, desc) \
+    do { \
+        aclError ret = call; \
+        if (ret != ACL_SUCCESS) { \
+            fprintf(stderr, "[ERROR][Rank %d] %s:%d: %s failed, ret=%d\n", \
+                    rank, __func__, __LINE__, desc, ret); \
+            return -1; \
+        } \
+        DEBUG_LOG(rank, "%s success, ret=%d", desc, ret); \
+    } while(0)
+
+#define CHECK_SHMEM_STATUS(rank, call, desc) \
+    do { \
+        int ret = call; \
+        if (ret != ACLSHMEM_SUCCESS) { \
+            fprintf(stderr, "[ERROR][Rank %d] %s:%d: %s failed, ret=%d\n", \
+                    rank, __func__, __LINE__, desc, ret); \
+            return -1; \
+        } \
+        DEBUG_LOG(rank, "%s success", desc); \
+    } while(0)
+
+#define CHECK_PTR(rank, ptr, desc) \
+    do { \
+        if (ptr == nullptr) { \
+            fprintf(stderr, "[ERROR][Rank %d] %s:%d: %s is nullptr\n", \
+                    rank, __func__, __LINE__, desc); \
+            return StatsResult{0,0,0,0,0}; \
+        } \
+        DEBUG_LOG(rank, "%s allocated at %p", desc, ptr); \
+    } while(0)
+
+// 时间戳打印宏
+#define TIMESTAMP(rank, label) \
+    do { \
+        auto ts = std::chrono::high_resolution_clock::now(); \
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts.time_since_epoch()).count(); \
+        DEBUG_LOG(rank, "[%s] timestamp=%lld ms", label, ms); \
+    } while(0)
+
 // Kernel函数声明
 extern void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
                                           uint64_t ffts_config, uint8_t* gva,
@@ -69,16 +116,21 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     int32_t device_id = rank % g_npus + f_npu;
     int status = 0;
 
+    DEBUG_LOG(rank, "=== init_environment START ===");
+    DEBUG_LOG(rank, "device_id=%d, world_size=%d, mem_size=%lu MB, engine=%s",
+              device_id, world_size, mem_size / (1024 * 1024), engine_name(engine).c_str());
+    TIMESTAMP(rank, "INIT_START");
+
     // aclInit: 初始化ACL运行时环境
     // 参数: nullptr表示使用默认配置
     // 必须在调用任何ACL API之前执行
     // 返回值: ACL_SUCCESS表示成功
-    status = aclInit(nullptr);
+    CHECK_ACL_STATUS(rank, aclInit(nullptr), "aclInit");
 
     // aclrtSetDevice: 设置当前进程使用的NPU设备
     // 参数: device_id - 物理NPU设备编号
     // 将进程绑定到指定的NPU，后续所有ACL操作在该设备上执行
-    status = aclrtSetDevice(device_id);
+    CHECK_ACL_STATUS(rank, aclrtSetDevice(device_id), "aclrtSetDevice");
 
     // 注意：不再在此函数内创建stream
     // stream由调用者创建，避免重复创建导致的资源冲突
@@ -87,89 +139,56 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     // aclrtCreateStream(&stream);
 
     // aclshmemx_init_attr_t: shmem初始化属性结构体
-    // 包含以下关键字段：
-    // - my_pe: 当前PE编号（进程ID），范围[0, n_pes-1]
-    // - n_pes: 总PE数量（进程总数）
-    // - ip_port: rendezvous地址（TCP socket地址）
-    // - local_mem_size: 对称内存大小（字节）
-    // - option_attr: 可选属性
-    //   .data_op_engine_type: 数据传输引擎类型
-    //   .timeout: 各阶段超时设置
-    // - instance_id: 多实例模式下的实例编号
-    // - comm_args: 通信参数指针
     aclshmemx_init_attr_t attributes;
 
     // test_set_attr: 辅助函数，填充shmem初始化属性结构体
-    // 参数详解:
-    // - rank: 当前PE编号（进程ID）
-    // - world_size: 总PE数量（进程总数）
-    // - mem_size: 对称内存大小（字节）
-    // - ipport: rendezvous地址字符串，如"tcp://127.0.0.1:8998"
-    //   PE 0监听此地址，其他PE连接到此地址进行握手
-    // - default_flag_uid: uniqueid结构体（DEFAULT模式下使用）
-    // - &attributes: 属性结构体指针（输出参数）
     test_set_attr(rank, world_size, mem_size, ipport, default_flag_uid, &attributes);
+    DEBUG_LOG(rank, "test_set_attr done: my_pe=%d, n_pes=%d, ip_port=%s, mem_size=%lu",
+              attributes.my_pe, attributes.n_pes, ipport, attributes.local_mem_size);
 
     // 根据引擎类型设置数据传输引擎:
-    // ACLSHMEM_DATA_OP_ROCE: RDMA引擎（跨节点通信）
-    //   - 使用RoCE网络进行远程直接内存访问
-    //   - 支持跨节点的高速低延迟数据传输
-    // ACLSHMEM_DATA_OP_MTE: MTE引擎（节点内通信）
-    //   - 使用片上MTE单元进行数据传输
-    //   - 仅支持节点内NPU间通信
-    //   - 高带宽、低延迟
-    // ACLSHMEM_DATA_OP_SDMA: SDMA引擎（节点内通信）
-    //   - 使用片上SDMA单元进行数据传输
-    //   - 仅支持节点内NPU间通信
     switch (engine) {
         case EngineType::RDMA:
-            // ACLSHMEM_DATA_OP_ROCE: 设置数据传输引擎为RDMA（RoCE协议）
-            // RDMA引擎用于跨节点NPU间通信
-            // 通过RoCE网络进行远程直接内存访问
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
+            DEBUG_LOG(rank, "Engine set to RDMA (ROCE)");
             break;
         case EngineType::MTE:
-            // ACLSHMEM_DATA_OP_MTE: 设置数据传输引擎为MTE
-            // MTE引擎用于节点内NPU间通信
-            // 使用片上MTE单元进行数据传输
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
+            DEBUG_LOG(rank, "Engine set to MTE");
             break;
         case EngineType::SDMA:
-            // ACLSHMEM_DATA_OP_SDMA: 设置数据传输引擎为SDMA
-            // SDMA引擎用于节点内NPU间通信
-            // 使用片上SDMA单元进行数据传输
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+            DEBUG_LOG(rank, "Engine set to SDMA");
             break;
         default:
-            // 默认使用RDMA引擎
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
+            DEBUG_LOG(rank, "Engine set to default RDMA");
     }
 
     // aclshmemx_set_conf_store_tls: 设置配置存储TLS（可选）
-    // 参数详解:
-    // - false: 是否启用TLS存储
-    // - nullptr: 配置数据指针
-    // - 0: 配置数据大小
-    // 执行效果：设置shmem内部配置存储方式
     aclshmemx_set_conf_store_tls(false, nullptr, 0);
+    DEBUG_LOG(rank, "aclshmemx_set_conf_store_tls done");
+
+    TIMESTAMP(rank, "SHMEM_INIT_START");
 
     // aclshmemx_init_attr: 初始化shmem运行时
-    // 参数详解:
-    // - BENCHMARK_INIT_FLAG: 初始化模式标志（根据是否启用MPI选择）
-    //   可选模式:
-    //   * ACLSHMEMX_INIT_WITH_DEFAULT: TCP socket模式（推荐）
-    //   * ACLSHMEMX_INIT_WITH_MPI: 使用MPI进行初始化
-    // - &attributes: 初始化属性结构体指针
-    // 返回值: ACLSHMEM_SUCCESS表示成功
-    // 执行后完成:
-    // 1. 建立进程间通信通道
-    // 2. 分配对称内存堆（Symmetric Heap）
-    // 3. 初始化通信引擎（根据engine类型）
-    // 4. 设置PE编号和通信组信息
-    status = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
+    CHECK_SHMEM_STATUS(rank, aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes), "aclshmemx_init_attr");
 
-    // 返回初始化状态
-    // 调用者无法获取函数内部创建的stream，会导致资源管理混乱
+    TIMESTAMP(rank, "SHMEM_INIT_END");
+
+    // 验证初始化后的状态
+    int my_pe = aclshmem_my_pe();
+    int n_pes = aclshmem_n_pes();
+    DEBUG_LOG(rank, "aclshmem_my_pe=%d, aclshmem_n_pes=%d (expected: my_pe=%d, n_pes=%d)",
+              my_pe, n_pes, rank, world_size);
+
+    if (my_pe != rank || n_pes != world_size) {
+        fprintf(stderr, "[ERROR][Rank %d] PE mismatch! my_pe=%d vs rank=%d, n_pes=%d vs world_size=%d\n",
+                rank, my_pe, rank, n_pes, world_size);
+        return -1;
+    }
+
+    DEBUG_LOG(rank, "=== init_environment END ===");
     return status;
 }
 
@@ -177,33 +196,26 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
  * 终止环境 - 清理ACL和SHMEM资源
  */
 void finalize_environment(int rank) {
+    DEBUG_LOG(rank, "=== finalize_environment START ===");
+    TIMESTAMP(rank, "FINALIZE_START");
+
     // 计算物理设备ID
     int32_t device_id = rank % g_npus + f_npu;
 
-    // aclshmem_finalize: 终止shmem运行时，释放所有shmem资源
-    // 功能详解：
-    // - 释放对称内存堆
-    // - 关闭进程间通信通道
-    // - 清理通信引擎状态
-    // - 释放内部同步机制资源
-    // 返回值: ACLSHMEM_SUCCESS表示成功
+    DEBUG_LOG(rank, "calling aclshmem_finalize...");
     aclshmem_finalize();
+    DEBUG_LOG(rank, "aclshmem_finalize done");
 
-    // aclrtResetDevice: 重置NPU设备状态
-    // 参数: device_id - 要重置的NPU设备编号
-    // 执行效果：
-    // - 清除设备上下文
-    // - 释放设备上的计算资源
+    DEBUG_LOG(rank, "calling aclrtResetDevice(%d)...", device_id);
     aclrtResetDevice(device_id);
+    DEBUG_LOG(rank, "aclrtResetDevice done");
 
-    // aclFinalize: 终止ACL运行时环境
-    // 执行效果：
-    // - 释放ACL内部资源
-    // - 关闭驱动连接
-    // - 清理CANN软件栈状态
-    // 返回值: ACL_SUCCESS表示成功
-    // 注意：调用后不能再执行任何ACL操作
+    DEBUG_LOG(rank, "calling aclFinalize...");
     aclFinalize();
+    DEBUG_LOG(rank, "aclFinalize done");
+
+    TIMESTAMP(rank, "FINALIZE_END");
+    DEBUG_LOG(rank, "=== finalize_environment END ===");
 }
 
 /**
@@ -212,75 +224,120 @@ void finalize_environment(int rank) {
 StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                          uint8_t* gva, size_t msg_size,
                                          int iterations, int warmup) {
+    int rank = aclshmem_my_pe();
+    DEBUG_LOG(rank, "=== test_rdma_pingpong_latency START ===");
+    DEBUG_LOG(rank, "msg_size=%zu bytes (%zu KB), iterations=%d, warmup=%d",
+              msg_size, msg_size / 1024, iterations, warmup);
+    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, ffts_config, gva);
+
+    CHECK_PTR(rank, stream, "stream");
+    CHECK_PTR(rank, gva, "gva");
+
     // 分配结果buffer：存储每次迭代的cycles值
-    // 大小：iterations * sizeof(int64_t) + sizeof(int64_t)（额外一个可能用于统计）
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
-    // aclrtMalloc: 分配NPU设备内存
-    // 参数: &result_buffer - 输出指针
-    //       result_size - 内存大小
-    //       ACL_MEM_MALLOC_HUGE_FIRST - 分配策略（优先使用大页内存）
-    aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    DEBUG_LOG(rank, "allocating result_buffer, size=%zu bytes", result_size);
+
+    aclError ret = aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMalloc result_buffer failed, ret=%d\n", rank, ret);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result_buffer allocated at %p", result_buffer);
+
+    // 初始化结果buffer为0xFF（方便调试）
+    int64_t* init_buf;
+    aclrtMallocHost((void**)&init_buf, result_size);
+    memset(init_buf, 0xFF, result_size);
+    aclrtMemcpy(result_buffer, result_size, init_buf, result_size, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtFreeHost(init_buf);
+    DEBUG_LOG(rank, "result_buffer initialized to 0xFF");
+
+    TIMESTAMP(rank, "KERNEL_LAUNCH_START");
 
     // launch_rdma_pingpong_latency: 启动RDMA PingPong延迟测试Kernel
-    // 参数详解:
-    // - 1: block_dim（block数量，通常为1）
-    // - stream: ACL流
-    // - ffts_config: FFTS配置地址（用于硬件同步）
-    // - gva: 对称内存地址（GVA格式）
-    //   用于存放pingpong测试的数据
-    // - msg_size: 消息大小（字节）
-    // - iterations: 正式迭代次数
-    // - warmup: warmup迭代次数（不计入统计）
-    // - result_buffer: 结果buffer地址（存储每次迭代的cycles）
-    //
-    // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // - Warmup阶段：预热数据传输路径
-    // - 正式测试：记录每次迭代的cycles差值
-    // - Magic value同步：发送方在数据末尾写入magic value，接收方检测
+    DEBUG_LOG(rank, "launching rdma_pingpong_latency kernel...");
     launch_rdma_pingpong_latency(1, stream, ffts_config, gva,
                                   msg_size, iterations, warmup, result_buffer);
+    DEBUG_LOG(rank, "kernel launched, waiting for synchronization...");
+
+    TIMESTAMP(rank, "KERNEL_LAUNCH_END");
 
     // aclrtSynchronizeStream: 同步stream，等待Kernel执行完成
-    aclrtSynchronizeStream(stream);
+    ret = aclrtSynchronizeStream(stream);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtSynchronizeStream failed, ret=%d\n", rank, ret);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "stream synchronized, kernel completed");
+
+    TIMESTAMP(rank, "KERNEL_SYNC_END");
 
     // 分配Host端内存，用于接收结果数据
     int64_t* host_result;
-    // aclrtMallocHost: 在Host端分配内存
-    // 参数: &host_result - 输出指针
-    //       result_size - 内存大小
-    aclrtMallocHost((void**)&host_result, result_size);
+    DEBUG_LOG(rank, "allocating host memory for result...");
+    ret = aclrtMallocHost((void**)&host_result, result_size);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMallocHost failed, ret=%d\n", rank, ret);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "host_result allocated at %p", host_result);
 
     // aclrtMemcpy: 将结果从Device拷贝到Host
-    // 参数详解:
-    // - host_result: 目标地址（Host端）
-    // - result_size: 数据大小
-    // - result_buffer: 源地址（Device端）
-    // - result_size: 数据大小
-    // - ACL_MEMCPY_DEVICE_TO_HOST: 拷贝方向（Device到Host）
-    aclrtMemcpy(host_result, result_size, result_buffer, result_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    DEBUG_LOG(rank, "copying result from device to host...");
+    ret = aclrtMemcpy(host_result, result_size, result_buffer, result_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMemcpy failed, ret=%d\n", rank, ret);
+        aclrtFreeHost(host_result);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result copied to host");
+
+    // 打印前10个结果值（调试）
+    DEBUG_LOG(rank, "=== First 10 raw cycles values ===");
+    for (int i = 0; i < std::min(10, iterations); i++) {
+        DEBUG_LOG(rank, "iteration[%d]: cycles=%lld (0x%llx)", i, host_result[i], host_result[i]);
+    }
+
+    // 统计结果中的有效值数量
+    int valid_count = 0;
+    int zero_count = 0;
+    int invalid_count = 0;
+    for (int i = 0; i < iterations; i++) {
+        if (host_result[i] == 0) zero_count++;
+        else if (host_result[i] == -1 || host_result[i] == 0xFFFFFFFFFFFFFFFFLL) invalid_count++;
+        else valid_count++;
+    }
+    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, invalid(-1/0xFF..)=%d, total=%d",
+              valid_count, zero_count, invalid_count, iterations);
+
+    if (zero_count > 0 && valid_count == 0) {
+        fprintf(stderr, "[WARN][Rank %d] All results are 0! Kernel may not have executed correctly.\n", rank);
+    }
 
     // 将cycles转换为延迟时间（us）
     std::vector<double> latencies;
     for (int i = 0; i < iterations; i++) {
-        // cycles_to_us: 将cycles转换为微秒
-        // 参数: host_result[i] - cycles值
-        //       NPU_FREQ_MHZ - NPU频率（MHz）
-        // 
         double latency_us = cycles_to_us(host_result[i], NPU_FREQ_MHZ);
         latencies.push_back(latency_us);
     }
 
     // aclrtFreeHost: 释放Host端内存
-    // 参数: aclrtMallocHost分配的内存指针
     aclrtFreeHost(host_result);
+    DEBUG_LOG(rank, "host_result freed");
 
     // aclrtFree: 释放NPU设备内存
-    // 参数: aclrtMalloc分配的设备内存指针
     aclrtFree(result_buffer);
+    DEBUG_LOG(rank, "result_buffer freed");
 
     // compute_stats: 计算统计结果（平均值、标准差、最小值、最大值、中位数）
-    return compute_stats(latencies);
+    StatsResult stats = compute_stats(latencies);
+    DEBUG_LOG(rank, "=== test_rdma_pingpong_latency END: mean=%.2f us ===", stats.mean);
+
+    return stats;
 }
 
 /**
@@ -297,29 +354,49 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                  uint8_t* gva, size_t msg_size, int iterations,
                                  int warmup_rounds, int test_rounds) {
+    int rank = aclshmem_my_pe();
+    DEBUG_LOG(rank, "=== test_rdma_bandwidth START ===");
+    DEBUG_LOG(rank, "msg_size=%zu bytes, iterations=%d, warmup_rounds=%d, test_rounds=%d",
+              msg_size, iterations, warmup_rounds, test_rounds);
+
     // 分配结果buffer
     uint8_t* result_buffer;
-    aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclError ret = aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMalloc result_buffer failed, ret=%d\n", rank, ret);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result_buffer allocated at %p", result_buffer);
 
     std::vector<double> bandwidths;
 
     // 多轮测试取平均
     for (int round = 0; round < warmup_rounds + test_rounds; round++) {
+        DEBUG_LOG(rank, "Bandwidth round %d (warmup=%d, test=%d)...",
+                  round, warmup_rounds, test_rounds);
+
         // launch_rdma_bandwidth: 启动RDMA带宽测试Kernel
-        // block_dim = 1（单核测试）
         launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
-        aclrtSynchronizeStream(stream);
+        ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            fprintf(stderr, "[ERROR][Rank %d] aclrtSynchronizeStream failed in round %d, ret=%d\n",
+                    rank, round, ret);
+            aclrtFree(result_buffer);
+            return StatsResult{0,0,0,0,0};
+        }
 
         int64_t* host_result;
         aclrtMallocHost((void**)&host_result, sizeof(int64_t));
         aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
+        DEBUG_LOG(rank, "round %d: cycles=%lld", round, host_result[0]);
+
         double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
         // 带宽计算（单向带宽）
-        // 总数据量 = iterations * msg_size
         double bw_gb_s = compute_bandwidth(iterations * msg_size, total_time_us);
+        DEBUG_LOG(rank, "round %d: time=%.2f us, bandwidth=%.2f GB/s", round, total_time_us, bw_gb_s);
 
         // 跳过 warmup 轮次
         if (round >= warmup_rounds) {
@@ -332,7 +409,10 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
     aclrtFree(result_buffer);
 
     // 计算统计结果（平均带宽、标准差等）
-    return compute_stats(bandwidths);
+    StatsResult stats = compute_stats(bandwidths);
+    DEBUG_LOG(rank, "=== test_rdma_bandwidth END: mean=%.2f GB/s ===", stats.mean);
+
+    return stats;
 }
 
 /**
@@ -341,38 +421,99 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
 StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                        uint8_t* gva, size_t msg_size,
                                        int iterations, int warmup) {
+    int rank = aclshmem_my_pe();
+    DEBUG_LOG(rank, "=== test_mte_pingpong_latency START ===");
+    DEBUG_LOG(rank, "msg_size=%zu bytes (%zu KB), iterations=%d, warmup=%d",
+              msg_size, msg_size / 1024, iterations, warmup);
+    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, ffts_config, gva);
+
+    CHECK_PTR(rank, stream, "stream");
+    CHECK_PTR(rank, gva, "gva");
+
     // 分配结果buffer
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
-    aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    DEBUG_LOG(rank, "allocating result_buffer, size=%zu bytes", result_size);
+
+    aclError ret = aclrtMalloc((void**)&result_buffer, result_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMalloc result_buffer failed, ret=%d\n", rank, ret);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result_buffer allocated at %p", result_buffer);
+
+    // 初始化结果buffer为0xFF（方便调试）
+    int64_t* init_buf;
+    aclrtMallocHost((void**)&init_buf, result_size);
+    memset(init_buf, 0xFF, result_size);
+    aclrtMemcpy(result_buffer, result_size, init_buf, result_size, ACL_MEMCPY_HOST_TO_DEVICE);
+    aclrtFreeHost(init_buf);
+    DEBUG_LOG(rank, "result_buffer initialized to 0xFF");
+
+    TIMESTAMP(rank, "KERNEL_LAUNCH_START");
 
     // launch_mte_pingpong_latency: 启动MTE PingPong延迟测试Kernel
-    // 参数详解:
-    // - 1: block_dim
-    // - stream: ACL流
-    // - ffts_config: FFTS配置地址
-    // - gva: 对称内存地址
-    // - msg_size: 消息大小（字节）
-    // - iterations: 正式迭代次数
-    // - warmup: warmup迭代次数
-    // - result_buffer: 结果buffer
-    //
-    // Kernel内部实现（参见comm_benchmark_kernel.cpp）：
-    // - 使用aclshmemx_mte_put_nbi发送数据（MTE引擎）
-    // - 使用MTE3_S事件同步等待传输完成
-    // - Magic value同步：发送方在数据末尾写入magic value
+    DEBUG_LOG(rank, "launching mte_pingpong_latency kernel...");
     launch_mte_pingpong_latency(1, stream, ffts_config, gva,
                                  msg_size, iterations, warmup, result_buffer);
+    DEBUG_LOG(rank, "kernel launched, waiting for synchronization...");
+
+    TIMESTAMP(rank, "KERNEL_LAUNCH_END");
 
     // aclrtSynchronizeStream: 同步stream
-    aclrtSynchronizeStream(stream);
+    ret = aclrtSynchronizeStream(stream);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtSynchronizeStream failed, ret=%d\n", rank, ret);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "stream synchronized, kernel completed");
+
+    TIMESTAMP(rank, "KERNEL_SYNC_END");
 
     // 分配Host端内存
     int64_t* host_result;
-    aclrtMallocHost((void**)&host_result, result_size);
+    DEBUG_LOG(rank, "allocating host memory for result...");
+    ret = aclrtMallocHost((void**)&host_result, result_size);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMallocHost failed, ret=%d\n", rank, ret);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "host_result allocated at %p", host_result);
 
     // aclrtMemcpy: 拷贝结果到Host
-    aclrtMemcpy(host_result, result_size, result_buffer, result_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    DEBUG_LOG(rank, "copying result from device to host...");
+    ret = aclrtMemcpy(host_result, result_size, result_buffer, result_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMemcpy failed, ret=%d\n", rank, ret);
+        aclrtFreeHost(host_result);
+        aclrtFree(result_buffer);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result copied to host");
+
+    // 打印前10个结果值（调试）
+    DEBUG_LOG(rank, "=== First 10 raw cycles values ===");
+    for (int i = 0; i < std::min(10, iterations); i++) {
+        DEBUG_LOG(rank, "iteration[%d]: cycles=%lld (0x%llx)", i, host_result[i], host_result[i]);
+    }
+
+    // 统计结果中的有效值数量
+    int valid_count = 0;
+    int zero_count = 0;
+    int invalid_count = 0;
+    for (int i = 0; i < iterations; i++) {
+        if (host_result[i] == 0) zero_count++;
+        else if (host_result[i] == -1 || host_result[i] == 0xFFFFFFFFFFFFFFFFLL) invalid_count++;
+        else valid_count++;
+    }
+    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, invalid(-1/0xFF..)=%d, total=%d",
+              valid_count, zero_count, invalid_count, iterations);
+
+    if (zero_count > 0 && valid_count == 0) {
+        fprintf(stderr, "[WARN][Rank %d] All results are 0! Kernel may not have executed correctly.\n", rank);
+    }
 
     // 将cycles转换为延迟时间
     std::vector<double> latencies;
@@ -383,12 +524,17 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 
     // 释放Host端内存
     aclrtFreeHost(host_result);
+    DEBUG_LOG(rank, "host_result freed");
 
     // 释放Device端内存
     aclrtFree(result_buffer);
+    DEBUG_LOG(rank, "result_buffer freed");
 
     // 计算统计结果
-    return compute_stats(latencies);
+    StatsResult stats = compute_stats(latencies);
+    DEBUG_LOG(rank, "=== test_mte_pingpong_latency END: mean=%.2f us ===", stats.mean);
+
+    return stats;
 }
 
 /**
@@ -408,39 +554,49 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                 uint8_t* gva, size_t msg_size, int iterations,
                                 int warmup_rounds, int test_rounds) {
+    int rank = aclshmem_my_pe();
+    DEBUG_LOG(rank, "=== test_mte_bandwidth START ===");
+    DEBUG_LOG(rank, "msg_size=%zu bytes, iterations=%d, warmup_rounds=%d, test_rounds=%d",
+              msg_size, iterations, warmup_rounds, test_rounds);
+
     // 分配结果buffer
     uint8_t* result_buffer;
-    aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclError ret = aclrtMalloc((void**)&result_buffer, sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMalloc result_buffer failed, ret=%d\n", rank, ret);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "result_buffer allocated at %p", result_buffer);
 
     std::vector<double> bandwidths;
 
     // 多轮测试取平均
     for (int round = 0; round < warmup_rounds + test_rounds; round++) {
+        DEBUG_LOG(rank, "Bandwidth round %d (warmup=%d, test=%d)...",
+                  round, warmup_rounds, test_rounds);
+
         // launch_mte_bandwidth: 启动MTE带宽测试Kernel
-        // block_dim = 1（单核测试）
-        //
-        // Kernel 内部流程：
-        // 发送方：
-        //   1. 批量发送 iterations 次数据（aclshmemx_mte_put_nbi）
-        //   2. WaitFlag 等待 MTE3_S 事件（发送完成）
-        //   3. 发送通知消息到 notify_addr
-        //   4. 轮询 ack_addr 等待确认
-        // 接收方：
-        //   1. 轮询 notify_addr 等待通知
-        //   2. 发送确认到 ack_addr
         launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
 
-        aclrtSynchronizeStream(stream);
+        ret = aclrtSynchronizeStream(stream);
+        if (ret != ACL_SUCCESS) {
+            fprintf(stderr, "[ERROR][Rank %d] aclrtSynchronizeStream failed in round %d, ret=%d\n",
+                    rank, round, ret);
+            aclrtFree(result_buffer);
+            return StatsResult{0,0,0,0,0};
+        }
 
         int64_t* host_result;
         aclrtMallocHost((void**)&host_result, sizeof(int64_t));
         aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
+        DEBUG_LOG(rank, "round %d: cycles=%lld", round, host_result[0]);
+
         double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
         // 带宽计算（单向带宽）
-        // 总数据量 = iterations * msg_size
         double bw_gb_s = compute_bandwidth(iterations * msg_size, total_time_us);
+        DEBUG_LOG(rank, "round %d: time=%.2f us, bandwidth=%.2f GB/s", round, total_time_us, bw_gb_s);
 
         // 跳过 warmup 轮次
         if (round >= warmup_rounds) {
@@ -453,7 +609,10 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
     aclrtFree(result_buffer);
 
     // 计算统计结果（平均带宽、标准差等）
-    return compute_stats(bandwidths);
+    StatsResult stats = compute_stats(bandwidths);
+    DEBUG_LOG(rank, "=== test_mte_bandwidth END: mean=%.2f GB/s ===", stats.mean);
+
+    return stats;
 }
 
 /**
@@ -463,77 +622,71 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
  * 用于对比NPU直连通信的性能优势
  */
 StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iterations, int warmup) {
+    int rank = aclshmem_my_pe();
+    DEBUG_LOG(rank, "=== test_cpu_transfer START ===");
+    DEBUG_LOG(rank, "msg_size=%zu bytes, iterations=%d, warmup=%d", msg_size, iterations, warmup);
+
     // 延迟结果数组
     std::vector<double> latencies;
 
     // 分配Device端内存
     void* device_buf;
-    // aclrtMalloc: 在NPU设备上分配内存
-    // 参数: &device_buf - 输出指针
-    //       msg_size - 内存大小
-    //       ACL_MEM_MALLOC_HUGE_FIRST - 分配策略
-    aclrtMalloc(&device_buf, msg_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    DEBUG_LOG(rank, "allocating device_buf...");
+    aclError ret = aclrtMalloc(&device_buf, msg_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMalloc device_buf failed, ret=%d\n", rank, ret);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "device_buf allocated at %p", device_buf);
 
     // 分配Host端内存
     void* host_buf;
-    // aclrtMallocHost: 在Host端分配内存
-    aclrtMallocHost(&host_buf, msg_size);
+    DEBUG_LOG(rank, "allocating host_buf...");
+    ret = aclrtMallocHost(&host_buf, msg_size);
+    if (ret != ACL_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclrtMallocHost host_buf failed, ret=%d\n", rank, ret);
+        aclrtFree(device_buf);
+        return StatsResult{0,0,0,0,0};
+    }
+    DEBUG_LOG(rank, "host_buf allocated at %p", host_buf);
 
     // memset: 初始化Host端数据为0xAA
-    // 用于测试数据传输
     memset(host_buf, 0xAA, msg_size);
 
     // warmup迭代：预热数据传输路径
-    // 不计入统计结果
+    DEBUG_LOG(rank, "warmup iterations...");
     for (int i = 0; i < warmup; i++) {
-        // aclrtMemcpy: Device -> Host拷贝
-        // 参数详解:
-        // - host_buf: 目标地址（Host端）
-        // - msg_size: 数据大小
-        // - device_buf: 源地址（Device端）
-        // - msg_size: 数据大小
-        // - ACL_MEMCPY_DEVICE_TO_HOST: 拷贝方向
         aclrtMemcpy(host_buf, msg_size, device_buf, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
-
-        // aclrtMemcpy: Host -> Device拷贝
-        // 参数详解:
-        // - device_buf: 目标地址（Device端）
-        // - msg_size: 数据大小
-        // - host_buf: 源地址（Host端）
-        // - msg_size: 数据大小
-        // - ACL_MEMCPY_HOST_TO_DEVICE: 拷贝方向
         aclrtMemcpy(device_buf, msg_size, host_buf, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
     }
 
     // 正式迭代：测量传输延迟
+    DEBUG_LOG(rank, "test iterations...");
     for (int i = 0; i < iterations; i++) {
-        // std::chrono::high_resolution_clock::now(): 获取高精度时间戳
-        // 用于测量传输延迟
         auto start = std::chrono::high_resolution_clock::now();
 
-        // aclrtMemcpy: Device -> Host拷贝
         aclrtMemcpy(host_buf, msg_size, device_buf, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
-
-        // aclrtMemcpy: Host -> Device拷贝
         aclrtMemcpy(device_buf, msg_size, host_buf, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
-        // 获取结束时间戳
         auto end = std::chrono::high_resolution_clock::now();
 
-        // std::chrono::duration: 计算时间差（微秒）
-        // 将start到end的时间差转换为微秒
         double latency_us = std::chrono::duration<double, std::micro>(end - start).count();
         latencies.push_back(latency_us);
     }
 
     // aclrtFree: 释放Device端内存
+    DEBUG_LOG(rank, "freeing device_buf...");
     aclrtFree(device_buf);
 
     // aclrtFreeHost: 释放Host端内存
+    DEBUG_LOG(rank, "freeing host_buf...");
     aclrtFreeHost(host_buf);
 
     // 计算统计结果
-    return compute_stats(latencies);
+    StatsResult stats = compute_stats(latencies);
+    DEBUG_LOG(rank, "=== test_cpu_transfer END: mean=%.2f us ===", stats.mean);
+
+    return stats;
 }
 
 /**
@@ -572,27 +725,48 @@ int run_benchmark(int rank, int world_size) {
             std::cout << "\n---------- Testing Engine: " << engine_name(engine) << " ----------\n";
         }
 
+        DEBUG_LOG(rank, "=== Starting engine %s ===", engine_name(engine).c_str());
+        TIMESTAMP(rank, "ENGINE_TEST_START");
+
         // init_environment: 初始化ACL和SHMEM环境
-        // 
-        init_environment(rank, world_size, mem_size, engine);
+        int init_ret = init_environment(rank, world_size, mem_size, engine);
+        if (init_ret != 0) {
+            fprintf(stderr, "[ERROR][Rank %d] init_environment failed, ret=%d\n", rank, init_ret);
+            return -1;
+        }
 
         // 调用者创建stream
         aclrtStream stream = nullptr;
-        aclrtCreateStream(&stream);
+        DEBUG_LOG(rank, "creating stream...");
+        aclError acl_ret = aclrtCreateStream(&stream);
+        if (acl_ret != ACL_SUCCESS) {
+            fprintf(stderr, "[ERROR][Rank %d] aclrtCreateStream failed, ret=%d\n", rank, acl_ret);
+            finalize_environment(rank);
+            return -1;
+        }
+        DEBUG_LOG(rank, "stream created at %p", stream);
 
         // util_get_ffts_config: 获取FFTS配置地址
-        // FFTS = Fast Fabric Task Scheduler，用于硬件同步
         uint64_t ffts_config = util_get_ffts_config();
+        DEBUG_LOG(rank, "ffts_config=0x%lx", ffts_config);
 
-        // aclshmem_malloc: 分配对称内存（用于通信数据缓冲区）
-        // 参数详解:
-        // - mem_size: 请求的内存大小（256MB）
-        // 返回: 对称内存指针（GVA格式）
-        // 对称内存用途：
-        // - 存放pingpong测试的数据
-        // - 存放带宽测试的数据
-        // - 用于跨PE的数据传输
+        // aclshmem_malloc: 分配对称内存
+        DEBUG_LOG(rank, "allocating symmetric memory, size=%lu MB...", mem_size / (1024 * 1024));
+        TIMESTAMP(rank, "SHMEM_MALLOC_START");
         uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
+        TIMESTAMP(rank, "SHMEM_MALLOC_END");
+        if (gva == nullptr) {
+            fprintf(stderr, "[ERROR][Rank %d] aclshmem_malloc failed, gva is nullptr\n", rank);
+            aclrtDestroyStream(stream);
+            finalize_environment(rank);
+            return -1;
+        }
+        DEBUG_LOG(rank, "symmetric memory allocated at %p", gva);
+
+        // Barrier 确保两个 PE 都完成了初始化
+        DEBUG_LOG(rank, "calling aclshmem_barrier_all to sync before testing...");
+        aclshmem_barrier_all();
+        DEBUG_LOG(rank, "barrier completed, both PEs ready");
 
         // PingPong延迟测试（仅 Rank 0 打印）
         if (rank == 0) {
@@ -675,18 +849,28 @@ int run_benchmark(int rank, int world_size) {
             }
         }
 
+        DEBUG_LOG(rank, "=== Engine %s tests completed ===", engine_name(engine).c_str());
+
+        // Barrier 确保所有测试完成后再释放资源
+        DEBUG_LOG(rank, "calling aclshmem_barrier_all before cleanup...");
+        aclshmem_barrier_all();
+        DEBUG_LOG(rank, "barrier completed, ready to cleanup");
+
         // aclshmem_free: 释放对称内存
-        // 参数: aclshmem_malloc返回的对称内存指针
-        // 必须与aclshmem_malloc配对使用
+        DEBUG_LOG(rank, "freeing symmetric memory at %p...", gva);
         aclshmem_free(gva);
+        DEBUG_LOG(rank, "symmetric memory freed");
 
         // aclrtDestroyStream: 销毁ACL流
-        // 参数: aclrtCreateStream创建的流指针
+        DEBUG_LOG(rank, "destroying stream at %p...", stream);
         aclrtDestroyStream(stream);
+        DEBUG_LOG(rank, "stream destroyed");
 
         // finalize_environment: 终止ACL和SHMEM环境
-        // 注意：调用后ACL环境被销毁，不能再执行任何ACL操作
         finalize_environment(rank);
+        DEBUG_LOG(rank, "=== Engine %s cleanup done ===", engine_name(engine).c_str());
+
+        TIMESTAMP(rank, "ENGINE_TEST_END");
     }
 
     // ========== CPU中转测试（仅 Rank 0 打印）==========
@@ -694,12 +878,20 @@ int run_benchmark(int rank, int world_size) {
         std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
     }
 
+    DEBUG_LOG(rank, "=== Starting CPU transfer test ===");
+
     // init_environment: 再次初始化ACL和SHMEM环境
-    init_environment(rank, world_size, mem_size, EngineType::RDMA);
+    int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::RDMA);
+    if (cpu_init_ret != 0) {
+        fprintf(stderr, "[ERROR][Rank %d] CPU test init_environment failed, ret=%d\n", rank, cpu_init_ret);
+        return -1;
+    }
 
     // 调用者创建stream
     aclrtStream stream = nullptr;
+    DEBUG_LOG(rank, "creating stream for CPU test...");
     aclrtCreateStream(&stream);
+    DEBUG_LOG(rank, "stream created at %p", stream);
 
     if (rank == 0) {
         std::cout << "\n[CPU Transfer Latency Test]\n";
@@ -711,6 +903,8 @@ int run_benchmark(int rank, int world_size) {
         // 获取warmup次数
         int warmup = get_warmup_iterations(msg_size);
 
+        DEBUG_LOG(rank, "CPU test: msg_size=%zu, iterations=%d, warmup=%d", msg_size, iterations, warmup);
+
         // test_cpu_transfer: 执行CPU中转延迟测试
         StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
 
@@ -721,11 +915,16 @@ int run_benchmark(int rank, int world_size) {
         }
     }
 
+    DEBUG_LOG(rank, "CPU test completed");
+
     // aclrtDestroyStream: 销毁ACL流
+    DEBUG_LOG(rank, "destroying stream at %p...", stream);
     aclrtDestroyStream(stream);
+    DEBUG_LOG(rank, "stream destroyed");
 
     // finalize_environment: 终止ACL和SHMEM环境
     finalize_environment(rank);
+    DEBUG_LOG(rank, "=== CPU test cleanup done ===");
 
 // ========== HCCL测试（条件编译） ==========
 #ifdef ENABLE_HCCL
@@ -1031,21 +1230,27 @@ int main(int argc, char* argv[]) {
     int rank_id = atoi(argv[argIdx++]);
 
     // ipport: rendezvous地址（TCP socket地址）
-    // 格式: "tcp://IP:PORT"
-    // PE 0监听此地址，其他PE连接到此地址
     ipport = argv[argIdx++];
 
     // g_npus: 节点内NPU总数
     g_npus = atoi(argv[argIdx++]);
 
-    // f_rank: rank编号偏移量（用于多节点场景）
+    // f_rank: rank编号偏移量
     f_rank = atoi(argv[argIdx++]);
 
-    // f_npu: NPU编号偏移量（物理设备ID的起点）
+    // f_npu: NPU编号偏移量
     f_npu = atoi(argv[argIdx++]);
+
+    // 打印启动信息
+    fprintf(stderr, "\n=== Comm Benchmark START ===\n");
+    fprintf(stderr, "[Rank %d] n_ranks=%d, ipport=%s, g_npus=%d, f_rank=%d, f_npu=%d\n",
+            rank_id, n_ranks, ipport, g_npus, f_rank, f_npu);
+    fprintf(stderr, "[Rank %d] device_id=%d\n", rank_id, rank_id % g_npus + f_npu);
+    fprintf(stderr, "============================\n\n");
 
     // check_env: 检查环境变量和配置
     if (!check_env()) {
+        fprintf(stderr, "[ERROR][Rank %d] Environment check failed\n", rank_id);
         return -1;
     }
 
@@ -1053,9 +1258,21 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[Benchmark Mode] " << BENCHMARK_MODE_NAME << "\n";
     std::cout << "[HCCL Status] " << BENCHMARK_HCCL_MODE_NAME << "\n";
 
-    // run_benchmark: 执行benchmark测试
-    int status = run_benchmark(rank_id, n_ranks);
+    TIMESTAMP(rank_id, "BENCHMARK_START");
 
-    std::cout << "[SUCCESS] Benchmark completed for rank " << rank_id << "\n";
+    // run_benchmark: 执行benchmark测试
+    DEBUG_LOG(rank_id, "Calling run_benchmark...");
+    int status = run_benchmark(rank_id, n_ranks);
+    DEBUG_LOG(rank_id, "run_benchmark returned, status=%d", status);
+
+    TIMESTAMP(rank_id, "BENCHMARK_END");
+
+    if (status == 0) {
+        std::cout << "[SUCCESS] Benchmark completed for rank " << rank_id << "\n";
+    } else {
+        fprintf(stderr, "[ERROR][Rank %d] Benchmark failed with status=%d\n", rank_id, status);
+    }
+
+    fprintf(stderr, "\n=== Comm Benchmark END (Rank %d) ===\n", rank_id);
     return status;
 }
