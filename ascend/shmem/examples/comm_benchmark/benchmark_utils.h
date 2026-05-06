@@ -20,7 +20,13 @@ namespace benchmark {
 // ========== 统计计算函数 ==========
 inline StatsResult compute_stats(std::vector<double>& data) {
     if (data.empty()) {
-        return {0, 0, 0, 0, 0};
+        StatsResult result;
+        result.mean = 0;
+        result.std = 0;
+        result.min = 0;
+        result.max = 0;
+        result.median = 0;
+        return result;
     }
 
     std::sort(data.begin(), data.end());
@@ -48,7 +54,13 @@ inline StatsResult compute_stats(std::vector<double>& data) {
         median = data[n/2];
     }
 
-    return {mean, std_dev, min_val, max_val, median};
+    StatsResult result;
+    result.mean = mean;
+    result.std = std_dev;
+    result.min = min_val;
+    result.max = max_val;
+    result.median = median;
+    return result;
 }
 
 // ========== CSV结果输出 ==========

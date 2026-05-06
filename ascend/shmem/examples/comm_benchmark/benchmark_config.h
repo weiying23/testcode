@@ -9,15 +9,10 @@
 #include <vector>
 #include <cstdint>
 #include <string>
-#include "shmem.h"  // 包含 ACLSHMEMX_INIT_WITH_MPI 等宏定义
 
 namespace benchmark {
 
 // ========== MPI开关配置 ==========
-// 默认关闭MPI，使用socket模式进行进程间通信
-// 取消下面注释以启用MPI:
-// #define ENABLE_MPI
-
 #ifdef ENABLE_MPI
 #define BENCHMARK_INIT_FLAG ACLSHMEMX_INIT_WITH_MPI
 #define BENCHMARK_MODE_NAME "MPI Mode"
@@ -27,15 +22,12 @@ namespace benchmark {
 #endif
 
 // ========== HCCL开关配置 ==========
-// HCCL需要CANN环境支持，取消注释启用HCCL测试
-// #define ENABLE_HCCL
-
 #ifdef ENABLE_HCCL
 #define BENCHMARK_HCCL_AVAILABLE 1
 #define BENCHMARK_HCCL_MODE_NAME "HCCL Enabled"
 #else
 #define BENCHMARK_HCCL_AVAILABLE 0
-#define BENCHMARK_HCCL_MODE_NAME "HCCL Disabled (No HCCL Library)"
+#define BENCHMARK_HCCL_MODE_NAME "HCCL Disabled"
 #endif
 
 // ========== 消息大小配置 ==========
@@ -109,7 +101,11 @@ inline std::string test_name(TestType type) {
 
 // ========== 统计结果结构 ==========
 struct StatsResult {
-    double mean, std, min, max, median;
+    double mean;
+    double std;
+    double min;
+    double max;
+    double median;
     std::string to_string() const {
         return "mean=" + std::to_string(mean) +
                ", std=" + std::to_string(std) +
@@ -119,7 +115,7 @@ struct StatsResult {
     }
 };
 
-// ========== Benchmark配置汇总 ==========
+// ========== Benchmark配置结构 ==========
 struct BenchmarkConfig {
     int rank;
     int world_size;
