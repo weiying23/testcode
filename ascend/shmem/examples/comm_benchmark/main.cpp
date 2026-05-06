@@ -71,18 +71,6 @@ extern void launch_mte_bandwidth(uint32_t block_dim, void* stream,
                                   int64_t msg_size, int64_t iterations,
                                   uint8_t* result_buffer);
 
-extern void launch_hidden_comm(uint32_t block_dim, void* stream,
-                                uint64_t ffts_config, uint8_t* gva,
-                                int64_t msg_size, int64_t iterations,
-                                uint8_t* matmul_A, uint8_t* matmul_B, uint8_t* matmul_C,
-                                int64_t M, int64_t K, int64_t N,
-                                uint8_t* result_buffer);
-
-extern void launch_matmul_compute(uint32_t block_dim, void* stream,
-                                   uint8_t* A, uint8_t* B, uint8_t* C,
-                                   int64_t M, int64_t K, int64_t N,
-                                   uint8_t* result_buffer);
-
 using namespace benchmark;
 
 // 全局配置变量
@@ -589,83 +577,6 @@ StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iteration
 }
 
 /**
- * ========== 通信隐藏测试 ==========
- *
- * 测试通信与计算重叠的性能
- * 用于评估通信隐藏（Communication-Computation Overlap）的效果
- */
-double test_hidden_comm(aclrtStream stream, uint64_t ffts_config,
-                         uint8_t* gva, size_t msg_size, int iterations,
-                         ComputeConfig compute_cfg) {
-    // 分配结果buffer：存储每次迭代的重叠时间
-    uint8_t* result_buffer;
-    aclrtMalloc((void**)&result_buffer, iterations * sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST);
-
-    // 分配矩阵乘法所需的矩阵A、B、C
-    uint8_t* matmul_A, *matmul_B, *matmul_C;
-
-    // 计算矩阵大小
-    size_t A_size = compute_cfg.M * compute_cfg.K * sizeof(float);
-    size_t B_size = compute_cfg.K * compute_cfg.N * sizeof(float);
-    size_t C_size = compute_cfg.M * compute_cfg.N * sizeof(float);
-
-    // aclrtMalloc: 分配矩阵A的Device端内存
-    aclrtMalloc(reinterpret_cast<void**>(&matmul_A), A_size, ACL_MEM_MALLOC_HUGE_FIRST);
-
-    // BUG!!! 这里使用了&而不是&matmul_B的正确类型
-    // 应该是: aclrtMalloc(reinterpret_cast<void**>(&matmul_B), ...)
-    // 错误写法可能导致编译警告或运行时问题
-    aclrtMalloc(reinterpret_cast<void**>(&matmul_B), B_size, ACL_MEM_MALLOC_HUGE_FIRST);
-    aclrtMalloc(reinterpret_cast<void**>(&matmul_C), C_size, ACL_MEM_MALLOC_HUGE_FIRST);
-
-    // launch_hidden_comm: 启动通信隐藏测试Kernel
-    // 参数详解:
-    // - 1: block_dim
-    // - stream: ACL流
-    // - ffts_config: FFTS配置地址
-    // - gva: 对称内存地址
-    // - msg_size: 通信消息大小
-    // - iterations: 迭代次数
-    // - matmul_A, matmul_B, matmul_C: 矩阵乘法输入输出地址
-    // - compute_cfg.M, K, N: 矩阵乘法维度
-    // - result_buffer: 结果buffer
-    launch_hidden_comm(1, stream, ffts_config, gva, msg_size, iterations,
-                       matmul_A, matmul_B, matmul_C,
-                       compute_cfg.M, compute_cfg.K, compute_cfg.N,
-                       result_buffer);
-
-    // aclrtSynchronizeStream: 同步stream
-    aclrtSynchronizeStream(stream);
-
-    // 分配Host端内存，接收结果
-    int64_t* host_result;
-    aclrtMallocHost((void**)&host_result, iterations * sizeof(int64_t));
-
-    // aclrtMemcpy: 拷贝结果到Host
-    aclrtMemcpy(host_result, iterations * sizeof(int64_t), result_buffer,
-                iterations * sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
-
-    // 计算平均重叠时间
-    double total_time = 0;
-    for (int i = 0; i < iterations; i++) {
-        total_time += cycles_to_us(host_result[i], NPU_FREQ_MHZ);
-    }
-    double avg_overlap_time = total_time / iterations;
-
-    // 释放Host端内存
-    aclrtFreeHost(host_result);
-
-    // 释放Device端内存
-    aclrtFree(result_buffer);
-    aclrtFree(matmul_A);
-    aclrtFree(matmul_B);
-    aclrtFree(matmul_C);
-
-    // 返回平均重叠时间
-    return avg_overlap_time;
-}
-
-/**
  * ========== 主测试流程 ==========
  */
 int run_benchmark(int rank, int world_size) {
@@ -679,7 +590,6 @@ int run_benchmark(int rank, int world_size) {
     // 用于记录测试结果
     CSVWriter latency_csv("results/latency_results.csv");
     CSVWriter bandwidth_csv("results/bandwidth_results.csv");
-    CSVWriter hidden_csv("results/hidden_results.csv");
 
     // 定义要测试的引擎类型列表
     std::vector<EngineType> engines = {
@@ -799,53 +709,6 @@ int run_benchmark(int rank, int world_size) {
             // bandwidth_csv.write_row: 将结果写入CSV文件
             bandwidth_csv.write_row(engine_name(engine), "bandwidth",
                                       msg_size, iterations, result);
-        }
-
-        // 通信隐藏测试
-        std::cout << "\n[Hidden Communication Test]\n";
-        if (rank == 0) {
-            for (size_t msg_size : MSG_SIZES) {
-                // 跳过小消息的隐藏测试
-                if (msg_size < 256 * 1024) continue;
-
-                // 设置迭代次数
-                int iterations = (msg_size <= 8 * 1024 * 1024) ? 100 : 20;
-
-                // match_compute: 根据通信消息大小匹配计算量
-                ComputeConfig compute_cfg = match_compute(msg_size);
-
-                std::cout << "MsgSize: " << msg_size << " bytes"
-                          << ", Compute: " << compute_cfg.M << "x" << compute_cfg.K << "x" << compute_cfg.N
-                          << "\n";
-
-                // 先测量纯通信时间
-                StatsResult comm_result;
-                if (engine == EngineType::RDMA) {
-                    comm_result = test_rdma_pingpong_latency(stream, ffts_config, gva,
-                                                              msg_size, iterations, 10);
-                } else {
-                    comm_result = test_mte_pingpong_latency(stream, ffts_config, gva,
-                                                             msg_size, iterations, 10);
-                }
-                double comm_time = comm_result.mean;
-
-                // test_hidden_comm: 测试通信与计算重叠的时间
-                double overlap_time = test_hidden_comm(stream, ffts_config, gva,
-                                                        msg_size, iterations, compute_cfg);
-
-                // 计算通信隐藏率
-                // 公式: hidden_rate = 100% * (1 - overlap_time / (comm_time * 2))
-                // comm_time * 2: 双向通信时间
-                double hidden_rate = 100.0 * (1.0 - overlap_time / (comm_time * 2));
-
-                std::cout << "CommTime: " << comm_time << " us"
-                          << ", OverlapTime: " << overlap_time << " us"
-                          << ", HiddenRate: " << hidden_rate << " %\n";
-
-                // hidden_csv.write_hidden_result: 写入隐藏测试结果
-                hidden_csv.write_hidden_result(engine_name(engine), msg_size,
-                                            comm_time, 0, overlap_time, hidden_rate);
-            }
         }
 
         // aclshmem_free: 释放对称内存
