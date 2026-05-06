@@ -47,8 +47,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // 这是rank 1期望检测到的值
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;
 
-            // 发送数据（包含magic value）到rank 1
-            aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
+            // 目标地址：peer的slot (gva + peer * msg_size)
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
             // 等待rank 1的响应magic value
             // 检测slot 1末尾的magic value = peer(1) + MAGIC_VAL + i = 12346 + i
@@ -69,8 +70,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // 这是rank 0期望检测到的值
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
 
-            // 发送响应数据（包含magic value）到rank 0
-            aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
+            // 目标地址：peer(0)的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -85,8 +87,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // Magic value = MAGIC_VAL + warmup + i（跳过warmup计数）
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
 
-            // 发送数据到rank 1
-            aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
+            // 目标地址：peer的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
             // 等待rank 1的响应（检测slot 1末尾的magic）
             while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != peer + MAGIC_VAL + warmup + i) {
@@ -112,8 +115,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // 写入响应magic value
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + warmup + i;
 
-            // 发送响应数据到rank 0
-            aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
+            // 目标地址：peer(0)的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
             AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
@@ -173,11 +177,14 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
         // 发送方逻辑
         peer = 1;
 
-        // 所有 Core 都执行数据发送
+        // 记录开始时间
         int64_t start_cycle = AscendC::GetSystemCycle();
 
+        // 所有 Core 都执行数据发送
         for (int64_t i = 0; i < iterations; i++) {
-            aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
+            // 目标地址：peer的对应slot
+            GM_ADDR dst_addr = gva + peer * msg_size * block_dim + core_idx * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
         }
 
         // 只有 Core 0 执行同步操作
@@ -278,7 +285,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             // MTE工作原理：
             // - 数据通过UB缓冲区进行搬运（分批传输）
             // - 使用MTE3_S事件进行同步
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
+            // 目标地址：peer的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
 
@@ -306,7 +315,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
 
             // 发送响应数据
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
+            // 目标地址：peer的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
@@ -325,7 +336,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
 
             // 发送数据
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
+            // 目标地址：peer的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
@@ -354,7 +367,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + warmup + i;
 
             // 发送响应
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
+            // 目标地址：peer的slot
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
@@ -415,7 +430,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
 
         // 所有 Core 都执行数据发送
         for (int64_t i = 0; i < iterations; i++) {
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)src_addr, (__gm__ uint8_t*)src_addr,
+            // 目标地址：peer的对应slot
+            GM_ADDR dst_addr = gva + peer * msg_size * block_dim + core_idx * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
         }
