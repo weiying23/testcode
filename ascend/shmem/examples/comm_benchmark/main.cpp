@@ -9,6 +9,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <cinttypes>
 
 #include "acl/acl.h"
 #include "shmem.h"
@@ -67,7 +68,7 @@
     do { \
         auto ts = std::chrono::high_resolution_clock::now(); \
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts.time_since_epoch()).count(); \
-        DEBUG_LOG(rank, "[%s] timestamp=%lld ms", label, ms); \
+        DEBUG_LOG(rank, "[%s] timestamp=%ld ms", label, (long)ms); \
     } while(0)
 
 // Kernel函数声明
@@ -118,7 +119,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
 
     DEBUG_LOG(rank, "=== init_environment START ===");
     DEBUG_LOG(rank, "device_id=%d, world_size=%d, mem_size=%lu MB, engine=%s",
-              device_id, world_size, mem_size / (1024 * 1024), engine_name(engine).c_str());
+              device_id, world_size, (unsigned long)(mem_size / (1024 * 1024)), engine_name(engine).c_str());
     TIMESTAMP(rank, "INIT_START");
 
     // aclInit: 初始化ACL运行时环境
@@ -144,7 +145,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     // test_set_attr: 辅助函数，填充shmem初始化属性结构体
     test_set_attr(rank, world_size, mem_size, ipport, default_flag_uid, &attributes);
     DEBUG_LOG(rank, "test_set_attr done: my_pe=%d, n_pes=%d, ip_port=%s, mem_size=%lu",
-              attributes.my_pe, attributes.n_pes, ipport, attributes.local_mem_size);
+              attributes.my_pe, attributes.n_pes, ipport, (unsigned long)attributes.local_mem_size);
 
     // 根据引擎类型设置数据传输引擎:
     switch (engine) {
@@ -228,7 +229,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     DEBUG_LOG(rank, "=== test_rdma_pingpong_latency START ===");
     DEBUG_LOG(rank, "msg_size=%zu bytes (%zu KB), iterations=%d, warmup=%d",
               msg_size, msg_size / 1024, iterations, warmup);
-    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, ffts_config, gva);
+    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, (unsigned long)ffts_config, gva);
 
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
@@ -299,7 +300,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // 打印前10个结果值（调试）
     DEBUG_LOG(rank, "=== First 10 raw cycles values ===");
     for (int i = 0; i < std::min(10, iterations); i++) {
-        DEBUG_LOG(rank, "iteration[%d]: cycles=%lld (0x%llx)", i, host_result[i], host_result[i]);
+        DEBUG_LOG(rank, "iteration[%d]: cycles=%ld (0x%lx)", i, (long)host_result[i], (unsigned long)host_result[i]);
     }
 
     // 统计结果中的有效值数量
@@ -390,7 +391,7 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
         aclrtMallocHost((void**)&host_result, sizeof(int64_t));
         aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
-        DEBUG_LOG(rank, "round %d: cycles=%lld", round, host_result[0]);
+        DEBUG_LOG(rank, "round %d: cycles=%ld", round, (long)host_result[0]);
 
         double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
@@ -425,7 +426,7 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     DEBUG_LOG(rank, "=== test_mte_pingpong_latency START ===");
     DEBUG_LOG(rank, "msg_size=%zu bytes (%zu KB), iterations=%d, warmup=%d",
               msg_size, msg_size / 1024, iterations, warmup);
-    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, ffts_config, gva);
+    DEBUG_LOG(rank, "stream=%p, ffts_config=0x%lx, gva=%p", stream, (unsigned long)ffts_config, gva);
 
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
@@ -496,7 +497,7 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // 打印前10个结果值（调试）
     DEBUG_LOG(rank, "=== First 10 raw cycles values ===");
     for (int i = 0; i < std::min(10, iterations); i++) {
-        DEBUG_LOG(rank, "iteration[%d]: cycles=%lld (0x%llx)", i, host_result[i], host_result[i]);
+        DEBUG_LOG(rank, "iteration[%d]: cycles=%ld (0x%lx)", i, (long)host_result[i], (unsigned long)host_result[i]);
     }
 
     // 统计结果中的有效值数量
@@ -590,7 +591,7 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
         aclrtMallocHost((void**)&host_result, sizeof(int64_t));
         aclrtMemcpy(host_result, sizeof(int64_t), result_buffer, sizeof(int64_t), ACL_MEMCPY_DEVICE_TO_HOST);
 
-        DEBUG_LOG(rank, "round %d: cycles=%lld", round, host_result[0]);
+        DEBUG_LOG(rank, "round %d: cycles=%ld", round, (long)host_result[0]);
 
         double total_time_us = cycles_to_us(host_result[0], NPU_FREQ_MHZ);
 
@@ -748,10 +749,10 @@ int run_benchmark(int rank, int world_size) {
 
         // util_get_ffts_config: 获取FFTS配置地址
         uint64_t ffts_config = util_get_ffts_config();
-        DEBUG_LOG(rank, "ffts_config=0x%lx", ffts_config);
+        DEBUG_LOG(rank, "ffts_config=0x%lx", (unsigned long)ffts_config);
 
         // aclshmem_malloc: 分配对称内存
-        DEBUG_LOG(rank, "allocating symmetric memory, size=%lu MB...", mem_size / (1024 * 1024));
+        DEBUG_LOG(rank, "allocating symmetric memory, size=%lu MB...", (unsigned long)(mem_size / (1024 * 1024)));
         TIMESTAMP(rank, "SHMEM_MALLOC_START");
         uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
         TIMESTAMP(rank, "SHMEM_MALLOC_END");
