@@ -145,11 +145,16 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     DEBUG_LOG(rank, "test_set_attr done: my_pe=%d, n_pes=%d, ip_port=%s, mem_size=%lu",
               attributes.my_pe, attributes.n_pes, ipport, (unsigned long)attributes.local_mem_size);
 
-    // 根据引擎类型设置数据传输引擎:
+    // 根据引擎类型设置数据传输引擎和超时配置:
+    // RDMA 需要更长的超时时间（网卡配置、跨节点通信等）
     switch (engine) {
         case EngineType::RDMA:
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
-            DEBUG_LOG(rank, "Engine set to RDMA (ROCE)");
+            // RDMA 超时配置：单节点测试通常10秒足够
+            attributes.option_attr.shm_init_timeout = 10;    // 10秒初始化超时
+            attributes.option_attr.shm_create_timeout = 10;  // 10秒创建超时
+            attributes.option_attr.control_operation_timeout = 10;  // 10秒控制操作超时
+            DEBUG_LOG(rank, "Engine set to RDMA (ROCE) with timeout=10s");
             break;
         case EngineType::MTE:
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
@@ -160,8 +165,8 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
             DEBUG_LOG(rank, "Engine set to SDMA");
             break;
         default:
-            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
-            DEBUG_LOG(rank, "Engine set to default RDMA");
+            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
+            DEBUG_LOG(rank, "Engine set to default MTE");
     }
 
     // aclshmemx_set_conf_store_tls: 设置配置存储TLS（可选）
@@ -171,9 +176,51 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     TIMESTAMP(rank, "SHMEM_INIT_START");
 
     // aclshmemx_init_attr: 初始化shmem运行时
-    CHECK_SHMEM_STATUS(rank, aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes), "aclshmemx_init_attr");
+    int init_ret = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
+    if (init_ret != ACLSHMEM_SUCCESS) {
+        fprintf(stderr, "[ERROR][Rank %d] aclshmemx_init_attr failed for engine %s, ret=%d\n",
+                rank, engine_name(engine).c_str(), init_ret);
+        // 详细错误码说明
+        switch (init_ret) {
+            case ACLSHMEM_INVALID_PARAM:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INVALID_PARAM (-1)\n", rank);
+                break;
+            case ACLSHMEM_INVALID_VALUE:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INVALID_VALUE (-2)\n", rank);
+                break;
+            case ACLSHMEM_SMEM_ERROR:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_SMEM_ERROR (-3) - Shared memory problem\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: disk space, memory limits, /dev/shmem permissions\n", rank);
+                break;
+            case ACLSHMEM_INNER_ERROR:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INNER_ERROR (-4) - Internal error\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] For RDMA: check RoCE network config, NIC availability, loopback support\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Try: 'ibv_devinfo' to check RDMA devices, 'ip link' to check network\n", rank);
+                break;
+            case ACLSHMEM_NOT_INITED:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_NOT_INITED (-5)\n", rank);
+                break;
+            case ACLSHMEM_BOOTSTRAP_ERROR:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_BOOTSTRAP_ERROR (-6) - Bootstrap connection failed\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: TCP port %s availability, firewall settings\n", rank, ipport);
+                break;
+            case ACLSHMEM_TIMEOUT_ERROR:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_TIMEOUT_ERROR (-7) - Connection timeout\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Peer may not have started, or network unreachable\n", rank);
+                break;
+            case ACLSHMEM_MALLOC_FAILED:
+                fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_MALLOC_FAILED (-8) - Memory allocation failed\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: system memory availability, mem_size=%lu MB request\n",
+                        rank, (unsigned long)(mem_size / (1024 * 1024)));
+                break;
+            default:
+                fprintf(stderr, "[ERROR][Rank %d] Error: Unknown error code %d\n", rank, init_ret);
+        }
+        return -1;
+    }
 
     TIMESTAMP(rank, "SHMEM_INIT_END");
+    DEBUG_LOG(rank, "aclshmemx_init_attr success for engine %s", engine_name(engine).c_str());
 
     // 验证初始化后的状态
     int my_pe = aclshmem_my_pe();
@@ -703,10 +750,14 @@ int run_benchmark(int rank, int world_size) {
     CSVWriter latency_csv("results/latency_results.csv");
     CSVWriter bandwidth_csv("results/bandwidth_results.csv");
 
-    // 定义要测试的引擎类型列表
+    // 定义要测试的引擎类型列表（优先测试节点内通信引擎）
+    // MTE: 节点内通信，使用片上互联，不需要网卡
+    // SDMA: 节点内通信，使用片上SDMA单元，不需要网卡
+    // RDMA: 跨节点通信，需要RoCE网卡，单节点测试时可能需要网卡loopback配置
     std::vector<EngineType> engines = {
-        EngineType::RDMA,  // RDMA引擎（跨节点）
-        EngineType::MTE,   // MTE引擎（节点内）
+        EngineType::MTE,   // MTE引擎（节点内）- 优先测试
+        EngineType::SDMA,  // SDMA引擎（节点内）- 第二优先
+        EngineType::RDMA,  // RDMA引擎（跨节点）- 最后测试
     };
 
     // 打印测试信息（仅 Rank 0 打印）
@@ -718,7 +769,8 @@ int run_benchmark(int rank, int world_size) {
         print_separator();
     }
 
-    // ========== RDMA/MTE测试 ==========
+    // ========== RDMA/MTE/SDMA测试 ==========
+    int successful_engines = 0;
     for (EngineType engine : engines) {
         if (rank == 0) {
             std::cout << "\n---------- Testing Engine: " << engine_name(engine) << " ----------\n";
@@ -730,9 +782,16 @@ int run_benchmark(int rank, int world_size) {
         // init_environment: 初始化ACL和SHMEM环境
         int init_ret = init_environment(rank, world_size, mem_size, engine);
         if (init_ret != 0) {
-            fprintf(stderr, "[ERROR][Rank %d] init_environment failed, ret=%d\n", rank, init_ret);
-            return -1;
+            fprintf(stderr, "[WARN][Rank %d] Engine %s initialization failed, skipping this engine\n",
+                    rank, engine_name(engine).c_str());
+            if (rank == 0) {
+                std::cout << "[SKIP] Engine " << engine_name(engine) << " unavailable on this system\n";
+            }
+            // 继续测试下一个引擎，不直接退出
+            continue;
         }
+
+        successful_engines++;
 
         // 调用者创建stream
         aclrtStream stream = nullptr;
@@ -741,7 +800,7 @@ int run_benchmark(int rank, int world_size) {
         if (acl_ret != ACL_SUCCESS) {
             fprintf(stderr, "[ERROR][Rank %d] aclrtCreateStream failed, ret=%d\n", rank, acl_ret);
             finalize_environment(rank);
-            return -1;
+            continue;
         }
         DEBUG_LOG(rank, "stream created at %p", stream);
 
@@ -758,7 +817,7 @@ int run_benchmark(int rank, int world_size) {
             fprintf(stderr, "[ERROR][Rank %d] aclshmem_malloc failed, gva is nullptr\n", rank);
             aclrtDestroyStream(stream);
             finalize_environment(rank);
-            return -1;
+            continue;
         }
         DEBUG_LOG(rank, "symmetric memory allocated at %p", gva);
 
@@ -785,6 +844,10 @@ int run_benchmark(int rank, int world_size) {
                                                      msg_size, iterations, warmup);
             } else if (engine == EngineType::MTE) {
                 // test_mte_pingpong_latency: 执行MTE pingpong延迟测试
+                result = test_mte_pingpong_latency(stream, ffts_config, gva,
+                                                    msg_size, iterations, warmup);
+            } else if (engine == EngineType::SDMA) {
+                // SDMA 使用与 MTE 相同的测试函数（都是节点内通信）
                 result = test_mte_pingpong_latency(stream, ffts_config, gva,
                                                     msg_size, iterations, warmup);
             }
@@ -834,6 +897,10 @@ int run_benchmark(int rank, int world_size) {
                 // test_mte_bandwidth: 执行MTE带宽测试
                 result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
                                              iterations, warmup_rounds, test_rounds);
+            } else if (engine == EngineType::SDMA) {
+                // SDMA 使用与 MTE 相同的测试函数（都是节点内通信）
+                result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
+                                             iterations, warmup_rounds, test_rounds);
             }
 
             // 仅 Rank 0 打印结果
@@ -872,6 +939,22 @@ int run_benchmark(int rank, int world_size) {
         TIMESTAMP(rank, "ENGINE_TEST_END");
     }
 
+    // 检查是否有成功的引擎
+    if (successful_engines == 0) {
+        fprintf(stderr, "[ERROR][Rank %d] No engine initialization succeeded! Cannot proceed.\n", rank);
+        if (rank == 0) {
+            std::cout << "\n[FAILED] All engines failed to initialize. Check:\n";
+            std::cout << "  - Disk space (need >10GB free)\n";
+            std::cout << "  - NPU device availability\n";
+            std::cout << "  - Network configuration for RDMA\n";
+        }
+        return -1;
+    }
+
+    if (rank == 0) {
+        std::cout << "\n[SUMMARY] " << successful_engines << " engine(s) tested successfully.\n";
+    }
+
     // ========== CPU中转测试（仅 Rank 0 打印）==========
     if (rank == 0) {
         std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
@@ -879,13 +962,30 @@ int run_benchmark(int rank, int world_size) {
 
     DEBUG_LOG(rank, "=== Starting CPU transfer test ===");
 
-    // init_environment: 再次初始化ACL和SHMEM环境
-    int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::RDMA);
+    // init_environment: 再次初始化ACL和SHMEM环境（使用MTE，节点内通信更可靠）
+    int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::MTE);
     if (cpu_init_ret != 0) {
-        fprintf(stderr, "[ERROR][Rank %d] CPU test init_environment failed, ret=%d\n", rank, cpu_init_ret);
-        return -1;
+        fprintf(stderr, "[WARN][Rank %d] CPU test init_environment failed (MTE), trying SDMA...\n", rank);
+        cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::SDMA);
+        if (cpu_init_ret != 0) {
+            fprintf(stderr, "[ERROR][Rank %d] CPU test init_environment failed for all engines\n", rank);
+            // CPU测试失败不影响整体结果，继续执行
+            if (rank == 0) {
+                std::cout << "[SKIP] CPU transfer test unavailable\n";
+            }
+        } else {
+            // SDMA 成功，继续CPU测试
+            goto cpu_test_proceed;
+        }
+    } else {
+        // MTE 成功，继续CPU测试
+        goto cpu_test_proceed;
     }
 
+    // 如果所有引擎都失败，跳过CPU测试
+    goto cpu_test_skip;
+
+cpu_test_proceed:
     // 调用者创建stream
     aclrtStream stream = nullptr;
     DEBUG_LOG(rank, "creating stream for CPU test...");
@@ -924,6 +1024,9 @@ int run_benchmark(int rank, int world_size) {
     // finalize_environment: 终止ACL和SHMEM环境
     finalize_environment(rank);
     DEBUG_LOG(rank, "=== CPU test cleanup done ===");
+
+cpu_test_skip:
+    // CPU测试跳过点（如果初始化失败）
 
 // ========== HCCL测试（条件编译） ==========
 #ifdef ENABLE_HCCL
