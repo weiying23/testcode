@@ -674,7 +674,6 @@ int run_benchmark(int rank, int world_size) {
                                           msg_size, iterations, result);
             }
         }
-        }
 
         // aclshmem_free: 释放对称内存
         // 参数: aclshmem_malloc返回的对称内存指针
