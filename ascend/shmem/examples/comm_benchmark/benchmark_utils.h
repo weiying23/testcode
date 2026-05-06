@@ -81,20 +81,6 @@ public:
         }
     }
 
-    void write_hidden_result(const std::string& engine, size_t msg_size,
-                              double comm_time, double compute_time, double overlap_time,
-                              double hidden_rate) {
-        if (file_.is_open()) {
-            file_ << engine << ","
-                  << "hidden_comm" << ","
-                  << msg_size << ","
-                  << std::fixed << std::setprecision(4) << comm_time << ","
-                  << compute_time << ","
-                  << overlap_time << ","
-                  << hidden_rate << "\n";
-        }
-    }
-
     bool is_open() const { return file_.is_open(); }
 
 private:

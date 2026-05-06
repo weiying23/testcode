@@ -9,6 +9,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include "shmem.h"  // 包含 ACLSHMEMX_INIT_WITH_MPI 等宏定义
 
 namespace benchmark {
 
@@ -94,8 +95,7 @@ inline std::string engine_name(EngineType type) {
 enum class TestType {
     PINGPONG_LATENCY,
     ONE_WAY_LATENCY,
-    BANDWIDTH,
-    HIDDEN_COMM
+    BANDWIDTH
 };
 
 inline std::string test_name(TestType type) {
@@ -103,23 +103,8 @@ inline std::string test_name(TestType type) {
         case TestType::PINGPONG_LATENCY: return "pingpong_latency";
         case TestType::ONE_WAY_LATENCY: return "one_way_latency";
         case TestType::BANDWIDTH: return "bandwidth";
-        case TestType::HIDDEN_COMM: return "hidden_comm";
         default: return "UNKNOWN";
     }
-}
-
-// ========== 计算负载配置 ==========
-struct ComputeConfig {
-    int M, K, N;
-    long long flops() const { return 2LL * M * K * N; }
-    long long data_size() const { return (M * K + K * N + M * N) * sizeof(float); }
-};
-
-inline ComputeConfig match_compute(size_t msg_size) {
-    if (msg_size <= 64 * 1024) return {512, 512, 512};
-    else if (msg_size <= 1 * 1024 * 1024) return {1024, 1024, 1024};
-    else if (msg_size <= 8 * 1024 * 1024) return {2048, 2048, 2048};
-    else return {4096, 4096, 4096};
 }
 
 // ========== 统计结果结构 ==========
@@ -144,7 +129,6 @@ struct BenchmarkConfig {
     int iterations;
     int warmup;
     std::string ipport;
-    void print() const;
 };
 
 } // namespace benchmark
