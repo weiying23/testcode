@@ -20,7 +20,7 @@ namespace aclshmem_log {
 constexpr size_t MAX_LOG_FILE_COUNT = 50;                               // 最多保留50个日志文件
 constexpr size_t MAX_FILE_NAME_LEN = 255;                               // 文件名最大长度（不含\0）
 constexpr uint64_t MAX_FILE_SIZE_THRESHOLD = 1024 * 1024 * 1024;        // 单个日志文件最大1GB
-constexpr uint64_t DISK_AVAILABLE_LIMIT = 10 * MAX_FILE_SIZE_THRESHOLD; // 磁盘剩余空间门限10GB
+constexpr uint64_t DISK_AVAILABLE_LIMIT = 1 * MAX_FILE_SIZE_THRESHOLD; // 磁盘剩余空间门限1GB（降低阈值避免频繁警告）
 
 // 内部辅助函数声明（仅在cpp中使用）
 std::string get_home_dir();

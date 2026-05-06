@@ -106,36 +106,28 @@ aclshmemx_uniqueid_t default_flag_uid;  // uniqueid结构体（DEFAULT模式下�
 const double NPU_FREQ_MHZ = 1000.0;
 
 /**
- * 初始化ACL和SHMEM环境
- * 注意：此函数不内部创建stream，调用者需要自己创建stream
+ * 初始化ACL环境（只调用一次，在引擎循环外）
  */
-int init_environment(int rank, int world_size, uint64_t mem_size, EngineType engine) {
-    // 直接使用 f_npu 作为物理设备ID（由 main 函数传入）
-    // f_npu: 用户指定的物理设备编号
+int init_acl_environment(int rank) {
     int32_t device_id = f_npu;
-    int status = 0;
+    DEBUG_LOG(rank, "=== init_acl_environment START ===");
+    DEBUG_LOG(rank, "device_id=%d (f_npu=%d)", device_id, f_npu);
 
-    DEBUG_LOG(rank, "=== init_environment START ===");
-    DEBUG_LOG(rank, "device_id=%d, world_size=%d, mem_size=%lu MB, engine=%s",
-              device_id, world_size, (unsigned long)(mem_size / (1024 * 1024)), engine_name(engine).c_str());
-    TIMESTAMP(rank, "INIT_START");
-
-    // aclInit: 初始化ACL运行时环境
-    // 参数: nullptr表示使用默认配置
-    // 必须在调用任何ACL API之前执行
-    // 返回值: ACL_SUCCESS表示成功
     CHECK_ACL_STATUS(rank, aclInit(nullptr), "aclInit");
-
-    // aclrtSetDevice: 设置当前进程使用的NPU设备
-    // 参数: device_id - 物理NPU设备编号
-    // 将进程绑定到指定的NPU，后续所有ACL操作在该设备上执行
     CHECK_ACL_STATUS(rank, aclrtSetDevice(device_id), "aclrtSetDevice");
 
-    // 注意：不再在此函数内创建stream
-    // stream由调用者创建，避免重复创建导致的资源冲突
-    // 调用者应在调用此函数后执行：
-    // aclrtStream stream = nullptr;
-    // aclrtCreateStream(&stream);
+    DEBUG_LOG(rank, "=== init_acl_environment END ===");
+    return 0;
+}
+
+/**
+ * 初始化SHMEM环境（每个引擎调用一次）
+ */
+int init_shmem_environment(int rank, int world_size, uint64_t mem_size, EngineType engine) {
+    DEBUG_LOG(rank, "=== init_shmem_environment START ===");
+    DEBUG_LOG(rank, "world_size=%d, mem_size=%lu MB, engine=%s",
+              world_size, (unsigned long)(mem_size / (1024 * 1024)), engine_name(engine).c_str());
+    TIMESTAMP(rank, "SHMEM_INIT_START");
 
     // aclshmemx_init_attr_t: shmem初始化属性结构体
     aclshmemx_init_attr_t attributes;
@@ -146,14 +138,12 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
               attributes.my_pe, attributes.n_pes, ipport, (unsigned long)attributes.local_mem_size);
 
     // 根据引擎类型设置数据传输引擎和超时配置:
-    // RDMA 需要更长的超时时间（网卡配置、跨节点通信等）
     switch (engine) {
         case EngineType::RDMA:
             attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
-            // RDMA 超时配置：单节点测试通常10秒足够
-            attributes.option_attr.shm_init_timeout = 10;    // 10秒初始化超时
-            attributes.option_attr.shm_create_timeout = 10;  // 10秒创建超时
-            attributes.option_attr.control_operation_timeout = 10;  // 10秒控制操作超时
+            attributes.option_attr.shm_init_timeout = 10;
+            attributes.option_attr.shm_create_timeout = 10;
+            attributes.option_attr.control_operation_timeout = 10;
             DEBUG_LOG(rank, "Engine set to RDMA (ROCE) with timeout=10s");
             break;
         case EngineType::MTE:
@@ -173,14 +163,11 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     aclshmemx_set_conf_store_tls(false, nullptr, 0);
     DEBUG_LOG(rank, "aclshmemx_set_conf_store_tls done");
 
-    TIMESTAMP(rank, "SHMEM_INIT_START");
-
     // aclshmemx_init_attr: 初始化shmem运行时
     int init_ret = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
     if (init_ret != ACLSHMEM_SUCCESS) {
         fprintf(stderr, "[ERROR][Rank %d] aclshmemx_init_attr failed for engine %s, ret=%d\n",
                 rank, engine_name(engine).c_str(), init_ret);
-        // 详细错误码说明
         switch (init_ret) {
             case ACLSHMEM_INVALID_PARAM:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INVALID_PARAM (-1)\n", rank);
@@ -190,12 +177,11 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
                 break;
             case ACLSHMEM_SMEM_ERROR:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_SMEM_ERROR (-3) - Shared memory problem\n", rank);
-                fprintf(stderr, "[HINT][Rank %d] Check: disk space, memory limits, /dev/shmem permissions\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: disk space (need >10GB), memory limits, /dev/shmem permissions\n", rank);
                 break;
             case ACLSHMEM_INNER_ERROR:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INNER_ERROR (-4) - Internal error\n", rank);
-                fprintf(stderr, "[HINT][Rank %d] For RDMA: check RoCE network config, NIC availability, loopback support\n", rank);
-                fprintf(stderr, "[HINT][Rank %d] Try: 'ibv_devinfo' to check RDMA devices, 'ip link' to check network\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: NPU device status, peer process running\n", rank);
                 break;
             case ACLSHMEM_NOT_INITED:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_NOT_INITED (-5)\n", rank);
@@ -210,8 +196,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
                 break;
             case ACLSHMEM_MALLOC_FAILED:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_MALLOC_FAILED (-8) - Memory allocation failed\n", rank);
-                fprintf(stderr, "[HINT][Rank %d] Check: system memory availability, mem_size=%lu MB request\n",
-                        rank, (unsigned long)(mem_size / (1024 * 1024)));
+                fprintf(stderr, "[HINT][Rank %d] Check: system memory availability\n", rank);
                 break;
             default:
                 fprintf(stderr, "[ERROR][Rank %d] Error: Unknown error code %d\n", rank, init_ret);
@@ -234,23 +219,31 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
         return -1;
     }
 
-    DEBUG_LOG(rank, "=== init_environment END ===");
-    return status;
+    DEBUG_LOG(rank, "=== init_shmem_environment END ===");
+    return 0;
 }
 
 /**
- * 终止环境 - 清理ACL和SHMEM资源
+ * 终止SHMEM环境（每个引擎结束时调用）
  */
-void finalize_environment(int rank) {
-    DEBUG_LOG(rank, "=== finalize_environment START ===");
-    TIMESTAMP(rank, "FINALIZE_START");
-
-    // 直接使用 f_npu 作为物理设备ID
-    int32_t device_id = f_npu;
+void finalize_shmem_environment(int rank) {
+    DEBUG_LOG(rank, "=== finalize_shmem_environment START ===");
+    TIMESTAMP(rank, "SHMEM_FINALIZE_START");
 
     DEBUG_LOG(rank, "calling aclshmem_finalize...");
     aclshmem_finalize();
     DEBUG_LOG(rank, "aclshmem_finalize done");
+
+    TIMESTAMP(rank, "SHMEM_FINALIZE_END");
+    DEBUG_LOG(rank, "=== finalize_shmem_environment END ===");
+}
+
+/**
+ * 终止ACL环境（最后调用一次）
+ */
+void finalize_acl_environment(int rank) {
+    int32_t device_id = f_npu;
+    DEBUG_LOG(rank, "=== finalize_acl_environment START ===");
 
     DEBUG_LOG(rank, "calling aclrtResetDevice(%d)...", device_id);
     aclrtResetDevice(device_id);
@@ -260,8 +253,7 @@ void finalize_environment(int rank) {
     aclFinalize();
     DEBUG_LOG(rank, "aclFinalize done");
 
-    TIMESTAMP(rank, "FINALIZE_END");
-    DEBUG_LOG(rank, "=== finalize_environment END ===");
+    DEBUG_LOG(rank, "=== finalize_acl_environment END ===");
 }
 
 /**
@@ -766,7 +758,16 @@ int run_benchmark(int rank, int world_size) {
         std::cout << "Mode: " << BENCHMARK_MODE_NAME << "\n";
         std::cout << "HCCL: " << BENCHMARK_HCCL_MODE_NAME << "\n";
         std::cout << "Rank: " << rank << ", WorldSize: " << world_size << "\n";
+        std::cout << "Device: " << f_npu << " (f_npu)\n";
         print_separator();
+    }
+
+    // ========== ACL初始化（只调用一次）==========
+    DEBUG_LOG(rank, "=== Initializing ACL (one-time) ===");
+    int acl_ret = init_acl_environment(rank);
+    if (acl_ret != 0) {
+        fprintf(stderr, "[ERROR][Rank %d] ACL initialization failed, cannot proceed\n", rank);
+        return -1;
     }
 
     // ========== RDMA/MTE/SDMA测试 ==========
@@ -779,15 +780,14 @@ int run_benchmark(int rank, int world_size) {
         DEBUG_LOG(rank, "=== Starting engine %s ===", engine_name(engine).c_str());
         TIMESTAMP(rank, "ENGINE_TEST_START");
 
-        // init_environment: 初始化ACL和SHMEM环境
-        int init_ret = init_environment(rank, world_size, mem_size, engine);
+        // init_shmem_environment: 初始化SHMEM环境（ACL已初始化）
+        int init_ret = init_shmem_environment(rank, world_size, mem_size, engine);
         if (init_ret != 0) {
-            fprintf(stderr, "[WARN][Rank %d] Engine %s initialization failed, skipping this engine\n",
+            fprintf(stderr, "[WARN][Rank %d] Engine %s SHMEM initialization failed, skipping this engine\n",
                     rank, engine_name(engine).c_str());
             if (rank == 0) {
                 std::cout << "[SKIP] Engine " << engine_name(engine) << " unavailable on this system\n";
             }
-            // 继续测试下一个引擎，不直接退出
             continue;
         }
 
@@ -796,10 +796,10 @@ int run_benchmark(int rank, int world_size) {
         // 调用者创建stream
         aclrtStream stream = nullptr;
         DEBUG_LOG(rank, "creating stream...");
-        aclError acl_ret = aclrtCreateStream(&stream);
-        if (acl_ret != ACL_SUCCESS) {
-            fprintf(stderr, "[ERROR][Rank %d] aclrtCreateStream failed, ret=%d\n", rank, acl_ret);
-            finalize_environment(rank);
+        aclError stream_ret = aclrtCreateStream(&stream);
+        if (stream_ret != ACL_SUCCESS) {
+            fprintf(stderr, "[ERROR][Rank %d] aclrtCreateStream failed, ret=%d\n", rank, stream_ret);
+            finalize_shmem_environment(rank);
             continue;
         }
         DEBUG_LOG(rank, "stream created at %p", stream);
@@ -816,7 +816,7 @@ int run_benchmark(int rank, int world_size) {
         if (gva == nullptr) {
             fprintf(stderr, "[ERROR][Rank %d] aclshmem_malloc failed, gva is nullptr\n", rank);
             aclrtDestroyStream(stream);
-            finalize_environment(rank);
+            finalize_shmem_environment(rank);
             continue;
         }
         DEBUG_LOG(rank, "symmetric memory allocated at %p", gva);
@@ -932,8 +932,8 @@ int run_benchmark(int rank, int world_size) {
         aclrtDestroyStream(stream);
         DEBUG_LOG(rank, "stream destroyed");
 
-        // finalize_environment: 终止ACL和SHMEM环境
-        finalize_environment(rank);
+        // finalize_shmem_environment: 终止SHMEM环境
+        finalize_shmem_environment(rank);
         DEBUG_LOG(rank, "=== Engine %s cleanup done ===", engine_name(engine).c_str());
 
         TIMESTAMP(rank, "ENGINE_TEST_END");
@@ -941,19 +941,24 @@ int run_benchmark(int rank, int world_size) {
 
     // 检查是否有成功的引擎
     if (successful_engines == 0) {
-        fprintf(stderr, "[ERROR][Rank %d] No engine initialization succeeded! Cannot proceed.\n", rank);
+        fprintf(stderr, "[ERROR][Rank %d] No SHMEM engine initialization succeeded!\n", rank);
         if (rank == 0) {
-            std::cout << "\n[FAILED] All engines failed to initialize. Check:\n";
-            std::cout << "  - Disk space (need >10GB free)\n";
+            std::cout << "\n[FAILED] All SHMEM engines failed. Check:\n";
+            std::cout << "  - Disk space (need >10GB free for shm log)\n";
             std::cout << "  - NPU device availability\n";
-            std::cout << "  - Network configuration for RDMA\n";
+            std::cout << "  - Peer process running on same node\n";
         }
+        finalize_acl_environment(rank);
         return -1;
     }
 
     if (rank == 0) {
         std::cout << "\n[SUMMARY] " << successful_engines << " engine(s) tested successfully.\n";
     }
+
+    // ========== 终止ACL环境（最后调用一次）==========
+    finalize_acl_environment(rank);
+    DEBUG_LOG(rank, "=== All tests completed, ACL finalized ===");
 
     // ========== CPU中转测试（仅 Rank 0 打印）==========
     if (rank == 0) {
@@ -962,13 +967,13 @@ int run_benchmark(int rank, int world_size) {
 
     DEBUG_LOG(rank, "=== Starting CPU transfer test ===");
 
-    // CPU测试：尝试使用MTE或SDMA初始化
+    // CPU测试：尝试使用MTE或SDMA初始化SHMEM（ACL已初始化）
     bool cpu_test_success = false;
     {
-        int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::MTE);
+        int cpu_init_ret = init_shmem_environment(rank, world_size, mem_size, EngineType::MTE);
         if (cpu_init_ret != 0) {
-            fprintf(stderr, "[WARN][Rank %d] CPU test MTE init failed, trying SDMA...\n", rank);
-            cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::SDMA);
+            fprintf(stderr, "[WARN][Rank %d] CPU test MTE SHMEM init failed, trying SDMA...\n", rank);
+            cpu_init_ret = init_shmem_environment(rank, world_size, mem_size, EngineType::SDMA);
         }
 
         if (cpu_init_ret == 0) {
@@ -1003,10 +1008,10 @@ int run_benchmark(int rank, int world_size) {
             aclrtDestroyStream(stream);
             DEBUG_LOG(rank, "stream destroyed");
 
-            finalize_environment(rank);
+            finalize_shmem_environment(rank);
             DEBUG_LOG(rank, "=== CPU test cleanup done ===");
         } else {
-            fprintf(stderr, "[WARN][Rank %d] CPU test init failed for all engines, skipping\n", rank);
+            fprintf(stderr, "[WARN][Rank %d] CPU test SHMEM init failed for all engines, skipping\n", rank);
             if (rank == 0) {
                 std::cout << "[SKIP] CPU transfer test unavailable\n";
             }
@@ -1329,7 +1334,7 @@ int main(int argc, char* argv[]) {
     // device_id: 直接指定物理设备ID（不再作为偏移量计算）
     int device_id = atoi(argv[argIdx++]);
 
-    // f_npu 设为 device_id（用于 init_environment 和 finalize_environment）
+    // f_npu 设为 device_id（用于 init_acl_environment 和设备操作）
     f_npu = device_id;
 
     // 打印启动信息
