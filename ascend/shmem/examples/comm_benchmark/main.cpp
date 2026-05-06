@@ -1,33 +1,6 @@
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * Comm Benchmark主程序 - NPU通信性能对比测试
- *
- * 问题诊断与修复状态：
- * 1. Pingpong latency定值：[已修复]
- *    - 根因：Kernel未写入magic value到数据末尾
- *    - 修复：发送方在发送前写入 magic value
- *    - 位置：comm_benchmark_kernel.cpp 的 pingpong latency kernels
- *
- * 2. 带宽测量过大：[已修复 - 参考最佳实现]
- *    - 根因：原实现只测量指令下发时间
- *    - 最佳实现参考：rdma_perftest/rdma_perftest_kernel.cpp
- *    - 新同步机制：
- *      a) 发送方批量发送 → quiet（保证数据到达）
- *      b) 发送方发送通知消息（内容来自 src_addr 前4字节）
- *      c) 接收方轮询通知 → 发送确认（不调用 quiet）
- *      d) 发送方轮询确认 → 记录结束时间
- *    - 关键改进：
- *      * 使用单独通知消息（不破坏数据）
- *      * 接收方不调用 quiet（无意义）
- *      * 数据初始化：Host端初始化 src_addr = pe_id + MAGIC_VAL
- *
- * 3. RDMA/MTE带宽相同：[已诊断] 测试配置问题（非bug）
- *    - MTE用于节点内，RDMA用于跨节点
- *    - 单节点测试时两者可能相近
- *
- * 4. Segmentation fault：[已修复]
- *    - init_environment内部创建stream但未返回
- *    - 修复：删除内部stream创建
  */
 
 #include <iostream>
@@ -40,7 +13,7 @@
 #include "acl/acl.h"
 #include "shmem.h"
 #include "shmemi_host_common.h"
-#include "utils/utils.h"
+#include "utils.h"
 #include "benchmark_config.h"
 #include "benchmark_utils.h"
 
@@ -82,15 +55,11 @@ int f_npu = 0;                  // NPU编号偏移量（物理设备ID的起点�
 aclshmemx_uniqueid_t default_flag_uid;  // uniqueid结构体（DEFAULT模式下使用）
 
 // NPU频率 (MHz) - 用于将cycles转换为时间
-// BUG警告：这个值需要确认，如果NPU实际频率不是1000MHz，
-// 所有延迟和带宽计算都会出错！应该使用正确的频率值
 const double NPU_FREQ_MHZ = 1000.0;
 
 /**
  * 初始化ACL和SHMEM环境
- *
- * 注意：此函数不再内部创建stream，调用者需要自己创建stream
- * 修复说明：原bug是函数内部创建stream但不返回，导致调用者重复创建stream
+ * 注意：此函数不内部创建stream，调用者需要自己创建stream
  */
 int init_environment(int rank, int world_size, uint64_t mem_size, EngineType engine) {
     // 计算物理设备ID：rank % g_npus + f_npu
@@ -199,7 +168,7 @@ int init_environment(int rank, int world_size, uint64_t mem_size, EngineType eng
     // 4. 设置PE编号和通信组信息
     status = aclshmemx_init_attr(BENCHMARK_INIT_FLAG, &attributes);
 
-    // BUG!!! 这里只返回status，丢失了stream指针
+    // 返回初始化状态
     // 调用者无法获取函数内部创建的stream，会导致资源管理混乱
     return status;
 }
@@ -239,10 +208,6 @@ void finalize_environment(int rank) {
 
 /**
  * ========== RDMA PingPong延迟测试 ==========
- *
- * 修复说明：Kernel中已添加magic value写入逻辑
- * - 发送方在发送前将magic value写入数据末尾
- * - 参见comm_benchmark_kernel.cpp中的rdma_pingpong_latency_kernel
  */
 StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                          uint8_t* gva, size_t msg_size,
@@ -301,7 +266,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
         // cycles_to_us: 将cycles转换为微秒
         // 参数: host_result[i] - cycles值
         //       NPU_FREQ_MHZ - NPU频率（MHz）
-        // BUG警告：如果NPU_FREQ_MHZ不准确，所有延迟计算都会错误！
+        // 
         double latency_us = cycles_to_us(host_result[i], NPU_FREQ_MHZ);
         latencies.push_back(latency_us);
     }
@@ -371,12 +336,7 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
 }
 
 /**
- * ========== MTE PingPong测试 ==========
- *
- * 修复说明：Kernel中已添加magic value写入逻辑
- * - 发送方在发送前将magic value写入数据末尾
- * - 参见comm_benchmark_kernel.cpp中的mte_pingpong_latency_kernel
- * - 与RDMA pingpong使用相同的同步机制
+ * ========== MTE PingPong延迟测试 ==========
  */
 StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                        uint8_t* gva, size_t msg_size,
@@ -597,22 +557,26 @@ int run_benchmark(int rank, int world_size) {
         EngineType::MTE,   // MTE引擎（节点内）
     };
 
-    // 打印测试信息
-    std::cout << "\n==================== Comm Benchmark ====================\n";
-    std::cout << "Mode: " << BENCHMARK_MODE_NAME << "\n";
-    std::cout << "HCCL: " << BENCHMARK_HCCL_MODE_NAME << "\n";
-    std::cout << "Rank: " << rank << ", WorldSize: " << world_size << "\n";
-    print_separator();
+    // 打印测试信息（仅 Rank 0 打印）
+    if (rank == 0) {
+        std::cout << "\n==================== Comm Benchmark ====================\n";
+        std::cout << "Mode: " << BENCHMARK_MODE_NAME << "\n";
+        std::cout << "HCCL: " << BENCHMARK_HCCL_MODE_NAME << "\n";
+        std::cout << "Rank: " << rank << ", WorldSize: " << world_size << "\n";
+        print_separator();
+    }
 
     // ========== RDMA/MTE测试 ==========
     for (EngineType engine : engines) {
-        std::cout << "\n---------- Testing Engine: " << engine_name(engine) << " ----------\n";
+        if (rank == 0) {
+            std::cout << "\n---------- Testing Engine: " << engine_name(engine) << " ----------\n";
+        }
 
         // init_environment: 初始化ACL和SHMEM环境
-        // 注意：此函数已修复，不再内部创建stream
+        // 
         init_environment(rank, world_size, mem_size, engine);
 
-        // 调用者创建stream（修复后不再重复创建，避免资源冲突）
+        // 调用者创建stream
         aclrtStream stream = nullptr;
         aclrtCreateStream(&stream);
 
@@ -630,18 +594,16 @@ int run_benchmark(int rank, int world_size) {
         // - 用于跨PE的数据传输
         uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
 
-        // PingPong延迟测试
-        std::cout << "\n[PingPong Latency Test]\n";
+        // PingPong延迟测试（仅 Rank 0 打印）
+        if (rank == 0) {
+            std::cout << "\n[PingPong Latency Test]\n";
+        }
         for (size_t msg_size : MSG_SIZES) {
             // get_iterations: 根据消息大小获取迭代次数
             int iterations = get_iterations(msg_size);
 
             // get_warmup_iterations: 根据消息大小获取warmup次数
             int warmup = get_warmup_iterations(msg_size);
-
-            // print_test_header: 打印测试头信息
-            print_test_header({rank, world_size, engine, TestType::PINGPONG_LATENCY,
-                               msg_size, iterations, warmup, ipport});
 
             StatsResult result;
             if (engine == EngineType::RDMA) {
@@ -650,21 +612,24 @@ int run_benchmark(int rank, int world_size) {
                                                      msg_size, iterations, warmup);
             } else if (engine == EngineType::MTE) {
                 // test_mte_pingpong_latency: 执行MTE pingpong延迟测试
-                // 问题：如果latency是定值，需要检查Kernel实现
                 result = test_mte_pingpong_latency(stream, ffts_config, gva,
                                                     msg_size, iterations, warmup);
             }
 
-            // print_result: 打印测试结果
-            print_result(result);
-
-            // latency_csv.write_row: 将结果写入CSV文件
-            latency_csv.write_row(engine_name(engine), "pingpong_latency",
-                                   msg_size, iterations, result);
+            // 仅 Rank 0 打印结果
+            if (rank == 0) {
+                print_test_header({rank, world_size, engine, TestType::PINGPONG_LATENCY,
+                                   msg_size, iterations, warmup, ipport});
+                print_result(result);
+                latency_csv.write_row(engine_name(engine), "pingpong_latency",
+                                       msg_size, iterations, result);
+            }
         }
 
-        // 带宽测试
-        std::cout << "\n[Bandwidth Test]\n";
+        // 带宽测试（仅 Rank 0 打印）
+        if (rank == 0) {
+            std::cout << "\n[Bandwidth Test]\n";
+        }
         for (size_t msg_size : MSG_SIZES) {
             // 跳过小消息的带宽测试（小于64KB）
             if (msg_size < 64 * 1024) continue;
@@ -687,11 +652,6 @@ int run_benchmark(int rank, int world_size) {
             aclrtMemcpy(gva + rank * msg_size, msg_size, bw_init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
             aclrtFreeHost(bw_init_data);
 
-            // 打印测试头信息
-            print_test_header({rank, world_size, engine, TestType::BANDWIDTH,
-                               msg_size, iterations, 0, ipport});
-            std::cout << "WarmupRounds: " << warmup_rounds << ", TestRounds: " << test_rounds << "\n";
-
             StatsResult result;
             if (engine == EngineType::RDMA) {
                 // test_rdma_bandwidth: 执行RDMA带宽测试
@@ -703,12 +663,17 @@ int run_benchmark(int rank, int world_size) {
                                              iterations, warmup_rounds, test_rounds);
             }
 
-            std::cout << "Bandwidth: " << result.mean << " +/- " << result.std
-                      << " GB/s (min=" << result.min << ", max=" << result.max << ")\n";
-
-            // bandwidth_csv.write_row: 将结果写入CSV文件
-            bandwidth_csv.write_row(engine_name(engine), "bandwidth",
-                                      msg_size, iterations, result);
+            // 仅 Rank 0 打印结果
+            if (rank == 0) {
+                print_test_header({rank, world_size, engine, TestType::BANDWIDTH,
+                                   msg_size, iterations, 0, ipport});
+                std::cout << "WarmupRounds: " << warmup_rounds << ", TestRounds: " << test_rounds << "\n";
+                std::cout << "Bandwidth: " << result.mean << " +/- " << result.std
+                          << " GB/s (min=" << result.min << ", max=" << result.max << ")\n";
+                bandwidth_csv.write_row(engine_name(engine), "bandwidth",
+                                          msg_size, iterations, result);
+            }
+        }
         }
 
         // aclshmem_free: 释放对称内存
@@ -725,21 +690,21 @@ int run_benchmark(int rank, int world_size) {
         finalize_environment(rank);
     }
 
-    // ========== CPU中转测试 ==========
-    // BUG!!! 这里是导致segmentation fault的关键位置
-    // 在finalize_environment之后，ACL环境已被销毁
-    // 再次调用init_environment时，需要确保正确重新初始化
-    std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
+    // ========== CPU中转测试（仅 Rank 0 打印）==========
+    if (rank == 0) {
+        std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
+    }
 
     // init_environment: 再次初始化ACL和SHMEM环境
-    // 注意：此函数已修复，不再内部创建stream
     init_environment(rank, world_size, mem_size, EngineType::RDMA);
 
-    // 调用者创建stream（修复后正常工作）
+    // 调用者创建stream
     aclrtStream stream = nullptr;
     aclrtCreateStream(&stream);
 
-    std::cout << "\n[CPU Transfer Latency Test]\n";
+    if (rank == 0) {
+        std::cout << "\n[CPU Transfer Latency Test]\n";
+    }
     for (size_t msg_size : MSG_SIZES) {
         // 获取迭代次数
         int iterations = get_iterations(msg_size);
@@ -748,15 +713,13 @@ int run_benchmark(int rank, int world_size) {
         int warmup = get_warmup_iterations(msg_size);
 
         // test_cpu_transfer: 执行CPU中转延迟测试
-        // 如果这里出现segmentation fault，可能是：
-        // 1. stream资源冲突（init_environment和外部创建的两个stream）
-        // 2. ACL环境初始化不正确
-        // 3. aclrtMalloc或aclrtMemcpy使用已销毁的资源
         StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
 
-        // latency_csv.write_row: 写入结果
-        latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
-                               msg_size, iterations, result);
+        // 仅 Rank 0 写入结果
+        if (rank == 0) {
+            latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
+                                   msg_size, iterations, result);
+        }
     }
 
     // aclrtDestroyStream: 销毁ACL流
@@ -1034,12 +997,16 @@ int run_benchmark(int rank, int world_size) {
     // aclrtResetDevice: 重置NPU设备
     aclrtResetDevice(device_id);
 #else
-    std::cout << "\n---------- HCCL Test Skipped ----------\n";
-    std::cout << "[INFO] HCCL not enabled. Define ENABLE_HCCL in benchmark_config.h to enable.\n";
+    if (rank == 0) {
+        std::cout << "\n---------- HCCL Test Skipped ----------\n";
+        std::cout << "[INFO] HCCL not enabled. Define ENABLE_HCCL in benchmark_config.h to enable.\n";
+    }
 #endif
 
-    std::cout << "\n==================== Benchmark Complete ====================\n";
-    std::cout << "Results saved to results/ directory\n";
+    if (rank == 0) {
+        std::cout << "\n==================== Benchmark Complete ====================\n";
+        std::cout << "Results saved to results/ directory\n";
+    }
 
     return 0;
 }

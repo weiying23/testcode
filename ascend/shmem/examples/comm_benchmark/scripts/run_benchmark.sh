@@ -40,6 +40,9 @@ echo "Devices: ${DEVICE_ID_LIST[@]}"
 echo "IP Port: ${IPPORT}"
 echo "========================================"
 
+# 信号处理：ctrl+c时杀死所有子进程
+trap 'echo "Interrupted, killing all processes..."; kill $(jobs -p) 2>/dev/null; exit 1' SIGINT SIGTERM
+
 # 启动多个进程
 for (( idx = 0; idx < ${RANK_SIZE}; idx = idx + 1 )); do
     device_id=${DEVICE_ID_LIST[$idx]}

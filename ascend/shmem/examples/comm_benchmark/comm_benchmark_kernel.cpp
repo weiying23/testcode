@@ -1,24 +1,6 @@
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * Comm Benchmark Kernel - 所有通信性能测试Kernel的集合
- *
- * 问题修复记录：
- * 1. Pingpong latency定值问题：已修复
- *    - 添加magic value写入逻辑到数据末尾
- *    - 发送方在发送前写入：`*(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i`
- *    - 接收方检测magic value确认数据到达
- *
- * 2. 带宽测量过大问题：已修复
- *    - 原问题：只测量指令下发时间，没有等待实际数据搬运完成
- *    - put_nbi是非阻塞操作，循环下发很快完成
- *    - quiet/WaitFlag只等待队列清空，不保证接收方收到数据
- *    - 修复：使用pingpong模式，发送方等待接收方确认后才记录结束时间
- *    - 新流程：
- *      a) 发送方批量发送所有数据
- *      b) 发送方写入完成标志通知接收方
- *      c) 接收方等待完成标志，确保数据到达
- *      d) 接收方发送确认响应
- *      e) 发送方收到确认后才记录结束时间
+ * Comm Benchmark Kernel - 通信性能测试Kernel
  */
 
 #include "kernel_operator.h"
@@ -29,26 +11,7 @@ constexpr uint32_t MAGIC_VAL = 12345;
 constexpr uint32_t MAGIC_VAL_BW = 10;
 
 // ========== RDMA PingPong延迟测试Kernel ==========
-//
-// BUG修复说明：
-// 原bug：Kernel轮询等待magic value但从未写入，导致latency测量为定值
-// 根因分析：
-// - Pingpong同步机制需要发送方在数据末尾写入magic value
-// - 接收方通过检测magic value来确认数据到达
-// - 原代码没有写入magic value，导致轮询失效
-//
-// 修复方案：
-// 1. 发送方在发送前，将magic value写入数据末尾的8字节位置
-// 2. Magic value格式: sender_rank + MAGIC_VAL + iteration
-// 3. 接收方通过轮询检测magic value变化来确认数据到达
-//
-// Pingpong流程（修复后）：
-// 1. Rank 0 写入 magic(12345+i) 到 slot 0 末尾
-// 2. Rank 0 发送 slot 0 到 Rank 1 的 slot 0
-// 3. Rank 1 检测 slot 0 末尾的 magic(12345+i)
-// 4. Rank 1 写入 magic(12346+i) 到 slot 1 末尾
-// 5. Rank 1 发送 slot 1 到 Rank 0 的 slot 1
-// 6. Rank 0 检测 slot 1 末尾的 magic(12346+i)
+// Pingpong同步：发送方写入magic value，接收方检测确认数据到达
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -79,7 +42,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     // Warmup阶段（不计入统计）
     for (int64_t i = 0; i < warmup; i++) {
         if (rank == 0) {
-            // BUG修复步骤1：写入magic value到数据末尾
+            // 写入magic value到数据末尾
             // Magic value = peer(0) + MAGIC_VAL + i = 12345 + i
             // 这是rank 1期望检测到的值
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;
@@ -87,21 +50,21 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // 发送数据（包含magic value）到rank 1
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
 
-            // BUG修复步骤6：等待rank 1的响应magic value
+            // 等待rank 1的响应magic value
             // 检测slot 1末尾的magic value = peer(1) + MAGIC_VAL + i = 12346 + i
             while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != peer + MAGIC_VAL + i) {
                 dcci_cachelines(gva + msg_size * 2 - 8, 8);
                 AscendC::GetSystemCycle();
             }
         } else {
-            // BUG修复步骤3：等待rank 0的magic value
+            // 等待rank 0的magic value
             // 检测slot 0末尾的magic value = peer(0) + MAGIC_VAL + i = 12345 + i
             while (*(__gm__ uint32_t*)(gva + msg_size * 1 - 8) != peer + MAGIC_VAL + i) {
                 dcci_cachelines(gva + msg_size * 1 - 8, 8);
                 AscendC::GetSystemCycle();
             }
 
-            // BUG修复步骤4：写入响应magic value到数据末尾
+            // 写入响应magic value到数据末尾
             // Magic value = peer(1) + MAGIC_VAL + i = 12346 + i
             // 这是rank 0期望检测到的值
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
@@ -118,7 +81,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             // 记录开始时间（cycles）
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            // BUG修复步骤1：写入magic value
+            // 写入magic value
             // Magic value = MAGIC_VAL + warmup + i（跳过warmup计数）
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
 
@@ -146,7 +109,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
                 AscendC::GetSystemCycle();
             }
 
-            // BUG修复步骤4：写入响应magic value
+            // 写入响应magic value
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + warmup + i;
 
             // 发送响应数据到rank 0
@@ -262,15 +225,10 @@ void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
 
 // ========== MTE PingPong延迟测试Kernel ==========
 //
-// BUG修复说明：
-// 原bug：与RDMA pingpong相同，Kernel未写入magic value导致latency为定值
-// 修复方案：在发送前写入magic value到数据末尾
-//
 // MTE引擎特点：
 // - 用于节点内NPU间通信
 // - 使用片上MTE单元进行数据传输
 // - 高带宽、低延迟，适合大规模数据传输
-// - MTE操作需要使用专门的同步机制（MTE3_S事件）
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -304,7 +262,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     // Warmup阶段（不计入统计）
     for (int64_t i = 0; i < warmup; i++) {
         if (rank == 0) {
-            // BUG修复步骤1：写入magic value到数据末尾
+            // 写入magic value到数据末尾
             // Magic value = peer(0) + MAGIC_VAL + i = 12345 + i
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;
 
@@ -344,7 +302,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
                 AscendC::GetSystemCycle();
             }
 
-            // BUG修复步骤4：写入响应magic value
+            // 写入响应magic value
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
 
             // 发送响应数据
@@ -363,7 +321,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             // 记录开始时间（cycles）
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            // BUG修复：写入magic value
+            // 写入magic value
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
 
             // 发送数据
