@@ -110,11 +110,9 @@ const double NPU_FREQ_MHZ = 1000.0;
  * 注意：此函数不内部创建stream，调用者需要自己创建stream
  */
 int init_environment(int rank, int world_size, uint64_t mem_size, EngineType engine) {
-    // 计算物理设备ID：rank % g_npus + f_npu
-    // rank: 当前进程的逻辑编号
-    // g_npus: 节点内NPU总数
-    // f_npu: NPU编号偏移量
-    int32_t device_id = rank % g_npus + f_npu;
+    // 直接使用 f_npu 作为物理设备ID（由 main 函数传入）
+    // f_npu: 用户指定的物理设备编号
+    int32_t device_id = f_npu;
     int status = 0;
 
     DEBUG_LOG(rank, "=== init_environment START ===");
@@ -200,8 +198,8 @@ void finalize_environment(int rank) {
     DEBUG_LOG(rank, "=== finalize_environment START ===");
     TIMESTAMP(rank, "FINALIZE_START");
 
-    // 计算物理设备ID
-    int32_t device_id = rank % g_npus + f_npu;
+    // 直接使用 f_npu 作为物理设备ID
+    int32_t device_id = f_npu;
 
     DEBUG_LOG(rank, "calling aclshmem_finalize...");
     aclshmem_finalize();
@@ -932,8 +930,8 @@ int run_benchmark(int rank, int world_size) {
     std::cout << "\n---------- Testing Engine: HCCL ----------\n";
     std::cout << "[HCCL] Huawei Collective Communication Library Test\n";
 
-    // 计算物理设备ID
-    int32_t device_id = rank % g_npus + f_npu;
+    // 直接使用 f_npu 作为物理设备ID
+    int32_t device_id = f_npu;
 
     // aclrtSetDevice: 设置当前进程使用的NPU设备
     aclrtSetDevice(device_id);
@@ -1216,8 +1214,9 @@ int run_benchmark(int rank, int world_size) {
 int main(int argc, char* argv[]) {
     // 检查命令行参数数量
     if (argc < 7) {
-        std::cout << "Usage: ./comm_benchmark <n_ranks> <rank_id> <ipport> <g_npus> <f_rank> <f_npu>\n";
-        std::cout << "Example: ./comm_benchmark 2 0 tcp://127.0.0.1:8765 8 0 0\n";
+        std::cout << "Usage: ./comm_benchmark <n_ranks> <rank_id> <ipport> <g_npus> <f_rank> <device_id>\n";
+        std::cout << "Example: ./comm_benchmark 2 0 tcp://127.0.0.1:8765 8 0 1\n";
+        std::cout << "         (rank 0 runs on device 1, rank 1 runs on device 2)\n";
         return -1;
     }
 
@@ -1233,20 +1232,22 @@ int main(int argc, char* argv[]) {
     // ipport: rendezvous地址（TCP socket地址）
     ipport = argv[argIdx++];
 
-    // g_npus: 节点内NPU总数
+    // g_npus: 节点内NPU总数（用于计算物理设备ID时的取模）
     g_npus = atoi(argv[argIdx++]);
 
-    // f_rank: rank编号偏移量
+    // f_rank: rank编号偏移量（用于多节点场景）
     f_rank = atoi(argv[argIdx++]);
 
-    // f_npu: NPU编号偏移量
-    f_npu = atoi(argv[argIdx++]);
+    // device_id: 直接指定物理设备ID（不再作为偏移量计算）
+    int device_id = atoi(argv[argIdx++]);
+
+    // f_npu 设为 device_id（用于 init_environment 和 finalize_environment）
+    f_npu = device_id;
 
     // 打印启动信息
     fprintf(stderr, "\n=== Comm Benchmark START ===\n");
-    fprintf(stderr, "[Rank %d] n_ranks=%d, ipport=%s, g_npus=%d, f_rank=%d, f_npu=%d\n",
-            rank_id, n_ranks, ipport, g_npus, f_rank, f_npu);
-    fprintf(stderr, "[Rank %d] device_id=%d\n", rank_id, rank_id % g_npus + f_npu);
+    fprintf(stderr, "[Rank %d] n_ranks=%d, ipport=%s, g_npus=%d, f_rank=%d, device_id=%d\n",
+            rank_id, n_ranks, ipport, g_npus, f_rank, device_id);
     fprintf(stderr, "============================\n\n");
 
     // check_env: 检查环境变量和配置
