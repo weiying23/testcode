@@ -962,71 +962,56 @@ int run_benchmark(int rank, int world_size) {
 
     DEBUG_LOG(rank, "=== Starting CPU transfer test ===");
 
-    // init_environment: 再次初始化ACL和SHMEM环境（使用MTE，节点内通信更可靠）
-    int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::MTE);
-    if (cpu_init_ret != 0) {
-        fprintf(stderr, "[WARN][Rank %d] CPU test init_environment failed (MTE), trying SDMA...\n", rank);
-        cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::SDMA);
+    // CPU测试：尝试使用MTE或SDMA初始化
+    bool cpu_test_success = false;
+    {
+        int cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::MTE);
         if (cpu_init_ret != 0) {
-            fprintf(stderr, "[ERROR][Rank %d] CPU test init_environment failed for all engines\n", rank);
-            // CPU测试失败不影响整体结果，继续执行
+            fprintf(stderr, "[WARN][Rank %d] CPU test MTE init failed, trying SDMA...\n", rank);
+            cpu_init_ret = init_environment(rank, world_size, mem_size, EngineType::SDMA);
+        }
+
+        if (cpu_init_ret == 0) {
+            cpu_test_success = true;
+
+            // 调用者创建stream
+            aclrtStream stream = nullptr;
+            DEBUG_LOG(rank, "creating stream for CPU test...");
+            aclrtCreateStream(&stream);
+            DEBUG_LOG(rank, "stream created at %p", stream);
+
+            if (rank == 0) {
+                std::cout << "\n[CPU Transfer Latency Test]\n";
+            }
+            for (size_t msg_size : MSG_SIZES) {
+                int iterations = get_iterations(msg_size);
+                int warmup = get_warmup_iterations(msg_size);
+
+                DEBUG_LOG(rank, "CPU test: msg_size=%zu, iterations=%d, warmup=%d", msg_size, iterations, warmup);
+
+                StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
+
+                if (rank == 0) {
+                    latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
+                                           msg_size, iterations, result);
+                }
+            }
+
+            DEBUG_LOG(rank, "CPU test completed");
+
+            DEBUG_LOG(rank, "destroying stream at %p...", stream);
+            aclrtDestroyStream(stream);
+            DEBUG_LOG(rank, "stream destroyed");
+
+            finalize_environment(rank);
+            DEBUG_LOG(rank, "=== CPU test cleanup done ===");
+        } else {
+            fprintf(stderr, "[WARN][Rank %d] CPU test init failed for all engines, skipping\n", rank);
             if (rank == 0) {
                 std::cout << "[SKIP] CPU transfer test unavailable\n";
             }
-        } else {
-            // SDMA 成功，继续CPU测试
-            goto cpu_test_proceed;
-        }
-    } else {
-        // MTE 成功，继续CPU测试
-        goto cpu_test_proceed;
-    }
-
-    // 如果所有引擎都失败，跳过CPU测试
-    goto cpu_test_skip;
-
-cpu_test_proceed:
-    // 调用者创建stream
-    aclrtStream stream = nullptr;
-    DEBUG_LOG(rank, "creating stream for CPU test...");
-    aclrtCreateStream(&stream);
-    DEBUG_LOG(rank, "stream created at %p", stream);
-
-    if (rank == 0) {
-        std::cout << "\n[CPU Transfer Latency Test]\n";
-    }
-    for (size_t msg_size : MSG_SIZES) {
-        // 获取迭代次数
-        int iterations = get_iterations(msg_size);
-
-        // 获取warmup次数
-        int warmup = get_warmup_iterations(msg_size);
-
-        DEBUG_LOG(rank, "CPU test: msg_size=%zu, iterations=%d, warmup=%d", msg_size, iterations, warmup);
-
-        // test_cpu_transfer: 执行CPU中转延迟测试
-        StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
-
-        // 仅 Rank 0 写入结果
-        if (rank == 0) {
-            latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
-                                   msg_size, iterations, result);
         }
     }
-
-    DEBUG_LOG(rank, "CPU test completed");
-
-    // aclrtDestroyStream: 销毁ACL流
-    DEBUG_LOG(rank, "destroying stream at %p...", stream);
-    aclrtDestroyStream(stream);
-    DEBUG_LOG(rank, "stream destroyed");
-
-    // finalize_environment: 终止ACL和SHMEM环境
-    finalize_environment(rank);
-    DEBUG_LOG(rank, "=== CPU test cleanup done ===");
-
-cpu_test_skip:
-    // CPU测试跳过点（如果初始化失败）
 
 // ========== HCCL测试（条件编译） ==========
 #ifdef ENABLE_HCCL
