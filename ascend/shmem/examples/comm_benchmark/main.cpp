@@ -376,14 +376,25 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // 统计结果中的有效值数量
     int valid_count = 0;
     int zero_count = 0;
-    int invalid_count = 0;
+    int timeout_count = 0;
+    constexpr int64_t TIMEOUT_ERROR_CODE = -1;  // kernel超时错误码
     for (int i = 0; i < iterations; i++) {
         if (host_result[i] == 0) zero_count++;
-        else if (host_result[i] == -1 || host_result[i] == 0xFFFFFFFFFFFFFFFFLL) invalid_count++;
+        else if (host_result[i] == TIMEOUT_ERROR_CODE) timeout_count++;
         else valid_count++;
     }
-    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, invalid(-1/0xFF..)=%d, total=%d",
-              valid_count, zero_count, invalid_count, iterations);
+    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, timeout=%d, total=%d",
+              valid_count, zero_count, timeout_count, iterations);
+
+    // 检测超时
+    if (timeout_count > 0) {
+        fprintf(stderr, "[WARN][Rank %d] TIMEOUT detected! %d iterations timed out after 10s.\n", rank, timeout_count);
+        fprintf(stderr, "[WARN][Rank %d] Sync mechanism may be broken. Check kernel implementation.\n", rank);
+        // 返回空结果，跳过此测试
+        aclrtFreeHost(host_result);
+        aclrtFree(result_buffer);
+        return StatsResult{0, 0, 0, 0, 0};
+    }
 
     if (zero_count > 0 && valid_count == 0) {
         fprintf(stderr, "[WARN][Rank %d] All results are 0! Kernel may not have executed correctly.\n", rank);
@@ -598,14 +609,25 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // 统计结果中的有效值数量
     int valid_count = 0;
     int zero_count = 0;
-    int invalid_count = 0;
+    int timeout_count = 0;
+    constexpr int64_t TIMEOUT_ERROR_CODE = -1;  // kernel超时错误码
     for (int i = 0; i < iterations; i++) {
         if (host_result[i] == 0) zero_count++;
-        else if (host_result[i] == -1 || host_result[i] == 0xFFFFFFFFFFFFFFFFLL) invalid_count++;
+        else if (host_result[i] == TIMEOUT_ERROR_CODE) timeout_count++;
         else valid_count++;
     }
-    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, invalid(-1/0xFF..)=%d, total=%d",
-              valid_count, zero_count, invalid_count, iterations);
+    DEBUG_LOG(rank, "Result statistics: valid=%d, zero=%d, timeout=%d, total=%d",
+              valid_count, zero_count, timeout_count, iterations);
+
+    // 检测超时
+    if (timeout_count > 0) {
+        fprintf(stderr, "[WARN][Rank %d] TIMEOUT detected! %d iterations timed out after 10s.\n", rank, timeout_count);
+        fprintf(stderr, "[WARN][Rank %d] Sync mechanism may be broken. Check kernel implementation.\n", rank);
+        // 返回空结果，跳过此测试
+        aclrtFreeHost(host_result);
+        aclrtFree(result_buffer);
+        return StatsResult{0, 0, 0, 0, 0};
+    }
 
     if (zero_count > 0 && valid_count == 0) {
         fprintf(stderr, "[WARN][Rank %d] All results are 0! Kernel may not have executed correctly.\n", rank);

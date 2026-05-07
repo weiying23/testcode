@@ -7,13 +7,19 @@
 #include "acl/acl.h"
 #include "shmem.h"
 
-constexpr uint32_t MAGIC_VAL = 12345;
-constexpr uint32_t MAGIC_VAL_BW = 10;
+// 参考rdma_perftest：MAGIC_VAL = 10，用于数据初始化和同步
+constexpr uint32_t MAGIC_VAL = 10;
+
+// 超时配置：10秒超时（假设NPU频率1GHz，10秒 = 10^10 cycles）
+constexpr int64_t TIMEOUT_CYCLES = 10000000000LL;  // 10 seconds timeout
+
+// 超时检测结果码
+constexpr int64_t TIMEOUT_ERROR_CODE = -1;  // 超时错误标记
 
 // ========== RDMA PingPong延迟测试Kernel ==========
-// 参考rdma_perftest的pingpong逻辑：
-// - Rank 0: 写入 MAGIC_VAL，发送到 peer slot，等待 peer+MAGIC_VAL 响应
-// - Rank 1: 等待 MAGIC_VAL，写入 peer+MAGIC_VAL 响应，发送回去
+// 正确的pingpong逻辑（参考rdma_perftest）：
+// - Rank 0: 写入 rank+MAGIC_VAL，put到peer，等待 peer+MAGIC_VAL 响应
+// - Rank 1: 等待 peer+MAGIC_VAL，写入 rank+MAGICVAL，put回去
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -33,44 +39,59 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     int64_t rank = aclshmem_my_pe();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
-    // 内存布局（参考rdma_perftest）：
-    // Slot 0 (gva + 0*msg_size): 数据区
-    // Slot 0末尾 (gva + msg_size - 8): rank 0写入magic value，rank 1等待检测
-    // Slot 1末尾 (gva + 2*msg_size - 8): rank 1写入magic value，rank 0等待检测
-    // 注意：put操作会把整个slot数据复制到peer slot，包括magic value
+    // 内存布局：
+    // slot 0 (gva + 0): Rank 0 数据区，末尾是 peer 等待位置
+    // slot 1 (gva + msg_size): Rank 1 数据区，末尾是 peer 等待位置
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
     // Warmup阶段
-    for (int64_t i = 0; i < warmup; i++) {
+    bool timeout_detected = false;
+    for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
-            // Rank 0: 写入 MAGIC_VAL + i，发送到 peer slot 0
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;
+            // Rank 0: 写入 rank+MAGIC_VAL = 10+i
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
-            // 等待 rank 1 响应：检测 slot 1 末尾的 peer(1) + MAGIC_VAL + i
-            // 注意：这里检测的是 gva + msg_size * 2 - 8（slot 1末尾）
-            while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != peer + MAGIC_VAL + i) {
-                dcci_cachelines(gva + msg_size * 2 - 8, 8);
-                AscendC::GetSystemCycle();
+            // 等待 peer slot末尾出现 peer+MAGIC_VAL = 11+i
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
+                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    timeout_detected = true;
+                    break;
+                }
             }
         } else {
-            // Rank 1: 等待 rank 0 的 MAGIC_VAL + i
-            // 注意：检测 slot 0 末尾，即 gva + msg_size - 8（不是 msg_size * 1 - 8）
-            while (*(__gm__ uint32_t*)(gva + msg_size - 8) != MAGIC_VAL + i) {
-                dcci_cachelines(gva + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+            // Rank 1: 等待 peer slot末尾出现 peer+MAGIC_VAL = 10+i
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
+                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    timeout_detected = true;
+                    break;
+                }
             }
 
-            // 写入响应：peer(0) + MAGIC_VAL + i
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
+            if (!timeout_detected) {
+                // Rank 1: 写入 rank+MAGIC_VAL = 11+i
+                *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
 
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+                GM_ADDR dst_addr = gva + peer * msg_size;
+                aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+
+        // 复位：恢复原始值
+        *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
+    }
+
+    if (timeout_detected) {
+        if (rank == 0) *(__gm__ int64_t*)(result_addr) = TIMEOUT_ERROR_CODE;
+        return;
     }
 
     // 正式测试阶段
@@ -78,28 +99,48 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
-            while (*(__gm__ uint32_t*)(gva + msg_size * 2 - 8) != peer + MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + msg_size * 2 - 8, 8);
-                AscendC::GetSystemCycle();
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
+                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
+                    return;
+                }
             }
             AscendC::PipeBarrier<PIPE_ALL>();
 
             int64_t iter_end = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = iter_end - iter_start;
+
+            // 复位
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
         }
     } else {
         for (int64_t i = 0; i < iterations; i++) {
-            while (*(__gm__ uint32_t*)(gva + msg_size - 8) != MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
+                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    return;
+                }
             }
 
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + warmup + i;
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
+
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+            AscendC::PipeBarrier<PIPE_ALL>();
+
+            // 复位
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
+        }
+    }
+}
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
@@ -216,15 +257,9 @@ void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
 }
 
 // ========== MTE PingPong延迟测试Kernel ==========
-//
-// MTE引擎特点：
-// - 用于节点内NPU间通信
-// - 使用片上MTE单元进行数据传输
-// - 高带宽、低延迟，适合大规模数据传输
-//
-// 参考rdma_perftest的pingpong逻辑：
-// - Rank 0 写入 MAGIC_VAL，发送到 peer，等待 peer+MAGIC_VAL 响应
-// - Rank 1 等待 peer+MAGIC_VAL，写入 peer+MAGIC_VAL 响应，发送回去
+// 正确的pingpong逻辑：
+// - Rank 0: 写入 rank+MAGIC_VAL，发送到 peer slot，等待 peer+MAGIC_VAL 响应
+// - Rank 1: 等待 peer+MAGIC_VAL，写入 rank+MAGIC_VAL 响应，发送回去
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -245,18 +280,19 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     int64_t rank = aclshmem_my_pe();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
-    // 内存布局（参考rdma_perftest）
-    // Slot 0 (gva + 0*msg_size): rank 0的发送数据区，末尾是rank 1的轮询位置
-    // Slot 1 (gva + 1*msg_size): rank 1的发送数据区，末尾是rank 0的轮询位置
-    // 等待位置：gva + msg_size * 2 - 8 用于存储结果（不用于同步）
+    // 内存布局：
+    // slot 0 (gva + 0): Rank 0 数据区
+    // slot 1 (gva + msg_size): Rank 1 数据区
+    // 检测位置：slot末尾 - 8
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // Warmup阶段（参考rdma_perftest的逻辑）
-    for (int64_t i = 0; i < warmup; i++) {
+    // Warmup阶段
+    bool timeout_detected = false;
+    for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
-            // Rank 0: 写入 MAGIC_VAL + i 到自己 slot 末尾，发送到 peer
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + i;
+            // Rank 0: 写入 rank+MAGIC_VAL = 10+i，put 到 peer slot
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
@@ -265,38 +301,55 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
-            // 等待 rank 1 的响应：检测 slot 1 末尾的 peer(1) + MAGIC_VAL + i
+            // 等待 peer slot末尾出现 peer+MAGIC_VAL = 11+i
+            int64_t wait_start = AscendC::GetSystemCycle();
             while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
                 dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    timeout_detected = true;
+                    break;
+                }
             }
         } else {
-            // Rank 1: 等待 rank 0 的数据：检测 slot 0 末尾的 MAGIC_VAL + i
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != MAGIC_VAL + i) {
+            // Rank 1: 等待 peer slot末尾出现 peer+MAGIC_VAL = 10+i
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
                 dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    timeout_detected = true;
+                    break;
+                }
             }
 
-            // 写入响应：peer(0) + MAGIC_VAL + i
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + i;
+            if (!timeout_detected) {
+                // Rank 1: 写入 rank+MAGIC_VAL = 11+i，put 回去
+                *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
 
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
-                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                                  copy_ub_size, msg_size, peer, copy_event_id);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+                GM_ADDR dst_addr = gva + peer * msg_size;
+                aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
+                                      reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                                      copy_ub_size, msg_size, peer, copy_event_id);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+
+        // 复位：恢复原始值
+        *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
     }
 
-    // 正式测试阶段（计入统计）
+    if (timeout_detected) {
+        if (rank == 0) *(__gm__ int64_t*)(result_addr) = TIMEOUT_ERROR_CODE;
+        return;
+    }
+
+    // 正式测试阶段
     if (rank == 0) {
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            // 写入 magic value
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = MAGIC_VAL + warmup + i;
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
@@ -305,26 +358,47 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
-            // 等待响应：peer(1) + MAGIC_VAL + warmup + i
+            int64_t wait_start = AscendC::GetSystemCycle();
             while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
                 dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
+                    return;
+                }
             }
             AscendC::PipeBarrier<PIPE_ALL>();
 
             int64_t iter_end = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = iter_end - iter_start;
+
+            // 复位
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
         }
     } else {
         for (int64_t i = 0; i < iterations; i++) {
-            // 等待 rank 0：MAGIC_VAL + warmup + i
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != MAGIC_VAL + warmup + i) {
+            int64_t wait_start = AscendC::GetSystemCycle();
+            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
                 dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
-                AscendC::GetSystemCycle();
+                if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
+                    return;
+                }
             }
 
-            // 写入响应：peer(0) + MAGIC_VAL + warmup + i
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = peer + MAGIC_VAL + warmup + i;
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
+
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
+                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
+                                  copy_ub_size, msg_size, peer, copy_event_id);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            AscendC::PipeBarrier<PIPE_ALL>();
+
+            // 复位
+            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
+        }
+    }
+}
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
