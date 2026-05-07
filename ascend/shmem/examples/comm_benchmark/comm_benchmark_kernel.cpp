@@ -1,6 +1,33 @@
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * Comm Benchmark Kernel - 通信性能测试Kernel
+ *
+ * ========== 延迟测量语义说明 ==========
+ *
+ * 本文件实现了 RDMA 和 MTE 两种引擎的 pingpong 延迟测试。
+ * 两个引擎测量的延迟在语义上是等价的，但硬件路径不同：
+ *
+ *   RDMA (roce_quiet 路径)：
+ *     put_nbi(data) → roce_quiet → write_flag → wait_peer_flag
+ *     roce_quiet 确保数据已到达远端 NIC 内存，flag 写入发生在数据确认之后。
+ *     测量的是"远端确认收到数据"的完整往返延迟（RTT/2 为单向延迟）。
+ *
+ *   MTE (WaitFlag 路径)：
+ *     mte_put_nbi(data) → SetFlag/WaitFlag(MTE3_S) → write_flag → wait_peer_flag
+ *     WaitFlag 确保 MTE DMA 已将数据写入共享 GVA，共享内存对所有 PE 立即可见。
+ *     对共享内存而言，WaitFlag 等价于 roce_quiet，两者测量语义一致。
+ *
+ * 带宽测量语义：
+ *   计时窗口 = [start_cycle, end_cycle]，其中：
+ *     start_cycle 在第一次 put_nbi 之前
+ *     end_cycle   在 quiet/WaitFlag 之后、notify/ack 握手之前
+ *   因此带宽 = iterations × msg_size / (end - start) 不含握手 RTT 开销。
+ *
+ * 同步机制说明：
+ *   - aclshmem_barrier_all()：kernel 入口双端同步，避免先启动的 PE 误超时
+ *   - AscendC::SyncAll()：带宽 kernel 内跨核同步，确保所有 core put 都发出后再 quiet
+ *   - aclshmem_uint32_test()：pingpong 等待（带超时，shmem 原语替代手写 dcci 轮询）
+ *   - aclshmem_uint32_wait_until()：带宽 notify/ack 等待（无需超时，barrier 已保证连通）
  */
 
 #include "kernel_operator.h"
@@ -50,31 +77,30 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 独立 flag 区域（与数据区不重叠）
     GM_ADDR rank0_flag_addr = gva + 2 * msg_size;
     GM_ADDR rank1_flag_addr = gva + 2 * msg_size + 8;
-
     GM_ADDR my_flag_addr   = (rank == 0) ? rank0_flag_addr : rank1_flag_addr;
     GM_ADDR peer_flag_addr = (rank == 0) ? rank1_flag_addr : rank0_flag_addr;
 
     uint32_t my_seq   = MAGIC_VAL + rank;
     uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer;
-
     bool timeout_detected = false;
+
+    // 入口屏障：确保双端都已进入 kernel，避免先启动的 PE 因对端未就绪而超时
+    aclshmem_barrier_all();
 
     // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
             my_seq++;
             *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -83,18 +109,16 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         } else {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
                 }
             }
-
             if (!timeout_detected) {
                 GM_ADDR dst_addr = gva + peer * msg_size;
                 aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-
+                aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
                 my_seq++;
                 *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
             }
@@ -108,20 +132,22 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     }
 
     // 正式测试阶段
+    // 延迟语义：包含 put_nbi + roce_quiet（远端确认收到）+ flag 信令的完整 RTT。
+    // roce_quiet 保证数据到达对端 NIC，因此测量的是"确认送达"的往返延迟，
+    // 与 MTE 版本的"共享内存写完成"RTT 语义等价但硬件路径不同。
     if (rank == 0) {
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
 
+            GM_ADDR dst_addr = gva + peer * msg_size;
+            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
             my_seq++;
             *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -136,16 +162,14 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         for (int64_t i = 0; i < iterations; i++) {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
             }
-
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-
+            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
             my_seq++;
             *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
@@ -156,31 +180,29 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
 // ========== RDMA带宽测试Kernel（支持多核聚合）==========
 //
-// 改进说明：
-// 1. 支持多核聚合带宽测试（block_dim 可配置：1, 8, 16, 32）
-// 2. 每个 AIV 核心独立发送数据，测量聚合带宽
-// 3. 只有 Core 0 执行同步操作（quiet + 通知 + 等待确认）
-//
-// 多核聚合测试说明：
-// - block_dim = 1: 单核带宽基准
-// - block_dim = 8/16/32: 多核并行，测量聚合带宽
-// - 每个 AIV 核心发送 iterations 次 msg_size 数据
-// - 总传输量 = block_dim * iterations * msg_size
-//
 // 内存布局：
 // - 每个 PE 有 block_dim 个数据 slot
 // - PE i 的 Core j 数据位于 gva + i * msg_size * block_dim + j * msg_size
-// - 同步区域位于所有数据之后
+// - 同步区域（notify/ack）位于所有数据之后：
+//     notify_addr = gva + rank_size * msg_size * block_dim + 8
+//     ack_addr    = gva + rank_size * msg_size * block_dim + 16
+//
+// 修复说明：
+// 1. 计时点：end_cycle 在 quiet 完成、notify/ack 开始之前采样，
+//    排除通知握手的 RTT 开销，让带宽结果只反映数据传输时间。
+// 2. round_id 参数：每轮使用 (rank + MAGIC_VAL + round_id) 作为 flag 值，
+//    避免上一轮残留值在下一轮被误读。
+// 3. 数据发完后 quiet，再停表，保证所有 put_nbi 都已到达对端。
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
     int64_t msg_size,
     int64_t iterations,
     int64_t block_dim,
-    GM_ADDR result_buffer) {
+    GM_ADDR result_buffer,
+    int64_t round_id) {
 
     util_set_ffts_config(ffts_config);
-    // 多核模式下，所有 Core 都执行（不再使用 return）
 
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECOUT> buf;
@@ -189,66 +211,52 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
 
     int64_t rank = aclshmem_my_pe();
     int64_t rank_size = aclshmem_n_pes();
-    int64_t core_idx = AscendC::GetBlockIdx();  // 当前核心编号
+    int64_t core_idx = AscendC::GetBlockIdx();
     uint32_t peer;
 
-    // 多核数据布局：
-    // 每个 PE 有 block_dim 个数据区域
-    // PE i 的 Core j 数据位于 gva + i * msg_size * block_dim + j * msg_size
     GM_ADDR src_addr = gva + rank * msg_size * block_dim + core_idx * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 同步区域（位于所有数据区域之后）
-    // 总数据区域大小 = rank_size * msg_size * block_dim
     int64_t sync_base_offset = rank_size * msg_size * block_dim;
     GM_ADDR notify_addr = gva + sync_base_offset + 8;
-    GM_ADDR ack_addr = gva + sync_base_offset + 16;
+    GM_ADDR ack_addr    = gva + sync_base_offset + 16;
+
+    // 每轮使用不同的 flag 值，防止上轮残留干扰
+    uint32_t expected_notify = (uint32_t)(0 + MAGIC_VAL + round_id);
+    uint32_t expected_ack    = (uint32_t)(1 + MAGIC_VAL + round_id);
+
+    // 入口屏障：确保双端都已进入 kernel
+    aclshmem_barrier_all();
 
     if (rank == 0) {
-        // 发送方逻辑
         peer = 1;
-
-        // 记录开始时间
         int64_t start_cycle = AscendC::GetSystemCycle();
 
-        // 所有 Core 都执行数据发送
         for (int64_t i = 0; i < iterations; i++) {
-            // 目标地址：peer的对应slot
             GM_ADDR dst_addr = gva + peer * msg_size * block_dim + core_idx * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
         }
 
-        // 只有 Core 0 执行同步操作
-        if (core_idx == 0) {
-            // aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
-            aclshmem_uint8_put_nbi(notify_addr, src_addr, sizeof(uint32_t), peer);
-            while (*(__gm__ uint32_t*)(ack_addr) != peer + MAGIC_VAL) {
-                dcci_cachelines(ack_addr, sizeof(uint32_t));
-                AscendC::GetSystemCycle();
-            }
-        }
+        // 跨核屏障：确保所有 core 的 put_nbi 都已发出，再由 core 0 调 quiet
+        AscendC::SyncAll();
 
-        AscendC::PipeBarrier<PIPE_ALL>();
-        int64_t end_cycle = AscendC::GetSystemCycle();
-
-        // 只有 Core 0 记录结果
         if (core_idx == 0) {
+            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            int64_t end_cycle = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+            *(__gm__ uint32_t*)(notify_addr) = expected_notify;
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, SHMEM_CMP_EQ, expected_ack);
         }
+        AscendC::PipeBarrier<PIPE_ALL>();
 
     } else {
-        // 接收方逻辑
         peer = 0;
 
-        // 只有 Core 0 执行同步操作
         if (core_idx == 0) {
-            while (*(__gm__ uint32_t*)(notify_addr) != peer + MAGIC_VAL) {
-                dcci_cachelines(notify_addr, sizeof(uint32_t));
-                AscendC::GetSystemCycle();
-            }
-            aclshmem_uint8_put_nbi(ack_addr, src_addr, sizeof(uint32_t), peer);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, SHMEM_CMP_EQ, expected_notify);
+            *(__gm__ uint32_t*)(ack_addr) = expected_ack;
         }
-
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }
@@ -256,9 +264,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
 void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
                             uint64_t ffts_config, uint8_t* gva,
                             int64_t msg_size, int64_t iterations,
-                            uint8_t* result_buffer) {
+                            uint8_t* result_buffer, int64_t round_id) {
     rdma_bandwidth_kernel<<<block_dim, nullptr, stream>>>(
-        ffts_config, gva, msg_size, iterations, block_dim, result_buffer);
+        ffts_config, gva, msg_size, iterations, block_dim, result_buffer, round_id);
 }
 
 // ========== MTE PingPong延迟测试Kernel ==========
@@ -297,69 +305,54 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 独立 flag 区域：与数据区不重叠，put 操作不会触碰到这里
-    // Rank 0 的发送 flag：Rank 1 轮询此地址
     GM_ADDR rank0_flag_addr = gva + 2 * msg_size;
-    // Rank 1 的响应 flag：Rank 0 轮询此地址
     GM_ADDR rank1_flag_addr = gva + 2 * msg_size + 8;
-
-    // 根据 rank 确定自己写哪个 flag、轮询哪个 flag
     GM_ADDR my_flag_addr   = (rank == 0) ? rank0_flag_addr : rank1_flag_addr;
     GM_ADDR peer_flag_addr = (rank == 0) ? rank1_flag_addr : rank0_flag_addr;
 
-    // flag 初始值为 MAGIC_VAL + rank，用单调递增序列，无需复位
-    uint32_t my_seq   = MAGIC_VAL + rank;          // 下一次要写入的值
-    uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer; // 下一次期望从对端看到的值
-
+    uint32_t my_seq   = MAGIC_VAL + rank;
+    uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer;
     bool timeout_detected = false;
+
+    // 入口屏障：确保双端都已进入 kernel
+    aclshmem_barrier_all();
 
     // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
-            // 1. 更新序列号并写入自己的 flag
-            my_seq++;
-            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
-
-            // 2. 把数据 put 到对端（不含 flag 区，不影响 peer_flag_addr）
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
-            // 3. 等待 Rank 1 的响应 flag 递增
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
                 }
             }
         } else {
-            // 1. 等待 Rank 0 的发送 flag 递增
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
                 }
             }
-
             if (!timeout_detected) {
-                // 2. 把数据 put 回去
                 GM_ADDR dst_addr = gva + peer * msg_size;
                 aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                       reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                       copy_ub_size, msg_size, peer, copy_event_id);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
-                // 3. 更新自己的响应 flag
                 my_seq++;
                 *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
             }
@@ -373,12 +366,12 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     }
 
     // 正式测试阶段
+    // 延迟语义：包含 mte_put_nbi + WaitFlag（本地 MTE 完成，数据写入共享 GVA，
+    // 对端通过 dcci/wait_until 可立即读到）+ flag 信令的完整 RTT。
+    // WaitFlag 对共享内存等价于 RDMA 的 roce_quiet，两者测量语义一致。
     if (rank == 0) {
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
-
-            my_seq++;
-            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
@@ -386,11 +379,12 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -405,20 +399,17 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
         for (int64_t i = 0; i < iterations; i++) {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
-                dcci_cachelines(peer_flag_addr, 8);
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
             }
-
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
             my_seq++;
             *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
@@ -429,28 +420,21 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 
 // ========== MTE带宽测试Kernel（支持多核聚合）==========
 //
-// 改进说明（与 RDMA 带宽测试相同）：
-// 1. 支持多核聚合带宽测试（block_dim 可配置）
-// 2. 每个 AIV 核心独立发送数据，测量聚合带宽
-// 3. 只有 Core 0 执行同步操作
-//
-// 多核聚合测试说明：
-// - block_dim = 1: 单核带宽基准
-// - block_dim = 8/16/32: 多核并行，测量聚合带宽
-// - 每个 AIV 核心发送 iterations 次 msg_size 数据
-// - 总传输量 = block_dim * iterations * msg_size
+// 修复说明（与 RDMA 带宽版本相同）：
+// 1. end_cycle 在 SetFlag/WaitFlag 之后、notify/ack 之前采样。
+// 2. round_id 参数保证每轮 flag 值唯一，避免跨轮污染。
+// 3. 数据全部发完且 MTE WaitFlag 后再停表，保证数据已到达对端。
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
     int64_t msg_size,
     int64_t iterations,
     int64_t block_dim,
-    GM_ADDR result_buffer) {
+    GM_ADDR result_buffer,
+    int64_t round_id) {
 
     util_set_ffts_config(ffts_config);
-    // 多核模式下，所有 Core 都执行
 
-    // 获取MTE配置
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint32_t copy_ub_size = device_state->mte_config.ub_size;
@@ -461,72 +445,51 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
     int64_t core_idx = AscendC::GetBlockIdx();
     uint32_t peer;
 
-    // 多核数据布局
     GM_ADDR src_addr = gva + rank * msg_size * block_dim + core_idx * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // 同步区域
     int64_t sync_base_offset = rank_size * msg_size * block_dim;
     GM_ADDR notify_addr = gva + sync_base_offset + 8;
-    GM_ADDR ack_addr = gva + sync_base_offset + 16;
+    GM_ADDR ack_addr    = gva + sync_base_offset + 16;
+
+    uint32_t expected_notify = (uint32_t)(0 + MAGIC_VAL + round_id);
+    uint32_t expected_ack    = (uint32_t)(1 + MAGIC_VAL + round_id);
+
+    // 入口屏障：确保双端都已进入 kernel
+    aclshmem_barrier_all();
 
     if (rank == 0) {
-        // 发送方逻辑
         peer = 1;
-
         int64_t start_cycle = AscendC::GetSystemCycle();
 
-        // 所有 Core 都执行数据发送
         for (int64_t i = 0; i < iterations; i++) {
-            // 目标地址：peer的对应slot
             GM_ADDR dst_addr = gva + peer * msg_size * block_dim + core_idx * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                   copy_ub_size, msg_size, peer, copy_event_id);
         }
 
-        // 只有 Core 0 执行同步操作
+        // 跨核屏障：确保所有 core 的 mte_put_nbi 都已发出，再由 core 0 做 WaitFlag
+        AscendC::SyncAll();
+
         if (core_idx == 0) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)notify_addr, (__gm__ uint8_t*)src_addr,
-                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                                  copy_ub_size, sizeof(uint32_t), peer, copy_event_id);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-
-            while (*(__gm__ uint32_t*)(ack_addr) != peer + MAGIC_VAL) {
-                dcci_cachelines(ack_addr, sizeof(uint32_t));
-                AscendC::GetSystemCycle();
-            }
-        }
-
-        AscendC::PipeBarrier<PIPE_ALL>();
-        int64_t end_cycle = AscendC::GetSystemCycle();
-
-        if (core_idx == 0) {
+            int64_t end_cycle = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
+
+            *(__gm__ uint32_t*)(notify_addr) = expected_notify;
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, SHMEM_CMP_EQ, expected_ack);
         }
+        AscendC::PipeBarrier<PIPE_ALL>();
 
     } else {
-        // 接收方逻辑
         peer = 0;
 
-        // 只有 Core 0 执行同步操作
         if (core_idx == 0) {
-            while (*(__gm__ uint32_t*)(notify_addr) != peer + MAGIC_VAL) {
-                dcci_cachelines(notify_addr, sizeof(uint32_t));
-                AscendC::GetSystemCycle();
-            }
-
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)ack_addr, (__gm__ uint8_t*)src_addr,
-                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                                  copy_ub_size, sizeof(uint32_t), peer, copy_event_id);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, SHMEM_CMP_EQ, expected_notify);
+            *(__gm__ uint32_t*)(ack_addr) = expected_ack;
         }
-
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 }
@@ -534,9 +497,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
 void launch_mte_bandwidth(uint32_t block_dim, void* stream,
                            uint64_t ffts_config, uint8_t* gva,
                            int64_t msg_size, int64_t iterations,
-                           uint8_t* result_buffer) {
+                           uint8_t* result_buffer, int64_t round_id) {
     mte_bandwidth_kernel<<<block_dim, nullptr, stream>>>(
-        ffts_config, gva, msg_size, iterations, block_dim, result_buffer);
+        ffts_config, gva, msg_size, iterations, block_dim, result_buffer, round_id);
 }
 
 // ========== Host端调用接口 ==========

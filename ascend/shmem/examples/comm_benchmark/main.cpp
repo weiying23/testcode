@@ -92,7 +92,7 @@ extern void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
 extern void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
                                    uint64_t ffts_config, uint8_t* gva,
                                    int64_t msg_size, int64_t iterations,
-                                   uint8_t* result_buffer);
+                                   uint8_t* result_buffer, int64_t round_id);
 
 extern void launch_mte_pingpong_latency(uint32_t block_dim, void* stream,
                                          uint64_t ffts_config, uint8_t* gva,
@@ -102,7 +102,7 @@ extern void launch_mte_pingpong_latency(uint32_t block_dim, void* stream,
 extern void launch_mte_bandwidth(uint32_t block_dim, void* stream,
                                   uint64_t ffts_config, uint8_t* gva,
                                   int64_t msg_size, int64_t iterations,
-                                  uint8_t* result_buffer);
+                                  uint8_t* result_buffer, int64_t round_id);
 
 using namespace benchmark;
 
@@ -474,13 +474,24 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
 
     std::vector<double> bandwidths;
 
+    // sync_base_offset 与 kernel 内计算保持一致（block_dim=1）
+    size_t sync_base_offset = 2 * msg_size * 1;  // rank_size=2, block_dim=1
+    size_t sync_area_size = 32;  // notify(8B) + ack(8B) + padding
+
     // 多轮测试取平均
     for (int round = 0; round < warmup_rounds + test_rounds; round++) {
         DEBUG_LOG(rank, "Bandwidth round %d (warmup=%d, test=%d)...",
                   round, warmup_rounds, test_rounds);
 
+        // 每轮前清零 notify/ack 区，防止上轮残留（kernel 使用 MAGIC_VAL+round 作为 flag）
+        {
+            uint8_t zero_sync[32] = {};
+            aclrtMemcpy(gva + sync_base_offset, sync_area_size,
+                        zero_sync, sync_area_size, ACL_MEMCPY_HOST_TO_DEVICE);
+        }
+
         // launch_rdma_bandwidth: 启动RDMA带宽测试Kernel
-        launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
+        launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer, (int64_t)round);
 
         ret = aclrtSynchronizeStream(stream);
         if (ret != ACL_SUCCESS) {
@@ -716,13 +727,24 @@ StatsResult test_mte_bandwidth(aclrtStream stream, uint64_t ffts_config,
 
     std::vector<double> bandwidths;
 
+    // sync_base_offset 与 kernel 内计算保持一致（block_dim=1）
+    size_t sync_base_offset = 2 * msg_size * 1;
+    size_t sync_area_size = 32;
+
     // 多轮测试取平均
     for (int round = 0; round < warmup_rounds + test_rounds; round++) {
         DEBUG_LOG(rank, "Bandwidth round %d (warmup=%d, test=%d)...",
                   round, warmup_rounds, test_rounds);
 
+        // 每轮前清零 notify/ack 区
+        {
+            uint8_t zero_sync[32] = {};
+            aclrtMemcpy(gva + sync_base_offset, sync_area_size,
+                        zero_sync, sync_area_size, ACL_MEMCPY_HOST_TO_DEVICE);
+        }
+
         // launch_mte_bandwidth: 启动MTE带宽测试Kernel
-        launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer);
+        launch_mte_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer, (int64_t)round);
 
         ret = aclrtSynchronizeStream(stream);
         if (ret != ACL_SUCCESS) {
@@ -964,9 +986,10 @@ int run_benchmark(int rank, int world_size) {
                 result = test_mte_pingpong_latency(stream, ffts_config, gva,
                                                     msg_size, iterations, warmup);
             } else if (engine == EngineType::SDMA) {
-                // SDMA 使用与 MTE 相同的测试函数（都是节点内通信）
-                result = test_mte_pingpong_latency(stream, ffts_config, gva,
-                                                    msg_size, iterations, warmup);
+                // SDMA 使用 generic put（aclshmem_uint8_put_nbi）内核，
+                // shmem 运行时根据初始化时设置的 ACLSHMEM_DATA_OP_SDMA 自动路由到 SDMA 硬件
+                result = test_rdma_pingpong_latency(stream, ffts_config, gva,
+                                                     msg_size, iterations, warmup);
             }
 
             // 仅 Rank 0 打印结果
@@ -1015,9 +1038,10 @@ int run_benchmark(int rank, int world_size) {
                 result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
                                              iterations, warmup_rounds, test_rounds);
             } else if (engine == EngineType::SDMA) {
-                // SDMA 使用与 MTE 相同的测试函数（都是节点内通信）
-                result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
-                                             iterations, warmup_rounds, test_rounds);
+                // SDMA 使用 generic put（aclshmem_uint8_put_nbi）内核，
+                // shmem 运行时根据初始化时设置的 ACLSHMEM_DATA_OP_SDMA 自动路由到 SDMA 硬件
+                result = test_rdma_bandwidth(stream, ffts_config, gva, msg_size,
+                                              iterations, warmup_rounds, test_rounds);
             }
 
             // 仅 Rank 0 打印结果
