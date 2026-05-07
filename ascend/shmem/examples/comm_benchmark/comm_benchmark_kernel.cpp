@@ -142,13 +142,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     }
 }
 
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-            AscendC::PipeBarrier<PIPE_ALL>();
-        }
-    }
-}
-
 // ========== RDMA带宽测试Kernel（支持多核聚合）==========
 //
 // 改进说明：
@@ -396,17 +389,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 
             // 复位
             *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
-        }
-    }
-}
-
-            GM_ADDR dst_addr = gva + peer * msg_size;
-            aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
-                                  reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
-                                  copy_ub_size, msg_size, peer, copy_event_id);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 }
