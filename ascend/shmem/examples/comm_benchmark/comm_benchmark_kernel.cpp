@@ -12,7 +12,8 @@
  */
 
 #include "kernel_operator.h"
-#include "aclshmem.h"
+#include "acl/acl.h"
+#include "shmem.h"
 
 // 宏定义
 #define MAGIC_VAL 1000
