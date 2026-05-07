@@ -24,10 +24,11 @@
  *   因此带宽 = iterations × msg_size / (end - start) 不含握手 RTT 开销。
  *
  * 同步机制说明：
- *   - aclshmem_barrier_all()：kernel 入口双端同步，避免先启动的 PE 误超时
+ *   - aclshmem_barrier_all()：仅在 host 端调用（run_benchmark 中），
+ *     确保两个 PE 的 kernel 都启动完毕再开始收发，不可在 kernel 内调用。
  *   - AscendC::SyncAll()：带宽 kernel 内跨核同步，确保所有 core put 都发出后再 quiet
  *   - aclshmem_uint32_test()：pingpong 等待（带超时，shmem 原语替代手写 dcci 轮询）
- *   - aclshmem_uint32_wait_until()：带宽 notify/ack 等待（无需超时，barrier 已保证连通）
+ *   - aclshmem_uint32_wait_until()：带宽 notify/ack 等待
  */
 
 #include "kernel_operator.h"
@@ -85,9 +86,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     uint32_t my_seq   = MAGIC_VAL + rank;
     uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer;
     bool timeout_detected = false;
-
-    // 入口屏障：确保双端都已进入 kernel，避免先启动的 PE 因对端未就绪而超时
-    aclshmem_barrier_all();
 
     // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
@@ -225,9 +223,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     uint32_t expected_notify = (uint32_t)(0 + MAGIC_VAL + round_id);
     uint32_t expected_ack    = (uint32_t)(1 + MAGIC_VAL + round_id);
 
-    // 入口屏障：确保双端都已进入 kernel
-    aclshmem_barrier_all();
-
     if (rank == 0) {
         peer = 1;
         int64_t start_cycle = AscendC::GetSystemCycle();
@@ -313,9 +308,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     uint32_t my_seq   = MAGIC_VAL + rank;
     uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer;
     bool timeout_detected = false;
-
-    // 入口屏障：确保双端都已进入 kernel
-    aclshmem_barrier_all();
 
     // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
@@ -454,9 +446,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
 
     uint32_t expected_notify = (uint32_t)(0 + MAGIC_VAL + round_id);
     uint32_t expected_ack    = (uint32_t)(1 + MAGIC_VAL + round_id);
-
-    // 入口屏障：确保双端都已进入 kernel
-    aclshmem_barrier_all();
 
     if (rank == 0) {
         peer = 1;
