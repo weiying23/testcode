@@ -290,26 +290,31 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
 
-    // 参考rdma_perftest: 初始化测试数据
-    // 数据布局：PE i的数据位于 gva + i * msg_size
+    // 初始化测试数据，并在 slot 末 8 字节写入 flag（MAGIC_VAL + rank）
+    // kernel 通过 put_nbi(src, src, msg_size, peer) 把整个 slot（含末尾 flag）PUT 到对端
     int64_t* init_data;
-    size_t total_data_size = msg_size * 2;  // 2个PE的数据
+    size_t total_data_size = msg_size;
     aclrtMallocHost((void**)&init_data, total_data_size);
-    // 参考rdma_perftest: 每个PE的数据值为 pe_id + 10
     for (size_t i = 0; i < msg_size / sizeof(int64_t); i++) {
-        init_data[i] = rank + 10;  // 每个PE初始化自己的数据
+        init_data[i] = rank + 10;
     }
-    // 拷贝数据到对称内存
+    // 在自己的 slot 末 8 字节写入 flag 值（uint32_t，值 = MAGIC_VAL + rank）
+    uint32_t my_flag_val = 10 + (uint32_t)rank;  // MAGIC_VAL=10
+    memcpy((uint8_t*)init_data + msg_size - 8, &my_flag_val, sizeof(uint32_t));
     aclrtMemcpy(gva + rank * msg_size, msg_size, init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
-    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
+    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld, flag at slot[-8] = %u",
+              rank * msg_size / sizeof(int64_t), (long)(rank + 10), my_flag_val);
     aclrtFreeHost(init_data);
 
-    // 初始化 flag 区为 0（位于 gva + 2*msg_size，共 16 字节）
+    // 清零对端 slot（接收方轮询 peer slot 末尾的 flag，初始必须为 0 避免误触发）
     {
-        uint8_t zero_flags[16] = {};
-        aclrtMemcpy(gva + 2 * msg_size, sizeof(zero_flags),
-                    zero_flags, sizeof(zero_flags), ACL_MEMCPY_HOST_TO_DEVICE);
-        DEBUG_LOG(rank, "flag area at gva+2*msg_size initialized to 0");
+        uint8_t* zero_slot;
+        aclrtMallocHost((void**)&zero_slot, msg_size);
+        memset(zero_slot, 0, msg_size);
+        uint32_t peer = (rank == 0) ? 1 : 0;
+        aclrtMemcpy(gva + peer * msg_size, msg_size, zero_slot, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
+        aclrtFreeHost(zero_slot);
+        DEBUG_LOG(rank, "peer slot at gva+%zu initialized to 0 (flag poll target cleared)", peer * msg_size);
     }
 
     // 分配结果buffer：存储每次迭代的cycles值
@@ -545,24 +550,29 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
 
-    // 参考mte_perftest: 初始化测试数据
+    // 初始化自己的数据 slot，末 8 字节写入 flag（MAGIC_VAL + rank）
     int64_t* init_data;
-    size_t total_data_size = msg_size * 2;  // 2个PE的数据
+    size_t total_data_size = msg_size;
     aclrtMallocHost((void**)&init_data, total_data_size);
     for (size_t i = 0; i < msg_size / sizeof(int64_t); i++) {
         init_data[i] = rank + 10;
     }
+    uint32_t my_flag_val = 10 + (uint32_t)rank;  // MAGIC_VAL=10
+    memcpy((uint8_t*)init_data + msg_size - 8, &my_flag_val, sizeof(uint32_t));
     aclrtMemcpy(gva + rank * msg_size, msg_size, init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
-    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
+    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld, flag at slot[-8] = %u",
+              rank * msg_size / sizeof(int64_t), (long)(rank + 10), my_flag_val);
     aclrtFreeHost(init_data);
 
-    // 初始化 flag 区为 0（位于 gva + 2*msg_size，共 16 字节）
-    // 防止上一轮测试的残留值误触发轮询退出
+    // 清零对端 slot（接收方轮询 peer slot 末尾的 flag，初始必须为 0）
     {
-        uint8_t zero_flags[16] = {};
-        aclrtMemcpy(gva + 2 * msg_size, sizeof(zero_flags),
-                    zero_flags, sizeof(zero_flags), ACL_MEMCPY_HOST_TO_DEVICE);
-        DEBUG_LOG(rank, "flag area at gva+2*msg_size initialized to 0");
+        uint8_t* zero_slot;
+        aclrtMallocHost((void**)&zero_slot, msg_size);
+        memset(zero_slot, 0, msg_size);
+        uint32_t peer = (rank == 0) ? 1 : 0;
+        aclrtMemcpy(gva + peer * msg_size, msg_size, zero_slot, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
+        aclrtFreeHost(zero_slot);
+        DEBUG_LOG(rank, "peer slot at gva+%zu initialized to 0 (flag poll target cleared)", peer * msg_size);
     }
 
     // 分配结果buffer
@@ -1018,13 +1028,16 @@ int run_benchmark(int rank, int world_size) {
             int test_rounds = 10;
 
             // ========== 数据初始化 ==========
-            // 初始化 src_addr 的数据，使得通知消息内容是 pe_id + MAGIC_VAL
+            // src_addr[0] 写入固定 flag 值（MAGIC_VAL + rank），kernel 用它作为 notify/ack 内容
+            // Rank 0 src_addr[0] = MAGIC_VAL = 10  → notify_val
+            // Rank 1 src_addr[0] = MAGIC_VAL+1= 11 → ack_val
             constexpr uint32_t BW_MAGIC_VAL = 10;
             uint32_t* bw_init_data;
             aclrtMallocHost((void**)&bw_init_data, msg_size);
             for (size_t i = 0; i < msg_size / sizeof(uint32_t); i++) {
                 bw_init_data[i] = rank + BW_MAGIC_VAL;
             }
+            bw_init_data[0] = (uint32_t)(rank + BW_MAGIC_VAL);
             aclrtMemcpy(gva + rank * msg_size, msg_size, bw_init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
             aclrtFreeHost(bw_init_data);
 
