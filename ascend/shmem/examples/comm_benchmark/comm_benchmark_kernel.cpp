@@ -11,22 +11,36 @@
 #define TIMEOUT_CYCLES 100000000LL
 #define TIMEOUT_ERROR_CODE -1
 
-// 显式定义等待逻辑，避免 Lambda 导致的 host/device 属性冲突
+// ---------------------------------------------------------------------------
+// 核心同步工具函数
+// ---------------------------------------------------------------------------
+
+// 强制刷新 Cache：使用汇编直接操作地址，不依赖任何特定头文件
+__aicore__ inline void refresh_cache(uint64_t addr) {
+    // dcci (Data Cache Clean and Invalidate) 针对指定地址
+    // 确保从内存中读取最新数据
+    __asm__ __volatile__("dcci %0" : : "r"(addr) : "memory");
+}
+
 __aicore__ inline bool perform_wait(uint64_t addr, uint32_t target_val) {
     int64_t wait_start = AscendC::GetSystemCycle();
     while (true) {
-        // 使用针对地址的底层 Cache 刷新指令
-        dcci_cachelines(addr, sizeof(uint32_t));
+        refresh_cache(addr);
 
-        // 显式从内存读取
+        // 执行流屏障，确保流水线对内存访问有序
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        // 显式将地址转换为 GM 指针并读取
         if (*(__gm__ uint32_t*)addr == target_val) {
             return true;
         }
+
         if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
             return false;
         }
-        // 简单的执行流挂起
-        for (int k = 0; k < 50; k++) {
+
+        // 避免 AI Core 跑太快造成总线拥堵
+        for (int k = 0; k < 100; k++) {
             __asm__ __volatile__("" : : : "memory");
         }
     }
