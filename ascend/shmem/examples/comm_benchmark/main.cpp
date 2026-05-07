@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <cinttypes>
+#include <unistd.h>  // for usleep
 
 #include "acl/acl.h"
 #include "shmem.h"
@@ -71,6 +72,17 @@
         DEBUG_LOG(rank, "[%s] timestamp=%ld ms", label, (long)ms); \
     } while(0)
 
+// 结果验证宏
+#define VERIFY_RESULT(rank, expected, actual, desc) \
+    do { \
+        if (expected != actual) { \
+            fprintf(stderr, "[ERROR][Rank %d] Verification failed: %s, expected=%ld, actual=%ld\n", \
+                    rank, desc, (long)expected, (long)actual); \
+        } else { \
+            DEBUG_LOG(rank, "Verification passed: %s, value=%ld", desc, (long)expected); \
+        } \
+    } while(0)
+
 // Kernel函数声明
 extern void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
                                           uint64_t ffts_config, uint8_t* gva,
@@ -107,15 +119,19 @@ const double NPU_FREQ_MHZ = 1000.0;
 
 /**
  * 初始化ACL环境（只调用一次，在引擎循环外）
+ * 参考rdma_perftest/mte_perftest: aclInit → aclrtSetDevice → aclrtCreateStream
  */
-int init_acl_environment(int rank) {
+int init_acl_environment(int rank, aclrtStream* stream) {
     int32_t device_id = f_npu;
     DEBUG_LOG(rank, "=== init_acl_environment START ===");
     DEBUG_LOG(rank, "device_id=%d (f_npu=%d)", device_id, f_npu);
 
     CHECK_ACL_STATUS(rank, aclInit(nullptr), "aclInit");
     CHECK_ACL_STATUS(rank, aclrtSetDevice(device_id), "aclrtSetDevice");
+    // 参考实现: stream在aclshmemx_init_attr之前创建
+    CHECK_ACL_STATUS(rank, aclrtCreateStream(stream), "aclrtCreateStream");
 
+    DEBUG_LOG(rank, "stream created at %p", *stream);
     DEBUG_LOG(rank, "=== init_acl_environment END ===");
     return 0;
 }
@@ -138,25 +154,20 @@ int init_shmem_environment(int rank, int world_size, uint64_t mem_size, EngineTy
               attributes.my_pe, attributes.n_pes, ipport, (unsigned long)attributes.local_mem_size);
 
     // 根据引擎类型设置数据传输引擎和超时配置:
-    switch (engine) {
-        case EngineType::RDMA:
-            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
-            attributes.option_attr.shm_init_timeout = 10;
-            attributes.option_attr.shm_create_timeout = 10;
-            attributes.option_attr.control_operation_timeout = 10;
-            DEBUG_LOG(rank, "Engine set to RDMA (ROCE) with timeout=10s");
-            break;
-        case EngineType::MTE:
-            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
-            DEBUG_LOG(rank, "Engine set to MTE");
-            break;
-        case EngineType::SDMA:
-            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
-            DEBUG_LOG(rank, "Engine set to SDMA");
-            break;
-        default:
-            attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
-            DEBUG_LOG(rank, "Engine set to default MTE");
+    // 参考mte_perftest: MTE引擎不显式设置engine_type，使用默认值
+    // 参考rdma_perftest: RDMA引擎设置ACLSHMEM_DATA_OP_ROCE
+    if (engine == EngineType::RDMA) {
+        attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_ROCE;
+        attributes.option_attr.shm_init_timeout = 10;
+        attributes.option_attr.shm_create_timeout = 10;
+        attributes.option_attr.control_operation_timeout = 10;
+        DEBUG_LOG(rank, "Engine set to RDMA (ROCE) with timeout=10s");
+    } else if (engine == EngineType::SDMA) {
+        attributes.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_SDMA;
+        DEBUG_LOG(rank, "Engine set to SDMA");
+    } else {
+        // MTE引擎：不设置engine_type，使用默认MTE（参考mte_perftest）
+        DEBUG_LOG(rank, "Engine set to MTE (default, no explicit engine_type)");
     }
 
     // aclshmemx_set_conf_store_tls: 设置配置存储TLS（可选）
@@ -225,14 +236,21 @@ int init_shmem_environment(int rank, int world_size, uint64_t mem_size, EngineTy
 
 /**
  * 终止SHMEM环境（每个引擎结束时调用）
+ * 参考参考实现：确保彻底清理状态
  */
 void finalize_shmem_environment(int rank) {
     DEBUG_LOG(rank, "=== finalize_shmem_environment START ===");
     TIMESTAMP(rank, "SHMEM_FINALIZE_START");
 
+    // 参考rdma_perftest/mte_perftest: 调用aclshmem_finalize清理所有SHMEM资源
     DEBUG_LOG(rank, "calling aclshmem_finalize...");
     aclshmem_finalize();
     DEBUG_LOG(rank, "aclshmem_finalize done");
+
+    // 参考参考实现: 添加短暂延迟让系统稳定
+    // 多引擎迭代时需要让前一个引擎的状态彻底清理
+    usleep(100000);  // 100ms
+    DEBUG_LOG(rank, "cleanup stabilization delay done");
 
     TIMESTAMP(rank, "SHMEM_FINALIZE_END");
     DEBUG_LOG(rank, "=== finalize_shmem_environment END ===");
@@ -240,6 +258,7 @@ void finalize_shmem_environment(int rank) {
 
 /**
  * 终止ACL环境（最后调用一次）
+ * 参考rdma_perftest/mte_perftest: aclrtResetDevice 在 aclFinalize 之前调用
  */
 void finalize_acl_environment(int rank) {
     int32_t device_id = f_npu;
@@ -270,6 +289,20 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
 
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
+
+    // 参考rdma_perftest: 初始化测试数据
+    // 数据布局：PE i的数据位于 gva + i * msg_size
+    int64_t* init_data;
+    size_t total_data_size = msg_size * 2;  // 2个PE的数据
+    aclrtMallocHost((void**)&init_data, total_data_size);
+    // 参考rdma_perftest: 每个PE的数据值为 pe_id + 10
+    for (size_t i = 0; i < msg_size / sizeof(int64_t); i++) {
+        init_data[i] = rank + 10;  // 每个PE初始化自己的数据
+    }
+    // 拷贝数据到对称内存
+    aclrtMemcpy(gva + rank * msg_size, msg_size, init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
+    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
+    aclrtFreeHost(init_data);
 
     // 分配结果buffer：存储每次迭代的cycles值
     uint8_t* result_buffer;
@@ -366,6 +399,20 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // aclrtFreeHost: 释放Host端内存
     aclrtFreeHost(host_result);
     DEBUG_LOG(rank, "host_result freed");
+
+    // ========== 数据验证 ==========
+    // 参考mte_perftest: 验证数据传输是否正确
+    DEBUG_LOG(rank, "=== Verifying data transfer ===");
+    int64_t* verify_buf;
+    aclrtMallocHost((void**)&verify_buf, msg_size);
+    uint32_t peer = (rank == 0) ? 1 : 0;
+    // 检查对端数据是否到达：读取 peer slot 的数据
+    aclrtMemcpy(verify_buf, msg_size, gva + peer * msg_size, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    // 验证第一个数据值：应该是 peer + 10
+    int64_t expected_val = peer + 10;
+    VERIFY_RESULT(rank, expected_val, verify_buf[0], "peer data transfer");
+    aclrtFreeHost(verify_buf);
+    DEBUG_LOG(rank, "=== Data verification done ===");
 
     // aclrtFree: 释放NPU设备内存
     aclrtFree(result_buffer);
@@ -468,6 +515,17 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     CHECK_PTR(rank, stream, "stream");
     CHECK_PTR(rank, gva, "gva");
 
+    // 参考mte_perftest: 初始化测试数据
+    int64_t* init_data;
+    size_t total_data_size = msg_size * 2;  // 2个PE的数据
+    aclrtMallocHost((void**)&init_data, total_data_size);
+    for (size_t i = 0; i < msg_size / sizeof(int64_t); i++) {
+        init_data[i] = rank + 10;
+    }
+    aclrtMemcpy(gva + rank * msg_size, msg_size, init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
+    DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
+    aclrtFreeHost(init_data);
+
     // 分配结果buffer
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
@@ -563,6 +621,17 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // 释放Host端内存
     aclrtFreeHost(host_result);
     DEBUG_LOG(rank, "host_result freed");
+
+    // ========== 数据验证 ==========
+    DEBUG_LOG(rank, "=== Verifying data transfer ===");
+    int64_t* verify_buf;
+    aclrtMallocHost((void**)&verify_buf, msg_size);
+    uint32_t peer = (rank == 0) ? 1 : 0;
+    aclrtMemcpy(verify_buf, msg_size, gva + peer * msg_size, msg_size, ACL_MEMCPY_DEVICE_TO_HOST);
+    int64_t expected_val = peer + 10;
+    VERIFY_RESULT(rank, expected_val, verify_buf[0], "peer data transfer");
+    aclrtFreeHost(verify_buf);
+    DEBUG_LOG(rank, "=== Data verification done ===");
 
     // 释放Device端内存
     aclrtFree(result_buffer);
@@ -731,8 +800,10 @@ StatsResult test_cpu_transfer(aclrtStream stream, size_t msg_size, int iteration
  * ========== 主测试流程 ==========
  */
 int run_benchmark(int rank, int world_size) {
-    // 定义对称内存大小：256MB
-    uint64_t mem_size = 256UL * 1024UL * 1024UL;
+    // 参考mte_perftest: 使用1GB local_mem_size
+    // 参考rdma_perftest: 使用64MB local_mem_size
+    // 多引擎测试需要更大内存，使用1GB
+    uint64_t mem_size = 1024UL * 1024UL * 1024UL;  // 1GB
 
     // make_dir: 创建结果目录
     make_dir("results");
@@ -762,13 +833,16 @@ int run_benchmark(int rank, int world_size) {
         print_separator();
     }
 
-    // ========== ACL初始化（只调用一次）==========
+    // ========== ACL初始化（只调用一次，参考rdma_perftest顺序）==========
+    // 参考实现顺序: aclInit → aclrtSetDevice → aclrtCreateStream
     DEBUG_LOG(rank, "=== Initializing ACL (one-time) ===");
-    int acl_ret = init_acl_environment(rank);
+    aclrtStream stream = nullptr;
+    int acl_ret = init_acl_environment(rank, &stream);
     if (acl_ret != 0) {
         fprintf(stderr, "[ERROR][Rank %d] ACL initialization failed, cannot proceed\n", rank);
         return -1;
     }
+    DEBUG_LOG(rank, "ACL initialized, stream=%p", stream);
 
     // ========== RDMA/MTE/SDMA测试 ==========
     int successful_engines = 0;
@@ -780,7 +854,7 @@ int run_benchmark(int rank, int world_size) {
         DEBUG_LOG(rank, "=== Starting engine %s ===", engine_name(engine).c_str());
         TIMESTAMP(rank, "ENGINE_TEST_START");
 
-        // init_shmem_environment: 初始化SHMEM环境（ACL已初始化）
+        // init_shmem_environment: 初始化SHMEM环境（ACL已初始化，stream已创建）
         int init_ret = init_shmem_environment(rank, world_size, mem_size, engine);
         if (init_ret != 0) {
             fprintf(stderr, "[WARN][Rank %d] Engine %s SHMEM initialization failed, skipping this engine\n",
@@ -793,29 +867,33 @@ int run_benchmark(int rank, int world_size) {
 
         successful_engines++;
 
-        // 调用者创建stream
-        aclrtStream stream = nullptr;
-        DEBUG_LOG(rank, "creating stream...");
-        aclError stream_ret = aclrtCreateStream(&stream);
-        if (stream_ret != ACL_SUCCESS) {
-            fprintf(stderr, "[ERROR][Rank %d] aclrtCreateStream failed, ret=%d\n", rank, stream_ret);
-            finalize_shmem_environment(rank);
-            continue;
-        }
-        DEBUG_LOG(rank, "stream created at %p", stream);
+        // stream已在ACL初始化时创建，这里直接使用
+        DEBUG_LOG(rank, "using existing stream=%p", stream);
 
         // util_get_ffts_config: 获取FFTS配置地址
         uint64_t ffts_config = util_get_ffts_config();
         DEBUG_LOG(rank, "ffts_config=0x%lx", (unsigned long)ffts_config);
 
-        // aclshmem_malloc: 分配对称内存
-        DEBUG_LOG(rank, "allocating symmetric memory, size=%lu MB...", (unsigned long)(mem_size / (1024 * 1024)));
+        // 参考rdma_perftest: 使用6MB (size6M = 6 * 1024 * 1024)
+        // 参考mte_perftest: 根据测试需求动态计算 datasize * block_size
+        // 计算实际需要的内存大小：
+        // - 延迟测试：2个slot * max_msg_size (2个PE各需要一个发送区)
+        // - 带宽测试：2个slot * max_msg_size * block_dim
+        // - 同步区域：额外的空间用于magic value同步
+        size_t max_msg_size = 8 * 1024 * 1024;  // 8MB (最大测试消息)
+        size_t latency_mem = 2 * max_msg_size + 32;  // 延迟测试内存
+        size_t bandwidth_mem = 2 * max_msg_size * 32 + 32;  // 带宽测试内存 (block_dim=32)
+        size_t required_mem = std::max(latency_mem, bandwidth_mem);
+        // 参考rdma_perftest: 使用至少6MB
+        size_t alloc_size = std::max(required_mem, (size_t)(6 * 1024 * 1024));
+        DEBUG_LOG(rank, "allocating symmetric memory, size=%zu MB (calculated from test requirements)...",
+                  alloc_size / (1024 * 1024));
         TIMESTAMP(rank, "SHMEM_MALLOC_START");
-        uint8_t* gva = (uint8_t*)aclshmem_malloc(mem_size);
+        uint8_t* gva = (uint8_t*)aclshmem_malloc(alloc_size);
         TIMESTAMP(rank, "SHMEM_MALLOC_END");
         if (gva == nullptr) {
             fprintf(stderr, "[ERROR][Rank %d] aclshmem_malloc failed, gva is nullptr\n", rank);
-            aclrtDestroyStream(stream);
+            // 不销毁stream，只finalize SHMEM
             finalize_shmem_environment(rank);
             continue;
         }
@@ -927,12 +1005,8 @@ int run_benchmark(int rank, int world_size) {
         aclshmem_free(gva);
         DEBUG_LOG(rank, "symmetric memory freed");
 
-        // aclrtDestroyStream: 销毁ACL流
-        DEBUG_LOG(rank, "destroying stream at %p...", stream);
-        aclrtDestroyStream(stream);
-        DEBUG_LOG(rank, "stream destroyed");
-
         // finalize_shmem_environment: 终止SHMEM环境
+        // 注意：不在这里销毁stream，stream在整个生命周期内保持
         finalize_shmem_environment(rank);
         DEBUG_LOG(rank, "=== Engine %s cleanup done ===", engine_name(engine).c_str());
 
@@ -948,6 +1022,8 @@ int run_benchmark(int rank, int world_size) {
             std::cout << "  - NPU device availability\n";
             std::cout << "  - Peer process running on same node\n";
         }
+        // 销毁stream再finalize
+        aclrtDestroyStream(stream);
         finalize_acl_environment(rank);
         return -1;
     }
@@ -956,100 +1032,53 @@ int run_benchmark(int rank, int world_size) {
         std::cout << "\n[SUMMARY] " << successful_engines << " engine(s) tested successfully.\n";
     }
 
-    // ========== 终止ACL环境（最后调用一次）==========
-    finalize_acl_environment(rank);
-    DEBUG_LOG(rank, "=== All tests completed, ACL finalized ===");
-
-    // ========== CPU中转测试（仅 Rank 0 打印）==========
+    // ========== CPU中转测试（在ACL finalize之前，使用已有stream）==========
+    // 参考rdma_perftest/mte_perftest: CPU测试不需要SHMEM初始化，只需要ACL
     if (rank == 0) {
         std::cout << "\n---------- Testing Engine: CPU_D2H_H2D ----------\n";
     }
 
     DEBUG_LOG(rank, "=== Starting CPU transfer test ===");
+    if (rank == 0) {
+        std::cout << "\n[CPU Transfer Latency Test]\n";
+    }
+    for (size_t msg_size : MSG_SIZES) {
+        int iterations = get_iterations(msg_size);
+        int warmup = get_warmup_iterations(msg_size);
 
-    // CPU测试：尝试使用MTE或SDMA初始化SHMEM（ACL已初始化）
-    bool cpu_test_success = false;
-    {
-        int cpu_init_ret = init_shmem_environment(rank, world_size, mem_size, EngineType::MTE);
-        if (cpu_init_ret != 0) {
-            fprintf(stderr, "[WARN][Rank %d] CPU test MTE SHMEM init failed, trying SDMA...\n", rank);
-            cpu_init_ret = init_shmem_environment(rank, world_size, mem_size, EngineType::SDMA);
-        }
+        DEBUG_LOG(rank, "CPU test: msg_size=%zu, iterations=%d, warmup=%d", msg_size, iterations, warmup);
 
-        if (cpu_init_ret == 0) {
-            cpu_test_success = true;
+        StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
 
-            // 调用者创建stream
-            aclrtStream stream = nullptr;
-            DEBUG_LOG(rank, "creating stream for CPU test...");
-            aclrtCreateStream(&stream);
-            DEBUG_LOG(rank, "stream created at %p", stream);
-
-            if (rank == 0) {
-                std::cout << "\n[CPU Transfer Latency Test]\n";
-            }
-            for (size_t msg_size : MSG_SIZES) {
-                int iterations = get_iterations(msg_size);
-                int warmup = get_warmup_iterations(msg_size);
-
-                DEBUG_LOG(rank, "CPU test: msg_size=%zu, iterations=%d, warmup=%d", msg_size, iterations, warmup);
-
-                StatsResult result = test_cpu_transfer(stream, msg_size, iterations, warmup);
-
-                if (rank == 0) {
-                    latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
-                                           msg_size, iterations, result);
-                }
-            }
-
-            DEBUG_LOG(rank, "CPU test completed");
-
-            DEBUG_LOG(rank, "destroying stream at %p...", stream);
-            aclrtDestroyStream(stream);
-            DEBUG_LOG(rank, "stream destroyed");
-
-            finalize_shmem_environment(rank);
-            DEBUG_LOG(rank, "=== CPU test cleanup done ===");
-        } else {
-            fprintf(stderr, "[WARN][Rank %d] CPU test SHMEM init failed for all engines, skipping\n", rank);
-            if (rank == 0) {
-                std::cout << "[SKIP] CPU transfer test unavailable\n";
-            }
+        if (rank == 0) {
+            latency_csv.write_row("CPU_D2H_H2D", "pingpong_latency",
+                                   msg_size, iterations, result);
         }
     }
+    DEBUG_LOG(rank, "=== CPU test completed ===");
 
-// ========== HCCL测试（条件编译） ==========
+// ========== HCCL测试（条件编译，在ACL finalize之前）==========
 #ifdef ENABLE_HCCL
-    std::cout << "\n---------- Testing Engine: HCCL ----------\n";
+    if (rank == 0) {
+        std::cout << "\n---------- Testing Engine: HCCL ----------\n";
+    }
     std::cout << "[HCCL] Huawei Collective Communication Library Test\n";
 
-    // 直接使用 f_npu 作为物理设备ID
-    int32_t device_id = f_npu;
-
-    // aclrtSetDevice: 设置当前进程使用的NPU设备
-    aclrtSetDevice(device_id);
-
-    // aclrtCreateStream: 创建ACL流
+    // HCCL需要自己的stream
     aclrtStream hccl_stream = nullptr;
     aclrtCreateStream(&hccl_stream);
+    DEBUG_LOG(rank, "HCCL stream created at %p", hccl_stream);
 
     // HcclComm: HCCL通信组句柄
     HcclComm hccl_comm = nullptr;
 
     // HcclRootInfo: HCCL根信息结构体
-    // 用于进程间通信组初始化
     HcclRootInfo root_info;
 
     // HcclGetRootInfo: 获取根信息
-    // 注意：多进程场景下，root_info需要由rank0广播给其他进程
     HcclGetRootInfo(&root_info);
 
     // HcclCommInitRootInfo: 使用根信息初始化通信组
-    // 参数详解:
-    // - world_size: 通信组大小（进程总数）
-    // - &root_info: 根信息指针
-    // - rank: 当前进程编号
-    // - &hccl_comm: 通信组句柄（输出参数）
     HcclCommInitRootInfo(world_size, &root_info, rank, &hccl_comm);
 
     std::cout << "[HCCL] Rank " << rank
@@ -1281,17 +1310,24 @@ int run_benchmark(int rank, int world_size) {
     // HcclCommDestroy: 销毁HCCL通信组
     HcclCommDestroy(hccl_comm);
 
-    // aclrtDestroyStream: 销毁ACL流
+    // aclrtDestroyStream: 销毁HCCL流
     aclrtDestroyStream(hccl_stream);
-
-    // aclrtResetDevice: 重置NPU设备
-    aclrtResetDevice(device_id);
+    DEBUG_LOG(rank, "HCCL stream destroyed");
 #else
     if (rank == 0) {
         std::cout << "\n---------- HCCL Test Skipped ----------\n";
         std::cout << "[INFO] HCCL not enabled. Define ENABLE_HCCL in benchmark_config.h to enable.\n";
     }
 #endif
+
+    // ========== 终止ACL环境（最后调用一次）==========
+    // 参考rdma_perftest/mte_perftest: aclrtDestroyStream → aclrtResetDevice → aclFinalize
+    DEBUG_LOG(rank, "destroying main stream at %p...", stream);
+    aclrtDestroyStream(stream);
+    DEBUG_LOG(rank, "main stream destroyed");
+
+    finalize_acl_environment(rank);
+    DEBUG_LOG(rank, "=== All tests completed, ACL finalized ===");
 
     if (rank == 0) {
         std::cout << "\n==================== Benchmark Complete ====================\n";
