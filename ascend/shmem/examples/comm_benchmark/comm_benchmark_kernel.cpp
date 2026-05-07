@@ -16,7 +16,7 @@ __aicore__ inline bool perform_wait(uint64_t addr, uint32_t target_val) {
     int64_t wait_start = AscendC::GetSystemCycle();
     while (true) {
         // 使用针对地址的底层 Cache 刷新指令
-        AscendC::dcci(addr);
+        dcci_cachelines(addr, sizeof(uint32_t));
 
         // 显式从内存读取
         if (*(__gm__ uint32_t*)addr == target_val) {
