@@ -17,9 +17,17 @@ constexpr int64_t TIMEOUT_CYCLES = 10000000000LL;  // 10 seconds timeout
 constexpr int64_t TIMEOUT_ERROR_CODE = -1;  // 超时错误标记
 
 // ========== RDMA PingPong延迟测试Kernel ==========
-// 正确的pingpong逻辑（参考rdma_perftest）：
-// - Rank 0: 写入 rank+MAGIC_VAL，put到peer，等待 peer+MAGIC_VAL 响应
-// - Rank 1: 等待 peer+MAGIC_VAL，写入 rank+MAGICVAL，put回去
+//
+// 内存布局（与 MTE 版本相同）：
+//   [0,          msg_size)         Rank 0 数据区
+//   [msg_size,   2*msg_size)       Rank 1 数据区
+//   [2*msg_size, 2*msg_size+8)     Rank 0 的通知 flag（仅 Rank 0 写，Rank 1 轮询）
+//   [2*msg_size+8, 2*msg_size+16)  Rank 1 的响应 flag（仅 Rank 1 写，Rank 0 轮询）
+//
+// 修复说明（与 MTE 版本相同）：
+//   原实现把 flag 放在数据 slot 末尾，put 整个 slot 时会覆盖对端刚写入的 flag，
+//   且每轮末尾的复位操作有窗口期，可能在对端读到前就清掉通知。
+//   修复：使用独立于数据区的 flag 地址，put 只传数据，flag 单调递增不复位。
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -39,36 +47,44 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     int64_t rank = aclshmem_my_pe();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
-    // 内存布局：
-    // slot 0 (gva + 0): Rank 0 数据区，末尾是 peer 等待位置
-    // slot 1 (gva + msg_size): Rank 1 数据区，末尾是 peer 等待位置
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // Warmup阶段
+    // 独立 flag 区域（与数据区不重叠）
+    GM_ADDR rank0_flag_addr = gva + 2 * msg_size;
+    GM_ADDR rank1_flag_addr = gva + 2 * msg_size + 8;
+
+    GM_ADDR my_flag_addr   = (rank == 0) ? rank0_flag_addr : rank1_flag_addr;
+    GM_ADDR peer_flag_addr = (rank == 0) ? rank1_flag_addr : rank0_flag_addr;
+
+    uint32_t my_seq   = MAGIC_VAL + rank;
+    uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer;
+
     bool timeout_detected = false;
+
+    // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
-            // Rank 0: 写入 rank+MAGIC_VAL = 10+i
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
-            // 等待 peer slot末尾出现 peer+MAGIC_VAL = 11+i
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
                 }
             }
         } else {
-            // Rank 1: 等待 peer slot末尾出现 peer+MAGIC_VAL = 10+i
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -76,17 +92,14 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             }
 
             if (!timeout_detected) {
-                // Rank 1: 写入 rank+MAGIC_VAL = 11+i
-                *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
-
                 GM_ADDR dst_addr = gva + peer * msg_size;
                 aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
+
+                my_seq++;
+                *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
             }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-
-        // 复位：恢复原始值
-        *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
     }
 
     if (timeout_detected) {
@@ -99,14 +112,16 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
 
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -116,28 +131,25 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
             int64_t iter_end = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = iter_end - iter_start;
-
-            // 复位
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
         }
     } else {
         for (int64_t i = 0; i < iterations; i++) {
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
             }
 
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
-
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmem_uint8_put_nbi(dst_addr, src_addr, msg_size, peer);
-            AscendC::PipeBarrier<PIPE_ALL>();
 
-            // 复位
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
+
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 }
@@ -250,9 +262,19 @@ void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
 }
 
 // ========== MTE PingPong延迟测试Kernel ==========
-// 正确的pingpong逻辑：
-// - Rank 0: 写入 rank+MAGIC_VAL，发送到 peer slot，等待 peer+MAGIC_VAL 响应
-// - Rank 1: 等待 peer+MAGIC_VAL，写入 rank+MAGIC_VAL 响应，发送回去
+//
+// 内存布局（调用方需保证 gva 分配足够空间）：
+//   [0,          msg_size)         Rank 0 数据区（put 的 src/dst）
+//   [msg_size,   2*msg_size)       Rank 1 数据区（put 的 src/dst）
+//   [2*msg_size, 2*msg_size+8)     Rank 0 的通知 flag（仅 Rank 0 写，Rank 1 轮询）
+//   [2*msg_size+8, 2*msg_size+16)  Rank 1 的通知 flag（仅 Rank 1 写，Rank 0 轮询）
+//
+// 修复说明：
+//   原实现把 flag 放在数据区末尾（msg_size-8 处），导致两个 bug：
+//   1. put 整个 slot 时会把对端刚写入的响应 flag 用旧值覆盖，Rank 0 永远看不到期望值。
+//   2. 每次迭代末尾的 "复位" 操作有窗口期，可能在对端读到值之前就清掉了通知。
+//   修复方法：使用独立于数据区的 flag 地址，put 只传数据（不含 flag），
+//   且 flag 单调递增，不再做复位。
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_latency_kernel(
     uint64_t ffts_config,
     GM_ADDR gva,
@@ -264,7 +286,6 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     util_set_ffts_config(ffts_config);
     if (AscendC::GetSubBlockIdx() != 0) return;
 
-    // 获取MTE配置信息
     __gm__ aclshmem_device_host_state_t *device_state = aclshmemi_get_state();
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint32_t copy_ub_size = device_state->mte_config.ub_size;
@@ -273,20 +294,33 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
     int64_t rank = aclshmem_my_pe();
     uint32_t peer = (rank == 0) ? 1 : 0;
 
-    // 内存布局：
-    // slot 0 (gva + 0): Rank 0 数据区
-    // slot 1 (gva + msg_size): Rank 1 数据区
-    // 检测位置：slot末尾 - 8
     GM_ADDR src_addr = gva + rank * msg_size;
     GM_ADDR result_addr = result_buffer;
 
-    // Warmup阶段
+    // 独立 flag 区域：与数据区不重叠，put 操作不会触碰到这里
+    // Rank 0 的发送 flag：Rank 1 轮询此地址
+    GM_ADDR rank0_flag_addr = gva + 2 * msg_size;
+    // Rank 1 的响应 flag：Rank 0 轮询此地址
+    GM_ADDR rank1_flag_addr = gva + 2 * msg_size + 8;
+
+    // 根据 rank 确定自己写哪个 flag、轮询哪个 flag
+    GM_ADDR my_flag_addr   = (rank == 0) ? rank0_flag_addr : rank1_flag_addr;
+    GM_ADDR peer_flag_addr = (rank == 0) ? rank1_flag_addr : rank0_flag_addr;
+
+    // flag 初始值为 MAGIC_VAL + rank，用单调递增序列，无需复位
+    uint32_t my_seq   = MAGIC_VAL + rank;          // 下一次要写入的值
+    uint32_t peer_seq = MAGIC_VAL + (uint32_t)peer; // 下一次期望从对端看到的值
+
     bool timeout_detected = false;
+
+    // Warmup 阶段
     for (int64_t i = 0; i < warmup && !timeout_detected; i++) {
         if (rank == 0) {
-            // Rank 0: 写入 rank+MAGIC_VAL = 10+i，put 到 peer slot
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
+            // 1. 更新序列号并写入自己的 flag
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
+            // 2. 把数据 put 到对端（不含 flag 区，不影响 peer_flag_addr）
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                   reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
@@ -294,20 +328,22 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
-            // 等待 peer slot末尾出现 peer+MAGIC_VAL = 11+i
+            // 3. 等待 Rank 1 的响应 flag 递增
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
                 }
             }
         } else {
-            // Rank 1: 等待 peer slot末尾出现 peer+MAGIC_VAL = 10+i
+            // 1. 等待 Rank 0 的发送 flag 递增
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -315,21 +351,20 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             }
 
             if (!timeout_detected) {
-                // Rank 1: 写入 rank+MAGIC_VAL = 11+i，put 回去
-                *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + i;
-
+                // 2. 把数据 put 回去
                 GM_ADDR dst_addr = gva + peer * msg_size;
                 aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
                                       reinterpret_cast<__ubuf__ uint8_t*>(copy_ub),
                                       copy_ub_size, msg_size, peer, copy_event_id);
                 AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
+
+                // 3. 更新自己的响应 flag
+                my_seq++;
+                *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
             }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
-
-        // 复位：恢复原始值
-        *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
     }
 
     if (timeout_detected) {
@@ -342,7 +377,8 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
         for (int64_t i = 0; i < iterations; i++) {
             int64_t iter_start = AscendC::GetSystemCycle();
 
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
@@ -351,9 +387,10 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
 
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -363,21 +400,17 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 
             int64_t iter_end = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = iter_end - iter_start;
-
-            // 复位
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
         }
     } else {
         for (int64_t i = 0; i < iterations; i++) {
+            peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (*(__gm__ uint32_t*)(gva + peer * msg_size + msg_size - 8) != peer + MAGIC_VAL + warmup + i) {
-                dcci_cachelines(gva + peer * msg_size + msg_size - 8, 8);
+            while (*(__gm__ uint32_t*)(peer_flag_addr) != peer_seq) {
+                dcci_cachelines(peer_flag_addr, 8);
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
             }
-
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL + warmup + i;
 
             GM_ADDR dst_addr = gva + peer * msg_size;
             aclshmemx_mte_put_nbi((__gm__ uint8_t*)dst_addr, (__gm__ uint8_t*)src_addr,
@@ -385,10 +418,11 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
                                   copy_ub_size, msg_size, peer, copy_event_id);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(copy_event_id);
-            AscendC::PipeBarrier<PIPE_ALL>();
 
-            // 复位
-            *(__gm__ uint32_t*)(src_addr + msg_size - 8) = rank + MAGIC_VAL;
+            my_seq++;
+            *(__gm__ uint32_t*)(my_flag_addr) = my_seq;
+
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 }

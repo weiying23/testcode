@@ -304,6 +304,14 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
     aclrtFreeHost(init_data);
 
+    // 初始化 flag 区为 0（位于 gva + 2*msg_size，共 16 字节）
+    {
+        uint8_t zero_flags[16] = {};
+        aclrtMemcpy(gva + 2 * msg_size, sizeof(zero_flags),
+                    zero_flags, sizeof(zero_flags), ACL_MEMCPY_HOST_TO_DEVICE);
+        DEBUG_LOG(rank, "flag area at gva+2*msg_size initialized to 0");
+    }
+
     // 分配结果buffer：存储每次迭代的cycles值
     uint8_t* result_buffer;
     size_t result_size = iterations * sizeof(int64_t) + sizeof(int64_t);
@@ -536,6 +544,15 @@ StatsResult test_mte_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     aclrtMemcpy(gva + rank * msg_size, msg_size, init_data, msg_size, ACL_MEMCPY_HOST_TO_DEVICE);
     DEBUG_LOG(rank, "Test data initialized: gva[%zu] = %ld", rank * msg_size / sizeof(int64_t), (long)(rank + 10));
     aclrtFreeHost(init_data);
+
+    // 初始化 flag 区为 0（位于 gva + 2*msg_size，共 16 字节）
+    // 防止上一轮测试的残留值误触发轮询退出
+    {
+        uint8_t zero_flags[16] = {};
+        aclrtMemcpy(gva + 2 * msg_size, sizeof(zero_flags),
+                    zero_flags, sizeof(zero_flags), ACL_MEMCPY_HOST_TO_DEVICE);
+        DEBUG_LOG(rank, "flag area at gva+2*msg_size initialized to 0");
+    }
 
     // 分配结果buffer
     uint8_t* result_buffer;
