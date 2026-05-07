@@ -100,7 +100,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -109,7 +109,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         } else {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -147,7 +147,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -162,7 +162,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         for (int64_t i = 0; i < iterations; i++) {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
@@ -246,7 +246,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
             *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
 
             *(__gm__ uint32_t*)(notify_addr) = expected_notify;
-            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, SHMEM_CMP_EQ, expected_ack);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, ACLSHMEM_CMP_EQ, expected_ack);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -254,7 +254,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
         peer = 0;
 
         if (core_idx == 0) {
-            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, SHMEM_CMP_EQ, expected_notify);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, ACLSHMEM_CMP_EQ, expected_notify);
             *(__gm__ uint32_t*)(ack_addr) = expected_ack;
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -331,7 +331,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -340,7 +340,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
         } else {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     timeout_detected = true;
                     break;
@@ -384,7 +384,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
 
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     *(__gm__ int64_t*)(result_addr + i * sizeof(int64_t)) = TIMEOUT_ERROR_CODE;
                     return;
@@ -399,7 +399,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_pingpong_
         for (int64_t i = 0; i < iterations; i++) {
             peer_seq++;
             int64_t wait_start = AscendC::GetSystemCycle();
-            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, SHMEM_CMP_EQ, peer_seq)) {
+            while (!aclshmem_uint32_test((__gm__ uint32_t*)peer_flag_addr, ACLSHMEM_CMP_EQ, peer_seq)) {
                 if (AscendC::GetSystemCycle() - wait_start > TIMEOUT_CYCLES) {
                     return;
                 }
@@ -479,7 +479,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
             *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
 
             *(__gm__ uint32_t*)(notify_addr) = expected_notify;
-            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, SHMEM_CMP_EQ, expected_ack);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)ack_addr, ACLSHMEM_CMP_EQ, expected_ack);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -487,7 +487,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bandwidth
         peer = 0;
 
         if (core_idx == 0) {
-            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, SHMEM_CMP_EQ, expected_notify);
+            aclshmem_uint32_wait_until((__gm__ uint32_t*)notify_addr, ACLSHMEM_CMP_EQ, expected_notify);
             *(__gm__ uint32_t*)(ack_addr) = expected_ack;
         }
         AscendC::PipeBarrier<PIPE_ALL>();
