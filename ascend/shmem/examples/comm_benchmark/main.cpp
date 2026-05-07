@@ -188,7 +188,7 @@ int init_shmem_environment(int rank, int world_size, uint64_t mem_size, EngineTy
                 break;
             case ACLSHMEM_SMEM_ERROR:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_SMEM_ERROR (-3) - Shared memory problem\n", rank);
-                fprintf(stderr, "[HINT][Rank %d] Check: disk space (need >10GB), memory limits, /dev/shmem permissions\n", rank);
+                fprintf(stderr, "[HINT][Rank %d] Check: memory limits, /dev/shmem permissions, NPU device status\n", rank);
                 break;
             case ACLSHMEM_INNER_ERROR:
                 fprintf(stderr, "[ERROR][Rank %d] Error: ACLSHMEM_INNER_ERROR (-4) - Internal error\n", rank);
@@ -1018,7 +1018,6 @@ int run_benchmark(int rank, int world_size) {
         fprintf(stderr, "[ERROR][Rank %d] No SHMEM engine initialization succeeded!\n", rank);
         if (rank == 0) {
             std::cout << "\n[FAILED] All SHMEM engines failed. Check:\n";
-            std::cout << "  - Disk space (need >10GB free for shm log)\n";
             std::cout << "  - NPU device availability\n";
             std::cout << "  - Peer process running on same node\n";
         }
