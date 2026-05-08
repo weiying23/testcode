@@ -120,8 +120,10 @@ void write_csv(const std::string& filename,
 }
 
 // ========== 性能数据解析 ==========
-PerfResult parse_perf_result(aclshmem_prof_pe_t *profs, size_t msg_size,
-                             int block_size, int iterations, int g_npus)
+// prev_profs: 上一次采样的快照（用于差分，消除设备端计数器跨迭代累积的影响）
+PerfResult parse_perf_result(aclshmem_prof_pe_t *profs,
+                             aclshmem_prof_pe_t *prev_profs,
+                             size_t msg_size, int block_size, int iterations)
 {
     PerfResult result;
     result.msg_size = msg_size;
@@ -135,18 +137,26 @@ PerfResult parse_perf_result(aclshmem_prof_pe_t *profs, size_t msg_size,
 
     for (int block_id = 0; block_id < actual_blocks; block_id++) {
         aclshmem_prof_block_t *prof = &profs->block_prof[block_id];
-        if (prof->ccount[0] == 0) continue;
+        aclshmem_prof_block_t *prev = &prev_profs->block_prof[block_id];
 
-        double avg_us = (double)prof->cycles[0] / prof->ccount[0] / cycle2us;
+        // 差分：只取本轮新增的 cycles 和 ccount
+        int64_t delta_ccount = prof->ccount[0] - prev->ccount[0];
+        int64_t delta_cycles = prof->cycles[0] - prev->cycles[0];
+
+        if (delta_ccount <= 0) continue;
+
+        // avg_us = 本轮所有迭代的平均单次耗时（us）
+        double avg_us = (double)delta_cycles / (double)delta_ccount / (double)cycle2us;
         if (avg_us > max_core_time) {
             max_core_time = avg_us;
         }
     }
 
+    // max_core_time 即最慢 block 的单次迭代平均耗时，直接作为延迟
     result.time_us = max_core_time;
-    result.latency_us = max_core_time / iterations;
+    result.latency_us = max_core_time;
 
-    // 计算带宽: 总数据量 / 时间
+    // 带宽：所有 block 并行传输，总数据量 / 单次迭代时间
     if (max_core_time > 0) {
         double total_bytes = (double)msg_size * (double)block_size;
         result.bandwidth_gbs = total_bytes / max_core_time * 1000000.0 / 1024.0 / 1024.0 / 1024.0;
@@ -242,6 +252,8 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
 
     std::vector<size_t> msg_sizes = get_msg_sizes();
 
+    // baseline_snapshot 在每轮循环内单独声明，此处无需全局状态
+
     for (size_t msg_size : msg_sizes) {
         int iterations = get_iterations(msg_size);
         int warmup = get_warmup_iterations(msg_size);
@@ -268,34 +280,42 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
         aclrtMemcpy(src_ptr, alloc_size, src_data.data(), alloc_size, ACL_MEMCPY_HOST_TO_DEVICE);
         aclrtMemcpy(dst_ptr, alloc_size, dst_data.data(), alloc_size, ACL_MEMCPY_HOST_TO_DEVICE);
 
+        // 内核执行前先取一次快照作为本轮基线
+        aclshmem_prof_pe_t baseline_snapshot;
+        std::memset(&baseline_snapshot, 0, sizeof(baseline_snapshot));
+        aclshmemx_show_prof(&out_profs, false);
+        if (out_profs != nullptr) {
+            std::memcpy(&baseline_snapshot, out_profs, sizeof(aclshmem_prof_pe_t));
+        }
+
         // 屏障同步
         aclshmem_barrier_all();
 
-        // 执行Kernel
+        // 执行Kernel - prof_pe固定为0，只有PE0执行性能测试
         if (config.engine == EngineType::SDMA_INTER_CARD) {
             launch_sdma_bench_kernel(config.block_size, stream,
                                      (uint8_t *)dst_ptr, (uint8_t *)src_ptr,
                                      elements, peer_pe, config.ub_size_kb,
                                      iterations, warmup,
                                      static_cast<int>(config.mode),
-                                     static_cast<int>(config.dtype), pe_id);
+                                     static_cast<int>(config.dtype), 0);
         } else {
             launch_mte_bench_kernel(config.block_size, stream,
                                     (uint8_t *)dst_ptr, (uint8_t *)src_ptr,
                                     elements, peer_pe, config.ub_size_kb,
                                     iterations, warmup,
                                     static_cast<int>(config.mode),
-                                    static_cast<int>(config.dtype), pe_id);
+                                    static_cast<int>(config.dtype), 0);
         }
 
         aclrtSynchronizeStream(stream);
 
-        // 收集性能数据
+        // 收集性能数据（内核执行后快照）
         aclshmemx_show_prof(&out_profs, false);
 
         if (out_profs != nullptr) {
-            PerfResult result = parse_perf_result(out_profs, msg_size,
-                                                  config.block_size, iterations, config.g_npus);
+            PerfResult result = parse_perf_result(out_profs, &baseline_snapshot,
+                                                  msg_size, config.block_size, iterations);
             results.push_back(result);
 
             std::cout << "MsgSize: " << msg_size << " B"
