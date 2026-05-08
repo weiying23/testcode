@@ -87,12 +87,12 @@
 extern void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
                                           uint64_t ffts_config, uint8_t* gva,
                                           int64_t msg_size, int64_t iterations,
-                                          int64_t warmup, uint8_t* result_buffer);
+                                          int64_t warmup, uint8_t* result_buffer, int64_t use_roce);
 
 extern void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
                                    uint64_t ffts_config, uint8_t* gva,
                                    int64_t msg_size, int64_t iterations,
-                                   uint8_t* result_buffer, int64_t round_id);
+                                   uint8_t* result_buffer, int64_t round_id, int64_t use_roce);
 
 extern void launch_mte_pingpong_latency(uint32_t block_dim, void* stream,
                                          uint64_t ffts_config, uint8_t* gva,
@@ -280,7 +280,7 @@ void finalize_acl_environment(int rank) {
  */
 StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
                                          uint8_t* gva, size_t msg_size,
-                                         int iterations, int warmup) {
+                                         int iterations, int warmup, int use_roce) {
     int rank = aclshmem_my_pe();
     DEBUG_LOG(rank, "=== test_rdma_pingpong_latency START ===");
     DEBUG_LOG(rank, "msg_size=%zu bytes (%zu KB), iterations=%d, warmup=%d",
@@ -342,7 +342,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
     // launch_rdma_pingpong_latency: 启动RDMA PingPong延迟测试Kernel
     DEBUG_LOG(rank, "launching rdma_pingpong_latency kernel...");
     launch_rdma_pingpong_latency(1, stream, ffts_config, gva,
-                                  msg_size, iterations, warmup, result_buffer);
+                                  msg_size, iterations, warmup, result_buffer, (int64_t)use_roce);
     DEBUG_LOG(rank, "kernel launched, waiting for synchronization...");
 
     TIMESTAMP(rank, "KERNEL_LAUNCH_END");
@@ -462,7 +462,7 @@ StatsResult test_rdma_pingpong_latency(aclrtStream stream, uint64_t ffts_config,
  */
 StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
                                  uint8_t* gva, size_t msg_size, int iterations,
-                                 int warmup_rounds, int test_rounds) {
+                                 int warmup_rounds, int test_rounds, int use_roce) {
     int rank = aclshmem_my_pe();
     DEBUG_LOG(rank, "=== test_rdma_bandwidth START ===");
     DEBUG_LOG(rank, "msg_size=%zu bytes, iterations=%d, warmup_rounds=%d, test_rounds=%d",
@@ -496,7 +496,7 @@ StatsResult test_rdma_bandwidth(aclrtStream stream, uint64_t ffts_config,
         }
 
         // launch_rdma_bandwidth: 启动RDMA带宽测试Kernel
-        launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer, (int64_t)round);
+        launch_rdma_bandwidth(1, stream, ffts_config, gva, msg_size, iterations, result_buffer, (int64_t)round, (int64_t)use_roce);
 
         ret = aclrtSynchronizeStream(stream);
         if (ret != ACL_SUCCESS) {
@@ -988,18 +988,15 @@ int run_benchmark(int rank, int world_size) {
 
             StatsResult result;
             if (engine == EngineType::RDMA) {
-                // test_rdma_pingpong_latency: 执行RDMA pingpong延迟测试
                 result = test_rdma_pingpong_latency(stream, ffts_config, gva,
-                                                     msg_size, iterations, warmup);
+                                                     msg_size, iterations, warmup, 1);
             } else if (engine == EngineType::MTE) {
-                // test_mte_pingpong_latency: 执行MTE pingpong延迟测试
                 result = test_mte_pingpong_latency(stream, ffts_config, gva,
                                                     msg_size, iterations, warmup);
             } else if (engine == EngineType::SDMA) {
-                // SDMA 使用 generic put（aclshmem_uint8_put_nbi）内核，
-                // shmem 运行时根据初始化时设置的 ACLSHMEM_DATA_OP_SDMA 自动路由到 SDMA 硬件
+                // SDMA 复用 rdma kernel，但 use_roce=0（跳过 roce_quiet，改用 PipeBarrier）
                 result = test_rdma_pingpong_latency(stream, ffts_config, gva,
-                                                     msg_size, iterations, warmup);
+                                                     msg_size, iterations, warmup, 0);
             }
 
             // 仅 Rank 0 打印结果
@@ -1043,18 +1040,15 @@ int run_benchmark(int rank, int world_size) {
 
             StatsResult result;
             if (engine == EngineType::RDMA) {
-                // test_rdma_bandwidth: 执行RDMA带宽测试
                 result = test_rdma_bandwidth(stream, ffts_config, gva, msg_size,
-                                              iterations, warmup_rounds, test_rounds);
+                                              iterations, warmup_rounds, test_rounds, 1);
             } else if (engine == EngineType::MTE) {
-                // test_mte_bandwidth: 执行MTE带宽测试
                 result = test_mte_bandwidth(stream, ffts_config, gva, msg_size,
                                              iterations, warmup_rounds, test_rounds);
             } else if (engine == EngineType::SDMA) {
-                // SDMA 使用 generic put（aclshmem_uint8_put_nbi）内核，
-                // shmem 运行时根据初始化时设置的 ACLSHMEM_DATA_OP_SDMA 自动路由到 SDMA 硬件
+                // SDMA 复用 rdma kernel，use_roce=0
                 result = test_rdma_bandwidth(stream, ffts_config, gva, msg_size,
-                                              iterations, warmup_rounds, test_rounds);
+                                              iterations, warmup_rounds, test_rounds, 0);
             }
 
             // 仅 Rank 0 打印结果

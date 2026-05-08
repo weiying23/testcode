@@ -44,6 +44,17 @@ constexpr int64_t TIMEOUT_CYCLES = 10000000000LL;  // 10 seconds timeout
 // 超时检测结果码
 constexpr int64_t TIMEOUT_ERROR_CODE = -1;  // 超时错误标记
 
+// put 完成确认：RDMA 需要 roce_quiet 等待 RoCE CQ；SDMA 只需 PipeBarrier
+// 若 use_roce==0（SDMA 模式）跳过 roce_quiet，避免 RoCE 未初始化导致死锁
+#define PUT_QUIET(peer, ub, use_roce) \
+    do { \
+        if (use_roce) { \
+            aclshmemx_roce_quiet((peer), (__ubuf__ uint8_t*)(ub), 0); \
+        } else { \
+            AscendC::PipeBarrier<PIPE_ALL>(); \
+        } \
+    } while (0)
+
 // ========== RDMA PingPong延迟测试Kernel ==========
 //
 // 内存布局（与参考实现 rdma_perftest_kernel.cpp 一致）：
@@ -63,7 +74,8 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
     int64_t msg_size,
     int64_t iterations,
     int64_t warmup,
-    GM_ADDR result_buffer) {
+    GM_ADDR result_buffer,
+    int64_t use_roce) {
 
     util_set_ffts_config(ffts_config);
     if (AscendC::GetSubBlockIdx() != 0) return;
@@ -96,7 +108,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
         if (rank == 0) {
             *(__gm__ uint32_t*)my_flag_addr = my_seq;
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
             while (*(__gm__ uint32_t*)peer_flag_addr != peer_seq) {
                 dcci_cachelines(peer_flag_addr, 8);
                 AscendC::GetSystemCycle();
@@ -111,7 +123,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
             AscendC::PipeBarrier<PIPE_ALL>();
             *(__gm__ uint32_t*)my_flag_addr = my_seq;
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
             my_seq++;
             peer_seq++;
         }
@@ -125,7 +137,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
             *(__gm__ uint32_t*)my_flag_addr = my_seq;
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
 
             int64_t wait_start = AscendC::GetSystemCycle();
             while (*(__gm__ uint32_t*)peer_flag_addr != peer_seq) {
@@ -157,7 +169,7 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_pingpong
 
             *(__gm__ uint32_t*)my_flag_addr = my_seq;
             aclshmem_uint8_put_nbi(src_addr, src_addr, msg_size, peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
             my_seq++;
             peer_seq++;
             AscendC::PipeBarrier<PIPE_ALL>();
@@ -184,7 +196,8 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
     int64_t iterations,
     int64_t block_dim,
     GM_ADDR result_buffer,
-    int64_t round_id) {
+    int64_t round_id,
+    int64_t use_roce) {
 
     util_set_ffts_config(ffts_config);
 
@@ -225,15 +238,13 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
         AscendC::SyncAll();
 
         if (core_idx == 0) {
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
             int64_t end_cycle = AscendC::GetSystemCycle();
             *(__gm__ int64_t*)(result_addr) = end_cycle - start_cycle;
 
-            // PUT notify 到 Rank 1 的本地内存（src_addr 首 4 字节已由 host 写为 notify_val）
             aclshmem_uint8_put_nbi(notify_addr, src_addr, sizeof(uint32_t), peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
 
-            // 等待 Rank 1 PUT 回来的 ack（轮询本地 ack_addr）
             while (*(__gm__ uint32_t*)ack_addr != ack_val) {
                 dcci_cachelines(ack_addr, 8);
                 AscendC::GetSystemCycle();
@@ -245,16 +256,14 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
         peer = 0;
 
         if (core_idx == 0) {
-            // 等待 Rank 0 PUT 来的 notify（轮询本地 notify_addr）
             while (*(__gm__ uint32_t*)notify_addr != notify_val) {
                 dcci_cachelines(notify_addr, 8);
                 AscendC::GetSystemCycle();
             }
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            // PUT ack 回 Rank 0（src_addr 首 4 字节已由 host 写为 ack_val）
             aclshmem_uint8_put_nbi(ack_addr, src_addr, sizeof(uint32_t), peer);
-            aclshmemx_roce_quiet(peer, (__ubuf__ uint8_t*)ubLocal.GetPhyAddr(), 0);
+            PUT_QUIET(peer, ubLocal.GetPhyAddr(), use_roce);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -263,9 +272,9 @@ extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void rdma_bandwidt
 void launch_rdma_bandwidth(uint32_t block_dim, void* stream,
                             uint64_t ffts_config, uint8_t* gva,
                             int64_t msg_size, int64_t iterations,
-                            uint8_t* result_buffer, int64_t round_id) {
+                            uint8_t* result_buffer, int64_t round_id, int64_t use_roce) {
     rdma_bandwidth_kernel<<<block_dim, nullptr, stream>>>(
-        ffts_config, gva, msg_size, iterations, block_dim, result_buffer, round_id);
+        ffts_config, gva, msg_size, iterations, block_dim, result_buffer, round_id, use_roce);
 }
 
 // ========== MTE PingPong延迟测试Kernel ==========
@@ -492,9 +501,9 @@ void launch_mte_bandwidth(uint32_t block_dim, void* stream,
 void launch_rdma_pingpong_latency(uint32_t block_dim, void* stream,
                                    uint64_t ffts_config, uint8_t* gva,
                                    int64_t msg_size, int64_t iterations,
-                                   int64_t warmup, uint8_t* result_buffer) {
+                                   int64_t warmup, uint8_t* result_buffer, int64_t use_roce) {
     rdma_pingpong_latency_kernel<<<1, nullptr, stream>>>(
-        ffts_config, gva, msg_size, iterations, warmup, result_buffer);
+        ffts_config, gva, msg_size, iterations, warmup, result_buffer, use_roce);
 }
 
 void launch_mte_pingpong_latency(uint32_t block_dim, void* stream,
