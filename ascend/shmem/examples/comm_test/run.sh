@@ -25,6 +25,6 @@ sleep 1
 
 echo "Testing NPU ${NPU0} <-> NPU ${NPU1}"
 
-$BIN 2 0 $PORT $NPU0 &
-$BIN 2 1 $PORT $NPU1 &
+$BIN 2 0 $PORT $NPU0 $NPU1 &
+$BIN 2 1 $PORT $NPU1 $NPU0 &
 wait

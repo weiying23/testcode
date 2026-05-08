@@ -156,20 +156,32 @@ static void sweep(const char *name, bool use_sdma,
 
 int main(int argc, char *argv[])
 {
-    if (argc < 5) {
+    if (argc < 6) {
         std::cerr << "Usage: " << argv[0]
-                  << " <n_pes> <pe_id> <ipport> <device_id>\n";
+                  << " <n_pes> <pe_id> <ipport> <device_id> <peer_device_id>\n";
         return 1;
     }
 
-    int         n_pes     = std::atoi(argv[1]);
-    int         pe        = std::atoi(argv[2]);
-    const char *ipport    = argv[3];
-    int         device_id = std::atoi(argv[4]);
-    uint32_t    block_dim = 32;
+    int         n_pes        = std::atoi(argv[1]);
+    int         pe           = std::atoi(argv[2]);
+    const char *ipport       = argv[3];
+    int         device_id    = std::atoi(argv[4]);
+    int         peer_device  = std::atoi(argv[5]);
+    uint32_t    block_dim    = 32;
 
     aclInit(nullptr);
     aclrtSetDevice(device_id);
+
+    int can_access = 0;
+    aclrtDeviceCanAccessPeer(&can_access, device_id, peer_device);
+    std::cout << "[P2P] device " << device_id << " -> " << peer_device
+              << ": can_access=" << can_access;
+    if (can_access) {
+        aclError p2p_err = aclrtDeviceEnablePeerAccess(peer_device, 0);
+        std::cout << ", EnablePeerAccess=" << p2p_err;
+    }
+    std::cout << "\n";
+    std::cout.flush();
 
     void *stream = nullptr;
     aclrtCreateStream(&stream);
