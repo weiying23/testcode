@@ -85,6 +85,38 @@ static void print_row(size_t msg_size, int iters, double time_us, double bw)
     std::cout.flush();
 }
 
+static void verify(const char *engine_name, bool use_sdma,
+                   int pe, uint8_t *gva, void *stream, uint32_t block_dim)
+{
+    const size_t verify_sz = 65536;
+    size_t aligned = (verify_sz / block_dim) * block_dim;
+
+    uint8_t fill_val = (pe == 0) ? 0xAA : 0x55;
+    aclrtMemset(gva, verify_sz, (int32_t)fill_val, verify_sz);
+    aclshmem_barrier_all();
+
+    if (use_sdma)
+        launch_sdma_bw(block_dim, stream, gva, (int64_t)aligned, 1);
+    else
+        launch_mte_bw(block_dim, stream, gva, (int64_t)aligned, 1);
+    aclrtSynchronizeStream(stream);
+
+    if (pe == 1) {
+        std::vector<uint8_t> host_buf(aligned, 0);
+        aclrtMemcpy(host_buf.data(), aligned, gva, aligned, ACL_MEMCPY_DEVICE_TO_HOST);
+        bool pass = true;
+        for (size_t i = 0; i < aligned; i++) {
+            if (host_buf[i] != 0xAA) { pass = false; break; }
+        }
+        std::cout << "[verify][" << engine_name << "] "
+                  << (pass ? "PASS — PE1.gva == 0xAA (data transferred)"
+                           : "FAIL — PE1.gva != 0xAA (data NOT transferred)")
+                  << "\n";
+        std::cout.flush();
+    }
+    aclshmem_barrier_all();
+}
+
 static void sweep(const char *name, bool use_sdma,
                   int pe, uint8_t *gva, void *stream, uint32_t block_dim)
 {
@@ -162,7 +194,9 @@ int main(int argc, char *argv[])
     aclshmem_barrier_all();
 
     // run both engines back-to-back in the same shmem session
+    verify("MTE",  false, pe, gva, stream, block_dim);
     sweep("MTE  (aclshmemx_mte_put_nbi)",  false, pe, gva, stream, block_dim);
+    verify("SDMA", true,  pe, gva, stream, block_dim);
     sweep("SDMA (aclshmemx_sdma_put_nbi)", true,  pe, gva, stream, block_dim);
 
     aclshmem_free(gva);
