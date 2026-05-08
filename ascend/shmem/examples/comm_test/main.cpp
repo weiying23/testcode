@@ -33,7 +33,6 @@ const char *ipport = "tcp://127.0.0.1:8898";
 int f_pe = 0;
 int f_npu = 0;
 int device_id_override = -1;  // 直接指定device ID，-1表示使用自动计算
-aclshmemx_uniqueid_t default_flag_uid;
 
 // ========== 外部Kernel启动函数 ==========
 extern "C" void launch_mte_bench_kernel(uint32_t block_dim, void *stream,
@@ -50,29 +49,33 @@ extern "C" void launch_sdma_bench_kernel(uint32_t block_dim, void *stream,
 static aclshmem_prof_pe_t *out_profs = nullptr;
 
 // ========== 辅助函数 ==========
+static char g_ipport[ACLSHMEM_MAX_IP_PORT_LEN] = {0};
+static aclshmemx_uniqueid_t g_uid = {0};
+
 int32_t test_set_attr(int32_t my_pe, int32_t n_pes, uint64_t local_mem_size,
-                      const char *ip_port, aclshmemx_uniqueid_t uid,
-                      aclshmemx_init_attr_t *attributes)
+                      const char *ip_port, aclshmemx_init_attr_t *attributes)
 {
     size_t ip_len = 0;
     if (ip_port != nullptr) {
         ip_len = std::min(strlen(ip_port), static_cast<size_t>(ACLSHMEM_MAX_IP_PORT_LEN) - 1);
+        std::copy_n(ip_port, ip_len, g_ipport);
         std::copy_n(ip_port, ip_len, attributes->ip_port);
-        if (attributes->ip_port[0] == '\0') {
-            return ACLSHMEM_INVALID_VALUE;
-        }
+        g_ipport[ip_len] = '\0';
+        attributes->ip_port[ip_len] = '\0';
     }
+
     int attr_version = (1 << 16) + sizeof(aclshmemx_init_attr_t);
     attributes->my_pe = my_pe;
     attributes->n_pes = n_pes;
-    attributes->ip_port[ip_len] = '\0';
     attributes->local_mem_size = local_mem_size;
     attributes->option_attr = {attr_version, ACLSHMEM_DATA_OP_MTE, DEFAULT_TIMEOUT,
                                DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
-    attributes->comm_args = reinterpret_cast<void *>(&uid);
-    aclshmemx_uniqueid_t *uid_args = (aclshmemx_uniqueid_t *)(attributes->comm_args);
-    uid_args->my_pe = my_pe;
-    uid_args->n_pes = n_pes;
+
+    // 使用全局变量 g_uid
+    attributes->comm_args = reinterpret_cast<void *>(&g_uid);
+    g_uid.my_pe = my_pe;
+    g_uid.n_pes = n_pes;
+
     return ACLSHMEM_SUCCESS;
 }
 
@@ -218,8 +221,7 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
     // ========== SHMEM初始化 ==========
     uint64_t local_mem_size = 1024UL * 1024UL * 1024 * 4;  // 4GB
     aclshmemx_init_attr_t attributes;
-    test_set_attr(pe_id, n_pes, local_mem_size, config.ipport.c_str(),
-                  default_flag_uid, &attributes);
+    test_set_attr(pe_id, n_pes, local_mem_size, config.ipport.c_str(), &attributes);
 
     // 根据引擎类型设置数据操作引擎
     if (config.engine == EngineType::SDMA_INTER_CARD) {
