@@ -6,7 +6,7 @@
  * Args:  <n_pes> <pe_id> <ipport> <device_id>
  * Only Rank 0 prints results.
  */
-
+#include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
