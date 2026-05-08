@@ -302,6 +302,12 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
             PerfResult result = parse_perf_result(out_profs, msg_size,
                                                   config.block_size, iterations, config.g_npus);
             results.push_back(result);
+
+            // 直接打印到屏幕
+            std::cout << "MsgSize: " << msg_size << " B"
+                      << ", Bandwidth: " << result.bandwidth_gbs << " GB/s"
+                      << ", Latency: " << result.latency_us << " us"
+                      << std::endl;
         }
 
         aclshmemx_show_prof(nullptr, true);  // 清空
