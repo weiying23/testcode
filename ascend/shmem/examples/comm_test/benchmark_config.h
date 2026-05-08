@@ -108,17 +108,14 @@ inline std::vector<size_t> get_msg_sizes() {
 
 // ========== 迭代次数配置 ==========
 inline int get_iterations(size_t msg_size) {
-    if (msg_size <= 256) return 10000;
-    else if (msg_size <= 64 * 1024) return 1000;
-    else if (msg_size <= 4 * 1024 * 1024) return 500;
+    if (msg_size <= 256) return 1000;
+    else if (msg_size <= 64 * 1024) return 500;
+    else if (msg_size <= 4 * 1024 * 1024) return 200;
     else return 100;
 }
 
 inline int get_warmup_iterations(size_t msg_size) {
-    int total = get_iterations(msg_size);
-    if (total >= 10000) return 100;
-    if (total >= 1000) return 50;
-    return 10;
+    return 20;
 }
 
 // ========== 测试配置结构 ==========

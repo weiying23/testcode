@@ -23,9 +23,15 @@ using namespace engine_bench;
 template <typename T>
 __aicore__ inline void mte_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
                                            int elements, int peer_pe,
-                                           int ub_size_kb, int loop_count, int warmup)
+                                           int ub_size_kb, int loop_count, int warmup, int64_t prof_pe)
 {
     int64_t pe = aclshmem_my_pe();
+
+    // PUT是单边操作，只有prof_pe执行测试，其他PE等待
+    if (pe != prof_pe) {
+        aclshmemx_barrier_all_vec();
+        return;
+    }
 
     __gm__ T *dst_gm = (__gm__ T *)dst_gva;
     __gm__ T *src_gm = (__gm__ T *)src_gva;
@@ -41,27 +47,21 @@ __aicore__ inline void mte_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
     }
 
     int ub_size_bytes = ub_size_kb * 1024;
-
-    // 使用UB地址0作为临时缓冲区
     __ubuf__ T *ub_buf = reinterpret_cast<__ubuf__ T *>(0);
 
     AscendC::PipeBarrier<PIPE_ALL>();
 
-    // 性能测试循环
     for (int i = 0; i < (warmup + loop_count); ++i) {
         if (i >= warmup) {
             SHMEMI_PROF_START(0);
         }
 
-        // 同步开始
         AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
 
-        // MTE Put: 发送数据到peer_pe
         aclshmemx_mte_put_nbi(dst_gm + offset, src_gm + offset,
                               ub_buf, ub_size_bytes, block_elements, peer_pe, 0);
 
-        // 等待完成
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(0);
 
@@ -77,9 +77,15 @@ __aicore__ inline void mte_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
 template <typename T>
 __aicore__ inline void mte_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
                                            int elements, int peer_pe,
-                                           int ub_size_kb, int loop_count, int warmup)
+                                           int ub_size_kb, int loop_count, int warmup, int64_t prof_pe)
 {
     int64_t pe = aclshmem_my_pe();
+
+    // GET是单边操作，只有prof_pe执行测试
+    if (pe != prof_pe) {
+        aclshmemx_barrier_all_vec();
+        return;
+    }
 
     __gm__ T *dst_gm = (__gm__ T *)dst_gva;
     __gm__ T *src_gm = (__gm__ T *)src_gva;
@@ -107,7 +113,6 @@ __aicore__ inline void mte_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
         AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
 
-        // MTE Get: 从peer_pe拉取数据
         aclshmemx_mte_get_nbi(dst_gm + offset, src_gm + offset,
                               ub_buf, ub_size_bytes, block_elements, peer_pe, 0);
 
@@ -126,16 +131,19 @@ __aicore__ inline void mte_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
 template <typename T>
 __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
                                             int elements, int peer_pe,
-                                            int ub_size_kb, int loop_count, int warmup)
+                                            int ub_size_kb, int loop_count, int warmup, int64_t prof_pe)
 {
     int64_t pe = aclshmem_my_pe();
-    int64_t n_pes = aclshmem_n_pes();
 
-    // SDMA使用字节指针，统一模板参数为uint8_t
+    // PUT是单边操作，只有prof_pe执行测试
+    if (pe != prof_pe) {
+        aclshmemx_barrier_all_vec();
+        return;
+    }
+
     __gm__ uint8_t *dst_gm = (__gm__ uint8_t *)dst_gva;
     __gm__ uint8_t *src_gm = (__gm__ uint8_t *)src_gva;
 
-    // SDMA数据分布（按字节计算）
     const auto cur_block_idx = AscendC::GetBlockIdx();
     const auto comm_block_dim = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
     uint64_t total_bytes = elements * sizeof(T);
@@ -155,7 +163,6 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
         return;
     }
 
-    // SDMA需要的UB缓冲区（使用uint8_t字节指针）
     constexpr uint32_t ub_offset = 1024;
     __ubuf__ uint8_t *tmp_buff = reinterpret_cast<__ubuf__ uint8_t *>(ub_offset);
 
@@ -166,7 +173,6 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
             SHMEMI_PROF_START(0);
         }
 
-        // SDMA Put: 直接发送数据到目标PE（所有参数使用uint8_t类型）
         aclshmemx_sdma_put_nbi(dst_gm + data_offset, src_gm + data_offset,
                                tmp_buff, ub_size_kb * 1024,
                                base_per_core, peer_pe, EVENT_ID0);
@@ -176,7 +182,6 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
         }
     }
 
-    // 等待所有SDMA操作完成
     aclshmemx_sdma_quiet(tmp_buff, ub_size_kb * 1024, EVENT_ID0);
 
     aclshmemx_barrier_all_vec();
@@ -186,16 +191,19 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
 template <typename T>
 __aicore__ inline void sdma_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
                                             int elements, int peer_pe,
-                                            int ub_size_kb, int loop_count, int warmup)
+                                            int ub_size_kb, int loop_count, int warmup, int64_t prof_pe)
 {
     int64_t pe = aclshmem_my_pe();
-    int64_t n_pes = aclshmem_n_pes();
 
-    // SDMA使用字节指针，统一模板参数为uint8_t
+    // GET是单边操作，只有prof_pe执行测试
+    if (pe != prof_pe) {
+        aclshmemx_barrier_all_vec();
+        return;
+    }
+
     __gm__ uint8_t *dst_gm = (__gm__ uint8_t *)dst_gva;
     __gm__ uint8_t *src_gm = (__gm__ uint8_t *)src_gva;
 
-    // SDMA数据分布（按字节计算）
     const auto cur_block_idx = AscendC::GetBlockIdx();
     const auto comm_block_dim = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
     uint64_t total_bytes = elements * sizeof(T);
@@ -225,7 +233,6 @@ __aicore__ inline void sdma_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
             SHMEMI_PROF_START(0);
         }
 
-        // SDMA Get: 从目标PE拉取数据（所有参数使用uint8_t类型）
         aclshmemx_sdma_get_nbi(dst_gm + data_offset, src_gm + data_offset,
                                tmp_buff, ub_size_kb * 1024,
                                base_per_core, peer_pe, EVENT_ID0);
@@ -243,26 +250,26 @@ __aicore__ inline void sdma_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
 // ========== Kernel定义宏 ==========
 #define DEFINE_MTE_KERNEL_FOR_TYPE(type_name, cpp_type) \
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bench_##type_name##_put( \
-    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup) \
+    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup, int64_t prof_pe) \
 { \
-    mte_bench_put_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup); \
+    mte_bench_put_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe); \
 } \
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void mte_bench_##type_name##_get( \
-    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup) \
+    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup, int64_t prof_pe) \
 { \
-    mte_bench_get_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup); \
+    mte_bench_get_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe); \
 }
 
 #define DEFINE_SDMA_KERNEL_FOR_TYPE(type_name, cpp_type) \
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void sdma_bench_##type_name##_put( \
-    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup) \
+    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup, int64_t prof_pe) \
 { \
-    sdma_bench_put_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup); \
+    sdma_bench_put_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe); \
 } \
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__ void sdma_bench_##type_name##_get( \
-    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup) \
+    GM_ADDR dst_gva, GM_ADDR src_gva, int elements, int peer_pe, int ub_size_kb, int loop_count, int warmup, int64_t prof_pe) \
 { \
-    sdma_bench_get_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup); \
+    sdma_bench_get_impl<cpp_type>(dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe); \
 }
 
 // 定义所有类型的Kernel
@@ -275,13 +282,13 @@ DEFINE_SDMA_KERNEL_FOR_TYPE(int32, int32_t)
 DEFINE_SDMA_KERNEL_FOR_TYPE(int64, int64_t)
 
 // ========== Host端Kernel启动函数 ==========
-#define DISPATCH_KERNEL(engine, type_name, mode, block_dim, stream, dst, src, elems, peer, ub_kb, loops, warmup) \
-    engine##_bench_##type_name##_##mode<<<block_dim, nullptr, stream>>>(dst, src, elems, peer, ub_kb, loops, warmup)
+#define DISPATCH_KERNEL(engine, type_name, mode, block_dim, stream, dst, src, elems, peer, ub_kb, loops, warmup, prof_pe) \
+    engine##_bench_##type_name##_##mode<<<block_dim, nullptr, stream>>>(dst, src, elems, peer, ub_kb, loops, warmup, prof_pe)
 
 extern "C" void launch_mte_bench_kernel(uint32_t block_dim, void *stream,
                                         uint8_t *dst_gva, uint8_t *src_gva,
                                         int elements, int peer_pe, int ub_size_kb,
-                                        int loop_count, int warmup, int mode, int dtype)
+                                        int loop_count, int warmup, int mode, int dtype, int64_t prof_pe)
 {
     TestMode test_mode = static_cast<TestMode>(mode);
     DataType data_type = static_cast<DataType>(dtype);
@@ -289,27 +296,27 @@ extern "C" void launch_mte_bench_kernel(uint32_t block_dim, void *stream,
     switch (data_type) {
         case DataType::FLOAT:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(mte, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(mte, float, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, float, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         case DataType::INT32:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(mte, int32, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, int32, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(mte, int32, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, int32, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         case DataType::INT64:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(mte, int64, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, int64, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(mte, int64, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(mte, int64, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         default:
-            DISPATCH_KERNEL(mte, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+            DISPATCH_KERNEL(mte, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             break;
     }
 }
@@ -317,7 +324,7 @@ extern "C" void launch_mte_bench_kernel(uint32_t block_dim, void *stream,
 extern "C" void launch_sdma_bench_kernel(uint32_t block_dim, void *stream,
                                          uint8_t *dst_gva, uint8_t *src_gva,
                                          int elements, int peer_pe, int ub_size_kb,
-                                         int loop_count, int warmup, int mode, int dtype)
+                                         int loop_count, int warmup, int mode, int dtype, int64_t prof_pe)
 {
     TestMode test_mode = static_cast<TestMode>(mode);
     DataType data_type = static_cast<DataType>(dtype);
@@ -325,27 +332,27 @@ extern "C" void launch_sdma_bench_kernel(uint32_t block_dim, void *stream,
     switch (data_type) {
         case DataType::FLOAT:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(sdma, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(sdma, float, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, float, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         case DataType::INT32:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(sdma, int32, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, int32, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(sdma, int32, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, int32, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         case DataType::INT64:
             if (test_mode == TestMode::PUT || test_mode == TestMode::BI_PUT) {
-                DISPATCH_KERNEL(sdma, int64, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, int64, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             } else {
-                DISPATCH_KERNEL(sdma, int64, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+                DISPATCH_KERNEL(sdma, int64, get, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             }
             break;
         default:
-            DISPATCH_KERNEL(sdma, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup);
+            DISPATCH_KERNEL(sdma, float, put, block_dim, stream, dst_gva, src_gva, elements, peer_pe, ub_size_kb, loop_count, warmup, prof_pe);
             break;
     }
 }

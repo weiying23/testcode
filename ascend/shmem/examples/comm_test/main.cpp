@@ -38,12 +38,12 @@ int device_id_override = -1;  // 直接指定device ID，-1表示使用自动计
 extern "C" void launch_mte_bench_kernel(uint32_t block_dim, void *stream,
                                         uint8_t *dst_gva, uint8_t *src_gva,
                                         int elements, int peer_pe, int ub_size_kb,
-                                        int loop_count, int warmup, int mode, int dtype);
+                                        int loop_count, int warmup, int mode, int dtype, int64_t prof_pe);
 
 extern "C" void launch_sdma_bench_kernel(uint32_t block_dim, void *stream,
                                          uint8_t *dst_gva, uint8_t *src_gva,
                                          int elements, int peer_pe, int ub_size_kb,
-                                         int loop_count, int warmup, int mode, int dtype);
+                                         int loop_count, int warmup, int mode, int dtype, int64_t prof_pe);
 
 // ========== 性能结果存储 ==========
 static aclshmem_prof_pe_t *out_profs = nullptr;
@@ -278,14 +278,14 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
                                      elements, peer_pe, config.ub_size_kb,
                                      iterations, warmup,
                                      static_cast<int>(config.mode),
-                                     static_cast<int>(config.dtype));
+                                     static_cast<int>(config.dtype), pe_id);
         } else {
             launch_mte_bench_kernel(config.block_size, stream,
                                     (uint8_t *)dst_ptr, (uint8_t *)src_ptr,
                                     elements, peer_pe, config.ub_size_kb,
                                     iterations, warmup,
                                     static_cast<int>(config.mode),
-                                    static_cast<int>(config.dtype));
+                                    static_cast<int>(config.dtype), pe_id);
         }
 
         aclrtSynchronizeStream(stream);
