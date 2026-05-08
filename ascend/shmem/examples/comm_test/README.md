@@ -1,13 +1,44 @@
-# comm_test - MTE/SDMA卡间通信性能对比测试
+# comm_test - MTE vs SDMA 跨卡带宽对比测试
 
-## 测试内容
+## 测试目的
 
-对比两种通信引擎在同节点内不同NPU之间传输数据的性能：
+对比 MTE 和 SDMA 两种通信引擎在同节点内不同 NPU 之间传输数据的带宽性能。
 
-| 引擎 | 数据路径 | 特点 |
-|------|---------|------|
-| **MTE** | GM → UB → GM | 需要UB缓冲区中转，适合大数据传输 |
-| **SDMA** | GM → GM 直接 | 无需UB中转，延迟更低 |
+## 两种引擎的区别
+
+| 引擎 | 数据传输路径 | 特点 | 适用场景 |
+|------|-------------|------|---------|
+| **MTE** (Memory Transfer Engine) | GM → UB → GM | 数据经过 UB 缓冲区中转 | 大数据传输 |
+| **SDMA** (System DMA) | GM → GM 直接 | 不经过 UB，延迟更低 | 中小数据传输 |
+
+- **GM** (Global Memory): NPU 的全局内存（HBM）
+- **UB** (Unified Buffer): AI Core 内部的统一缓冲区
+
+## 测试方法
+
+### 带宽测试流程
+
+```
+Rank 0 (发送方)                      Rank 1 (接收方)
+    │                                    │
+    ├─ aclshmem_malloc ──────────────────┤  分配对称内存
+    │                                    │
+    ├─ warmup (20 iterations) ───────────┤  预热
+    │                                    │
+    ├─ 记录开始时间 t0                    │
+    ├─ PUT (N iterations) ──────────────►│  循环发送数据
+    ├─ 等待 DMA 完成                     │
+    ├─ 记录结束时间 t1                    │
+    │                                    │
+    ├─ 计算 BW = msg_size / (t1-t0)      │
+    └ barrier_all ───────────────────────┤  同步结束
+```
+
+### 测试参数
+
+- **消息大小**: 4KB → 16MB（8 种大小）
+- **迭代次数**: 大消息 100 次，小消息 1000 次
+- **AI Core 数**: 32（并行发送）
 
 ## 编译
 
@@ -22,37 +53,106 @@ bash scripts/build.sh -examples
 ```bash
 cd examples/comm_test
 
-# 使用 NPU 0 和 1 测试 MTE
-bash run.sh 0,1
+# 使用 NPU 0 和 NPU 1 测试
+bash run.sh 0 1
 
-# 使用 NPU 4 和 5 测试 SDMA
-bash run.sh 4,5 -e sdma_inter
-
-# 测试两种引擎对比
-bash run.sh 0,1 -all
-
-# 直接运行二进制（需要两个进程同时运行）
-./build/bin/comm_test --pe-id 0 -D 0 &
-./build/bin/comm_test --pe-id 1 -D 1 &
-wait
+# 使用 NPU 4 和 NPU 5 测试
+bash run.sh 4 5
 ```
 
-## 参数
+## 输出示例
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `0,1` | NPU ID列表 | 0,1 |
-| `-e mte_inter` | MTE引擎 | 默认 |
-| `-e sdma_inter` | SDMA引擎 | - |
-| `-all` | 测试两种引擎 | - |
-| `-m put/get` | 测试模式 | put |
-| `-dtype float/int32/int64` | 数据类型 | float |
+```
+[P2P] device 0 -> 1: can_access=1, EnablePeerAccess=0
+[verify][MTE] PASS — PE1.gva == 0xAA (数据传输成功)
 
-## 输出
+=== MTE (aclshmemx_mte_put_nbi) ===
+MsgSize(B)    Iters         Time/iter(us)     BW(GB/s)
+------------------------------------------------------------
+4096          1000          12.34             0.33
+16384         1000          45.67             0.36
+...
+16384         100           15234.56          1.07
 
-结果保存在 `output/` 目录：
+[verify][SDMA] PASS — PE1.gva == 0xAA (数据传输成功)
 
-- `MTE_INTER_put_float.csv`
-- `SDMA_INTER_put_float.csv`
+=== SDMA (aclshmemx_sdma_put_nbi) ===
+MsgSize(B)    Iters         Time/iter(us)     BW(GB/s)
+------------------------------------------------------------
+4096          1000          8.56              0.48
+...
 
-CSV内容：消息大小、带宽(GB/s)、延迟(μs)、总时间、迭代次数
+[DONE]
+```
+
+## 代码结构
+
+### comm_test_kernel.cpp - Device Kernel
+
+```
+mte_bw_kernel():
+  1. Rank 0 发送，Rank 1 等待
+  2. 从 device_state 获取 UB 配置
+  3. 每个 Core 处理 msg_size/block_dim 的数据切片
+  4. 循环调用 aclshmemx_mte_put_nbi
+  5. SetFlag/WaitFlag 等待 DMA 完成
+  6. barrier_all_vec 结束
+
+sdma_bw_kernel():
+  1. Rank 0 发送，Rank 1 等待
+  2. 每个 Core 处理数据切片
+  3. 循环调用 aclshmemx_sdma_put_nbi
+  4. sdma_quiet 等待 DMA 完成
+  5. barrier_all_vec 结束
+```
+
+### main.cpp - Host 程序
+
+```
+main():
+  1. 解析参数：pe_id, device_id, ipport
+  2. ACL 初始化
+  3. 启用 P2P 访问
+  4. SHMEM 初始化
+  5. 分配对称内存
+  6. verify(): 数据正确性验证
+  7. sweep(): 扫描不同消息大小，测试带宽
+  8. 输出结果
+```
+
+## 关键 API
+
+### MTE API
+
+```cpp
+aclshmemx_mte_put_nbi(dst_gm, src_gm, ub_buf, ub_size, count, peer_pe, event_id)
+```
+- `dst_gm`: 目标地址（对端 NPU 的 GM）
+- `src_gm`: 源地址（本 NPU 的 GM）
+- `ub_buf`: UB 缓冲区地址（数据中转站）
+- `ub_size`: UB 大小（通常 16KB）
+- `count`: 传输字节数
+- `peer_pe`: 目标 PE 编号
+- `event_id`: 同步事件 ID
+
+### SDMA API
+
+```cpp
+aclshmemx_sdma_put_nbi(dst_gm, src_gm, ub_buf, ub_size, count, peer_pe, event_id)
+aclshmemx_sdma_quiet(ub_buf, ub_size, event_id)
+```
+
+### 对称内存 API
+
+```cpp
+aclshmem_malloc(size)   // 分配对称内存
+aclshmem_free(ptr)      // 释放对称内存
+aclshmem_barrier_all()  // 全局屏障同步
+```
+
+## 注意事项
+
+1. **两个进程必须同时启动**：run.sh 会并行启动两个进程
+2. **IP 地址必须相同**：两个进程使用相同的 ipport 进行通信
+3. **P2P 访问**：测试前会检查并启用 NPU 之间的 P2P 访问
+4. **计时方式**：使用 Host 端 chrono 计时，避免 Device profiling 的 overflow 问题
