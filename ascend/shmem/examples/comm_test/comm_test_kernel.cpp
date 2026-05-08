@@ -62,30 +62,26 @@ void sdma_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations, int64_t b
     }
 
     constexpr uint32_t UB_OFFSET  = 1024;
-    constexpr uint32_t SDMA_UB_SZ = 256 * 1024;
+    constexpr uint32_t SDMA_UB_SZ = 16 * 1024;   // 16KB, matches original comm_test default
     __ubuf__ uint8_t *tmp = reinterpret_cast<__ubuf__ uint8_t *>(UB_OFFSET);
 
-    int64_t comm_dim = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
-    int64_t base     = msg_size / comm_dim;
-    int64_t extra    = msg_size % comm_dim;
-    int64_t my_bytes = base + (core_idx < extra ? 1 : 0);
-    int64_t my_off   = core_idx < extra
-                           ? core_idx * (base + 1)
-                           : extra * (base + 1) + (core_idx - extra) * base;
+    // divide by block_dim only (same as MTE), so each core gets a reasonable slice
+    int64_t slice  = msg_size / block_dim;
+    int64_t offset = core_idx * slice;
 
-    if (my_bytes == 0) {
+    if (slice == 0) {
         aclshmemx_barrier_all_vec();
         return;
     }
 
-    __gm__ uint8_t *src = (__gm__ uint8_t *)gva + my_off;
-    __gm__ uint8_t *dst = (__gm__ uint8_t *)gva + my_off;
+    __gm__ uint8_t *src = (__gm__ uint8_t *)gva + offset;
+    __gm__ uint8_t *dst = (__gm__ uint8_t *)gva + offset;
 
     AscendC::PipeBarrier<PIPE_ALL>();
 
     for (int64_t i = 0; i < iterations; i++) {
         aclshmemx_sdma_put_nbi(dst, src, tmp, SDMA_UB_SZ,
-                               (uint64_t)my_bytes, (int32_t)peer, EVENT_ID0);
+                               (uint64_t)slice, (int32_t)peer, EVENT_ID0);
     }
     aclshmemx_sdma_quiet(tmp, SDMA_UB_SZ, EVENT_ID0);
 
