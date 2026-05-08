@@ -1,12 +1,9 @@
 #!/bin/bash
 # MTE vs SDMA cross-card bandwidth benchmark
 # Usage: ./run.sh <npu0> <npu1>   OR   ./run.sh <npu0>,<npu1>
-# Example: ./run.sh 6 7
-#          ./run.sh 6,7
 
 set -e
 
-# parse both "6,7" and "6 7" formats
 if [[ "$1" == *","* ]]; then
     NPU0=$(echo "$1" | cut -d',' -f1)
     NPU1=$(echo "$1" | cut -d',' -f2)
@@ -15,8 +12,7 @@ else
     NPU1=${2:-1}
 fi
 
-MTE_PORT="tcp://127.0.0.1:8899"
-SDMA_PORT="tcp://127.0.0.1:8900"
+PORT="tcp://127.0.0.1:8899"
 BIN="../../build/bin/comm_test"
 
 if [ ! -f "$BIN" ]; then
@@ -24,14 +20,11 @@ if [ ! -f "$BIN" ]; then
     exit 1
 fi
 
+pkill -f "comm_test" 2>/dev/null || true
+sleep 1
+
 echo "Testing NPU ${NPU0} <-> NPU ${NPU1}"
 
-echo "[1/2] Running MTE..."
-$BIN 2 0 $MTE_PORT $NPU0 mte &
-$BIN 2 1 $MTE_PORT $NPU1 mte &
-wait
-
-echo "[2/2] Running SDMA..."
-$BIN 2 0 $SDMA_PORT $NPU0 sdma &
-$BIN 2 1 $SDMA_PORT $NPU1 sdma &
+$BIN 2 0 $PORT $NPU0 &
+$BIN 2 1 $PORT $NPU1 &
 wait

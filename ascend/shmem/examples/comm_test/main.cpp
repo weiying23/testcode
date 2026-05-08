@@ -1,7 +1,9 @@
 /**
  * MTE vs SDMA cross-card bandwidth benchmark.
- * Args:  <n_pes> <pe_id> <ipport> <device_id> <engine: mte|sdma>
- * One process runs one engine only. run.sh launches them in two separate batches.
+ * Both engines use MTE shmem init (MTE engine works over HCCS).
+ * The difference is in the kernel: mte_bw_kernel uses aclshmemx_mte_put_nbi,
+ * sdma_bw_kernel uses aclshmemx_sdma_put_nbi. Both run in one shmem session.
+ * Args:  <n_pes> <pe_id> <ipport> <device_id>
  * Only Rank 0 prints results.
  */
 
@@ -19,7 +21,7 @@ extern "C" void launch_sdma_bw(uint32_t, void *, uint8_t *, int64_t, int64_t);
 
 static aclshmemx_uniqueid_t g_uid;
 
-static void shmem_init(int pe, int n_pes, const char *ipport, bool use_sdma)
+static bool shmem_init(int pe, int n_pes, const char *ipport)
 {
     aclshmemx_init_attr_t attr;
     int ver = (1 << 16) + sizeof(aclshmemx_init_attr_t);
@@ -31,8 +33,9 @@ static void shmem_init(int pe, int n_pes, const char *ipport, bool use_sdma)
     attr.my_pe          = pe;
     attr.n_pes          = n_pes;
     attr.local_mem_size = 512UL * 1024 * 1024;
-    attr.option_attr    = {ver,
-                           use_sdma ? ACLSHMEM_DATA_OP_SDMA : ACLSHMEM_DATA_OP_MTE,
+    // Always use MTE engine: SDMA_DATA_OP_SDMA requires a separate SIO link,
+    // MTE engine works over HCCS which is what both kernels actually use.
+    attr.option_attr    = {ver, ACLSHMEM_DATA_OP_MTE,
                            DEFAULT_TIMEOUT, DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
     g_uid.my_pe    = pe;
     g_uid.n_pes    = n_pes;
@@ -40,8 +43,11 @@ static void shmem_init(int pe, int n_pes, const char *ipport, bool use_sdma)
 
     aclshmemx_set_conf_store_tls(false, nullptr, 0);
     int ret = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr);
-    if (ret != ACLSHMEM_SUCCESS)
+    if (ret != ACLSHMEM_SUCCESS) {
         std::cerr << "[PE " << pe << "] shmem_init failed: " << ret << "\n";
+        return false;
+    }
+    return true;
 }
 
 static std::vector<size_t> msg_sizes()
@@ -59,7 +65,7 @@ static int get_iters(size_t sz)
 
 static void print_header(const char *engine)
 {
-    std::cout << "\n=== " << engine << " Engine ===\n";
+    std::cout << "\n=== " << engine << " ===\n";
     std::cout << std::left
               << std::setw(14) << "MsgSize(B)"
               << std::setw(14) << "Iters"
@@ -79,21 +85,9 @@ static void print_row(size_t msg_size, int iters, double time_us, double bw)
     std::cout.flush();
 }
 
-static void run_engine(const char *name, bool use_sdma,
-                       int pe, int n_pes, const char *ipport,
-                       void *stream, uint32_t block_dim)
+static void sweep(const char *name, bool use_sdma,
+                  int pe, uint8_t *gva, void *stream, uint32_t block_dim)
 {
-    shmem_init(pe, n_pes, ipport, use_sdma);
-
-    uint8_t *gva = (uint8_t *)aclshmem_malloc(16UL << 20);
-    if (!gva) {
-        std::cerr << "[PE " << pe << "] aclshmem_malloc failed\n";
-        aclshmem_finalize();
-        return;
-    }
-
-    aclshmem_barrier_all();
-
     if (pe == 0) print_header(name);
 
     for (size_t msg_size : msg_sizes()) {
@@ -103,19 +97,18 @@ static void run_engine(const char *name, bool use_sdma,
         size_t aligned = (msg_size / block_dim) * block_dim;
         if (aligned == 0) aligned = block_dim;
 
-        // warmup
-        if (use_sdma)
-            launch_sdma_bw(block_dim, stream, gva, (int64_t)aligned, warmup_iters);
-        else
-            launch_mte_bw(block_dim, stream, gva, (int64_t)aligned, warmup_iters);
+        auto launch = [&](int64_t n) {
+            if (use_sdma)
+                launch_sdma_bw(block_dim, stream, gva, (int64_t)aligned, n);
+            else
+                launch_mte_bw(block_dim, stream, gva, (int64_t)aligned, n);
+        };
+
+        launch(warmup_iters);
         aclrtSynchronizeStream(stream);
 
-        // timed run
         auto t0 = std::chrono::high_resolution_clock::now();
-        if (use_sdma)
-            launch_sdma_bw(block_dim, stream, gva, (int64_t)aligned, iters);
-        else
-            launch_mte_bw(block_dim, stream, gva, (int64_t)aligned, iters);
+        launch(iters);
         aclrtSynchronizeStream(stream);
         auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -126,17 +119,14 @@ static void run_engine(const char *name, bool use_sdma,
             print_row(aligned, iters, time_per_iter, bw);
         }
     }
-
     aclshmem_barrier_all();
-    aclshmem_free(gva);
-    aclshmem_finalize();
 }
 
 int main(int argc, char *argv[])
 {
-    if (argc < 6) {
+    if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <n_pes> <pe_id> <ipport> <device_id> <mte|sdma>\n";
+                  << " <n_pes> <pe_id> <ipport> <device_id>\n";
         return 1;
     }
 
@@ -144,7 +134,7 @@ int main(int argc, char *argv[])
     int         pe        = std::atoi(argv[2]);
     const char *ipport    = argv[3];
     int         device_id = std::atoi(argv[4]);
-    bool        use_sdma  = (strcmp(argv[5], "sdma") == 0);
+    uint32_t    block_dim = 32;
 
     aclInit(nullptr);
     aclrtSetDevice(device_id);
@@ -152,9 +142,31 @@ int main(int argc, char *argv[])
     void *stream = nullptr;
     aclrtCreateStream(&stream);
 
-    run_engine(use_sdma ? "SDMA" : "MTE", use_sdma,
-               pe, n_pes, ipport, stream, 32);
+    if (!shmem_init(pe, n_pes, ipport)) {
+        aclrtDestroyStream(stream);
+        aclrtResetDevice(device_id);
+        aclFinalize();
+        return 1;
+    }
 
+    uint8_t *gva = (uint8_t *)aclshmem_malloc(16UL << 20);
+    if (!gva) {
+        std::cerr << "[PE " << pe << "] aclshmem_malloc failed\n";
+        aclshmem_finalize();
+        aclrtDestroyStream(stream);
+        aclrtResetDevice(device_id);
+        aclFinalize();
+        return 1;
+    }
+
+    aclshmem_barrier_all();
+
+    // run both engines back-to-back in the same shmem session
+    sweep("MTE  (aclshmemx_mte_put_nbi)",  false, pe, gva, stream, block_dim);
+    sweep("SDMA (aclshmemx_sdma_put_nbi)", true,  pe, gva, stream, block_dim);
+
+    aclshmem_free(gva);
+    aclshmem_finalize();
     aclrtDestroyStream(stream);
     aclrtResetDevice(device_id);
     aclFinalize();
