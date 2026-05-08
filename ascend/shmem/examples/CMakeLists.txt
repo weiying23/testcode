@@ -167,6 +167,7 @@ foreach(EXAMPLE
     notifywait
     cmo
     mte_perftest
+    comm_test
     udma_demo
     udma_atomic_add
     comm_benchmark
