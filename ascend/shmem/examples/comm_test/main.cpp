@@ -239,11 +239,6 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
 
     // ========== 测试循环 ==========
     int peer_pe = (pe_id + 1) % n_pes;
-    int prof_pe = 0;  // 性能采集PE
-
-    // 对于卡内测试（MTE_INTRA），peer_pe应该是自己（同一NPU内的不同内存区域）
-    // 注意：当前SHMEM架构下，真正的"卡内"需要特殊处理
-    // 这里我们通过设置不同的通信目标来模拟
 
     std::vector<size_t> msg_sizes = get_msg_sizes();
 
@@ -298,19 +293,18 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
         // 收集性能数据
         aclshmemx_show_prof(&out_profs, false);
 
-        if (pe_id == prof_pe && out_profs != nullptr) {
+        if (out_profs != nullptr) {
             PerfResult result = parse_perf_result(out_profs, msg_size,
                                                   config.block_size, iterations, config.g_npus);
             results.push_back(result);
 
-            // 直接打印到屏幕
             std::cout << "MsgSize: " << msg_size << " B"
-                      << ", Bandwidth: " << result.bandwidth_gbs << " GB/s"
-                      << ", Latency: " << result.latency_us << " us"
+                      << ", BW: " << result.bandwidth_gbs << " GB/s"
+                      << ", Lat: " << result.latency_us << " us"
                       << std::endl;
         }
 
-        aclshmemx_show_prof(nullptr, true);  // 清空
+        aclshmemx_show_prof(nullptr, true);
 
         aclshmem_free(dst_ptr);
         aclshmem_free(src_ptr);

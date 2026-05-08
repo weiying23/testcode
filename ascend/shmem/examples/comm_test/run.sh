@@ -78,7 +78,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ========== 环境检查 ==========
-if [ ! -f "./build/bin/comm_test" ]; then
+if [ ! -f "../../build/bin/comm_test" ]; then
     echo "Error: Binary not found. Please compile first."
     echo "Run: bash scripts/build.sh -examples"
     exit 1
@@ -95,30 +95,30 @@ echo "=========================================="
 
 if [ "$ENGINE" == "all" ]; then
     echo "===== MTE Inter-Card ====="
-    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
         -D ${NPU0} --engine mte_inter -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
         -D ${NPU1} --engine mte_inter -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
 
     echo "===== SDMA Inter-Card ====="
-    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
         -D ${NPU0} --engine sdma_inter -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
         -D ${NPU1} --engine sdma_inter -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
 else
-    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
         -D ${NPU0} --engine ${ENGINE} -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+    ../../build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
         -D ${NPU1} --engine ${ENGINE} -m ${MODE} -dtype ${DTYPE} \
         -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
