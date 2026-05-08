@@ -127,6 +127,7 @@ struct TestConfig {
     int n_pes;
     int g_npus;
     int f_npu;
+    int device_id;          // 直接指定NPU ID，-1表示自动计算
     EngineType engine;
     TestMode mode;
     DataType dtype;

@@ -9,4 +9,4 @@
 # -----------------------------------------------------------------------------------------------------------
 
 # comm_test示例使用fusion_example模式
-aclshmem_add_fusion_example(comm_test main.cpp engine_benchmark_kernel.cpp)
+aclshmem_add_fusion_example(comm_test main.cpp comm_test_kernel.cpp)

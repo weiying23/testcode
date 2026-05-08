@@ -32,6 +32,7 @@ int g_npus = 8;
 const char *ipport = "tcp://127.0.0.1:8898";
 int f_pe = 0;
 int f_npu = 0;
+int device_id_override = -1;  // 直接指定device ID，-1表示使用自动计算
 aclshmemx_uniqueid_t default_flag_uid;
 
 // ========== 外部Kernel启动函数 ==========
@@ -183,7 +184,14 @@ int run_engine_benchmark(TestConfig config, std::vector<PerfResult>& results)
 {
     int pe_id = config.pe_id;
     int n_pes = config.n_pes;
-    int device_id = pe_id % config.g_npus + config.f_npu;
+    int device_id;
+    if (config.device_id >= 0) {
+        // 直接使用指定的device ID
+        device_id = config.device_id;
+    } else {
+        // 自动计算（原来的方式）
+        device_id = pe_id % config.g_npus + config.f_npu;
+    }
 
     int status = 0;
     aclrtStream stream = nullptr;
@@ -317,6 +325,7 @@ int main(int argc, char *argv[])
     config.n_pes = 2;
     config.g_npus = 2;
     config.f_npu = 0;
+    config.device_id = -1;  // 默认自动计算
     config.engine = EngineType::MTE_INTER_CARD;
     config.mode = TestMode::PUT;
     config.dtype = DataType::FLOAT;
@@ -330,6 +339,7 @@ int main(int argc, char *argv[])
     static struct option long_options[] = {
         {"pes", required_argument, 0, 0},
         {"pe-id", required_argument, 0, 0},
+        {"device", required_argument, 0, 'D'},  // 直接指定NPU ID
         {"ipport", required_argument, 0, 0},
         {"gnpus", required_argument, 0, 0},
         {"fnpu", required_argument, 0, 0},
@@ -344,8 +354,11 @@ int main(int argc, char *argv[])
 
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "e:m:d:b:a", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "e:m:d:b:aD:", long_options, &option_index)) != -1) {
         switch (opt) {
+            case 'D':
+                config.device_id = std::atoi(optarg);
+                break;
             case 'e':
                 config.engine = parse_engine_type(optarg);
                 if (strcmp(optarg, "all") == 0) test_all_engines = true;
@@ -383,9 +396,17 @@ int main(int argc, char *argv[])
         }
     }
 
+    // 计算实际使用的device_id
+    int actual_device_id;
+    if (config.device_id >= 0) {
+        actual_device_id = config.device_id;
+    } else {
+        actual_device_id = config.pe_id % config.g_npus + config.f_npu;
+    }
+
     std::cout << "========== Engine Benchmark Configuration ==========" << std::endl;
     std::cout << "PE: " << config.pe_id << " / " << config.n_pes << std::endl;
-    std::cout << "NPUs: " << config.g_npus << ", first_npu: " << config.f_npu << std::endl;
+    std::cout << "NPU Device: " << actual_device_id << std::endl;
     std::cout << "Engine: " << engine_name(config.engine) << std::endl;
     std::cout << "Mode: " << mode_name(config.mode) << std::endl;
     std::cout << "DataType: " << type_name(config.dtype) << std::endl;

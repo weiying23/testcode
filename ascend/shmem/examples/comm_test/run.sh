@@ -1,13 +1,13 @@
 #!/bin/bash
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
 # Engine Benchmark运行脚本
+# 使用方式: bash run.sh <npu_ids> [options]
+#   bash run.sh 0,1 -e mte_inter
+#   bash run.sh 4,5 -e sdma_inter -m put
 
 set -e
 
 # ========== 默认参数 ==========
-PES=2
-GNPUS=2
-FNPU=0
+NPU_IDS="0,1"
 IPPORT="tcp://127.0.0.1:8898"
 ENGINE="mte_inter"
 MODE="put"
@@ -15,21 +15,19 @@ DTYPE="float"
 BLOCK_SIZE=32
 UB_SIZE=16
 
-# ========== 解析参数 ==========
+# ========== 解析第一个参数（NPU ID列表）==========
+if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    NPU_IDS="$1"
+    shift
+fi
+
+# 解析 NPU ID
+NPU0=$(echo $NPU_IDS | cut -d',' -f1)
+NPU1=$(echo $NPU_IDS | cut -d',' -f2)
+
+# ========== 解析其他参数 ==========
 while [[ $# -gt 0 ]]; do
     case $1 in
-        -pes|--pes)
-            PES="$2"
-            shift 2
-            ;;
-        -gnpus|--gnpus)
-            GNPUS="$2"
-            shift 2
-            ;;
-        -fnpu|--fnpu)
-            FNPU="$2"
-            shift 2
-            ;;
         -ipport|--ipport)
             IPPORT="$2"
             shift 2
@@ -42,7 +40,7 @@ while [[ $# -gt 0 ]]; do
             MODE="$2"
             shift 2
             ;;
-        -d|--dtype)
+        -dtype|--dtype)
             DTYPE="$2"
             shift 2
             ;;
@@ -59,19 +57,17 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: bash run.sh [options]"
+            echo "Usage: bash run.sh <npu_ids> [options]"
+            echo "  npu_ids: NPU ID列表，如 0,1 或 4,5 (default: 0,1)"
+            echo ""
             echo "Options:"
-            echo "  -pes, --pes <num>       Number of PEs (default: 2)"
-            echo "  -gnpus, --gnpus <num>   Number of NPUs (default: 2)"
-            echo "  -fnpu, --fnpu <num>     First NPU ID (default: 0)"
-            echo "  -ipport, --ipport <ip>  IP and port (default: tcp://127.0.0.1:8898)"
-            echo "  -e, --engine <type>     Engine type: mte_intra|mte_inter|sdma_inter|all (default: mte_inter)"
-            echo "  -m, --mode <mode>       Test mode: put|get|bi_put|bi_get (default: put)"
-            echo "  -d, --dtype <type>      Data type: float|int32|int64 (default: float)"
-            echo "  -b, --block-size <num>  Block size (default: 32)"
-            echo "  --ub-size <num>         UB size in KB (default: 16)"
-            echo "  -all, --all             Test all engines"
-            echo "  -h, --help              Show this help"
+            echo "  -ipport <ip>      IP and port (default: tcp://127.0.0.1:8898)"
+            echo "  -e <type>         Engine: mte_inter|sdma_inter|all (default: mte_inter)"
+            echo "  -m <mode>         Mode: put|get (default: put)"
+            echo "  -dtype <type>     Data type: float|int32|int64 (default: float)"
+            echo "  -b <num>          Block size (default: 32)"
+            echo "  --ub-size <num>   UB size KB (default: 16)"
+            echo "  -all              Test all engines"
             exit 0
             ;;
         *)
@@ -82,101 +78,53 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ========== 环境检查 ==========
-if [ ! -f "./build/bin/engine_benchmark" ]; then
+if [ ! -f "./build/bin/comm_test" ]; then
     echo "Error: Binary not found. Please compile first."
     echo "Run: bash scripts/build.sh -examples"
     exit 1
 fi
 
-# ========== 创建输出目录 ==========
 mkdir -p output
-
-# ========== 设置环境变量 ==========
 export LD_LIBRARY_PATH=${PROJECT_ROOT}/build/lib:$LD_LIBRARY_PATH
 export SHMEM_UID_SESSION_ID=${IPPORT#tcp://}
 
-# ========== 运行测试 ==========
 echo "=========================================="
-echo "Starting Engine Benchmark"
-echo "=========================================="
-echo "PES: ${PES}"
-echo "GNPUS: ${GNPUS}"
-echo "FNPU: ${FNPU}"
-echo "IPPORT: ${IPPORT}"
-echo "ENGINE: ${ENGINE}"
-echo "MODE: ${MODE}"
-echo "DTYPE: ${DTYPE}"
-echo "BLOCK_SIZE: ${BLOCK_SIZE}"
-echo "UB_SIZE: ${UB_SIZE}"
+echo "NPU: ${NPU0}, ${NPU1}"
+echo "Engine: ${ENGINE}, Mode: ${MODE}"
 echo "=========================================="
 
-# 根据引擎类型选择测试模式
 if [ "$ENGINE" == "all" ]; then
-    # 测试所有引擎
-    echo "Testing all engines..."
+    echo "===== MTE Inter-Card ====="
+    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU0} --engine mte_inter -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    # MTE Inter-Card
-    echo ""
-    echo "===== Testing MTE Inter-Card ====="
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 0 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine mte_inter --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
-
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 1 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine mte_inter --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
-
+    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU1} --engine mte_inter -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
-    echo "MTE Inter-Card test completed"
 
-    # SDMA Inter-Card
-    echo ""
-    echo "===== Testing SDMA Inter-Card ====="
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 0 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine sdma_inter --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
+    echo "===== SDMA Inter-Card ====="
+    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU0} --engine sdma_inter -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 1 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine sdma_inter --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
-
+    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU1} --engine sdma_inter -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
-    echo "SDMA Inter-Card test completed"
-
 else
-    # 单引擎测试
-    echo ""
-    echo "===== Testing ${ENGINE} ====="
+    ./build/bin/comm_test --pe-id 0 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU0} --engine ${ENGINE} -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
 
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 0 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine ${ENGINE} --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
-
-    ./build/bin/engine_benchmark \
-        --pes ${PES} --pe-id 1 --ipport ${IPPORT} \
-        --gnpus ${GNPUS} --fnpu ${FNPU} \
-        --engine ${ENGINE} --mode ${MODE} --dtype ${DTYPE} \
-        --block-size ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
-
+    ./build/bin/comm_test --pe-id 1 --pes 2 --ipport ${IPPORT} \
+        -D ${NPU1} --engine ${ENGINE} -m ${MODE} -dtype ${DTYPE} \
+        -b ${BLOCK_SIZE} --ub-size ${UB_SIZE} &
     wait
-    echo "${ENGINE} test completed"
 fi
 
 echo ""
-echo "=========================================="
-echo "Benchmark Results Summary"
-echo "=========================================="
-echo "Results saved to: output/"
-ls -la output/*.csv 2>/dev/null || echo "No CSV files generated"
-echo ""
-echo "[SUCCESS] Engine benchmark completed"
+echo "Results:"
+ls -la output/*.csv 2>/dev/null || echo "No CSV files"
+echo "[SUCCESS]"
