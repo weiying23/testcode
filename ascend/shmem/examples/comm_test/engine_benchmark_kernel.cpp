@@ -131,29 +131,31 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
     int64_t pe = aclshmem_my_pe();
     int64_t n_pes = aclshmem_n_pes();
 
-    __gm__ T *dst_gm = (__gm__ T *)dst_gva;
-    __gm__ T *src_gm = (__gm__ T *)src_gva;
+    // SDMA使用字节指针，统一模板参数为uint8_t
+    __gm__ uint8_t *dst_gm = (__gm__ uint8_t *)dst_gva;
+    __gm__ uint8_t *src_gm = (__gm__ uint8_t *)src_gva;
 
-    // SDMA数据分布
+    // SDMA数据分布（按字节计算）
     const auto cur_block_idx = AscendC::GetBlockIdx();
     const auto comm_block_dim = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
-    uint64_t base_per_core = elements / comm_block_dim;
-    uint64_t extra_size = elements % comm_block_dim;
+    uint64_t total_bytes = elements * sizeof(T);
+    uint64_t base_per_core = total_bytes / comm_block_dim;
+    uint64_t extra_bytes = total_bytes % comm_block_dim;
     uint64_t data_offset = 0;
 
-    if (cur_block_idx < extra_size) {
+    if (cur_block_idx < extra_bytes) {
         data_offset = cur_block_idx * (base_per_core + 1);
         base_per_core += 1;
     } else {
-        data_offset = extra_size * (base_per_core + 1) +
-                      (cur_block_idx - extra_size) * base_per_core;
+        data_offset = extra_bytes * (base_per_core + 1) +
+                      (cur_block_idx - extra_bytes) * base_per_core;
     }
 
     if (base_per_core == 0) {
         return;
     }
 
-    // SDMA需要的UB缓冲区
+    // SDMA需要的UB缓冲区（使用uint8_t字节指针）
     constexpr uint32_t ub_offset = 1024;
     __ubuf__ uint8_t *tmp_buff = reinterpret_cast<__ubuf__ uint8_t *>(ub_offset);
 
@@ -164,10 +166,10 @@ __aicore__ inline void sdma_bench_put_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
             SHMEMI_PROF_START(0);
         }
 
-        // SDMA Put: 直接发送数据到目标PE
+        // SDMA Put: 直接发送数据到目标PE（所有参数使用uint8_t类型）
         aclshmemx_sdma_put_nbi(dst_gm + data_offset, src_gm + data_offset,
                                tmp_buff, ub_size_kb * 1024,
-                               base_per_core * sizeof(T), peer_pe, EVENT_ID0);
+                               base_per_core, peer_pe, EVENT_ID0);
 
         if (i >= warmup) {
             SHMEMI_PROF_END(0);
@@ -189,21 +191,24 @@ __aicore__ inline void sdma_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
     int64_t pe = aclshmem_my_pe();
     int64_t n_pes = aclshmem_n_pes();
 
-    __gm__ T *dst_gm = (__gm__ T *)dst_gva;
-    __gm__ T *src_gm = (__gm__ T *)src_gva;
+    // SDMA使用字节指针，统一模板参数为uint8_t
+    __gm__ uint8_t *dst_gm = (__gm__ uint8_t *)dst_gva;
+    __gm__ uint8_t *src_gm = (__gm__ uint8_t *)src_gva;
 
+    // SDMA数据分布（按字节计算）
     const auto cur_block_idx = AscendC::GetBlockIdx();
     const auto comm_block_dim = AscendC::GetBlockNum() * AscendC::GetSubBlockNum();
-    uint64_t base_per_core = elements / comm_block_dim;
-    uint64_t extra_size = elements % comm_block_dim;
+    uint64_t total_bytes = elements * sizeof(T);
+    uint64_t base_per_core = total_bytes / comm_block_dim;
+    uint64_t extra_bytes = total_bytes % comm_block_dim;
     uint64_t data_offset = 0;
 
-    if (cur_block_idx < extra_size) {
+    if (cur_block_idx < extra_bytes) {
         data_offset = cur_block_idx * (base_per_core + 1);
         base_per_core += 1;
     } else {
-        data_offset = extra_size * (base_per_core + 1) +
-                      (cur_block_idx - extra_size) * base_per_core;
+        data_offset = extra_bytes * (base_per_core + 1) +
+                      (cur_block_idx - extra_bytes) * base_per_core;
     }
 
     if (base_per_core == 0) {
@@ -220,10 +225,10 @@ __aicore__ inline void sdma_bench_get_impl(GM_ADDR dst_gva, GM_ADDR src_gva,
             SHMEMI_PROF_START(0);
         }
 
-        // SDMA Get: 从目标PE拉取数据
+        // SDMA Get: 从目标PE拉取数据（所有参数使用uint8_t类型）
         aclshmemx_sdma_get_nbi(dst_gm + data_offset, src_gm + data_offset,
                                tmp_buff, ub_size_kb * 1024,
-                               base_per_core * sizeof(T), peer_pe, EVENT_ID0);
+                               base_per_core, peer_pe, EVENT_ID0);
 
         if (i >= warmup) {
             SHMEMI_PROF_END(0);
