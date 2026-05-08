@@ -1,18 +1,16 @@
 /**
  * MTE vs SDMA cross-card bandwidth benchmark kernels.
- * Timing: GetSystemCycle() directly in kernel, result written to result_buf.
- * Rank 0 does all the puts and timing; Rank 1 waits barrier.
+ * Kernel only does the puts + completion sync.
+ * All timing is done host-side with chrono.
  */
 
 #include "kernel_operator.h"
 #include "shmem.h"
 
 // ===== MTE Bandwidth Kernel =====
-// Rank 0: times (iterations) mte_put_nbi calls, writes elapsed cycles to result_buf[0].
-// Rank 1: waits barrier and returns.
+// All cores issue mte_put_nbi, core 0 waits for DMA completion, then barrier.
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__
-void mte_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
-                   int64_t block_dim, GM_ADDR result_buf)
+void mte_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations, int64_t block_dim)
 {
     int64_t rank     = aclshmem_my_pe();
     int64_t core_idx = AscendC::GetBlockIdx();
@@ -30,12 +28,10 @@ void mte_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
 
     int64_t slice  = msg_size / block_dim;
     int64_t offset = core_idx * slice;
-
     __gm__ uint8_t *src = (__gm__ uint8_t *)gva + offset;
     __gm__ uint8_t *dst = (__gm__ uint8_t *)gva + offset;
 
     AscendC::PipeBarrier<PIPE_ALL>();
-    int64_t start = AscendC::GetSystemCycle();
 
     for (int64_t i = 0; i < iterations; i++) {
         aclshmemx_mte_put_nbi(dst, src,
@@ -44,22 +40,17 @@ void mte_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
     }
 
     AscendC::SyncAll();
-
     if (core_idx == 0) {
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(ev);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(ev);
-        int64_t end = AscendC::GetSystemCycle();
-        *(__gm__ int64_t *)result_buf = end - start;
     }
 
     aclshmemx_barrier_all_vec();
 }
 
 // ===== SDMA Bandwidth Kernel =====
-// Same structure, but uses aclshmemx_sdma_put_nbi + sdma_quiet.
 extern "C" [[bisheng::core_ratio(0,1)]] __global__ __aicore__
-void sdma_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
-                    int64_t block_dim, GM_ADDR result_buf)
+void sdma_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations, int64_t block_dim)
 {
     int64_t rank     = aclshmem_my_pe();
     int64_t core_idx = AscendC::GetBlockIdx();
@@ -91,7 +82,6 @@ void sdma_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
     __gm__ uint8_t *dst = (__gm__ uint8_t *)gva + my_off;
 
     AscendC::PipeBarrier<PIPE_ALL>();
-    int64_t start = AscendC::GetSystemCycle();
 
     for (int64_t i = 0; i < iterations; i++) {
         aclshmemx_sdma_put_nbi(dst, src, tmp, SDMA_UB_SZ,
@@ -99,25 +89,18 @@ void sdma_bw_kernel(GM_ADDR gva, int64_t msg_size, int64_t iterations,
     }
     aclshmemx_sdma_quiet(tmp, SDMA_UB_SZ, EVENT_ID0);
 
-    AscendC::SyncAll();
-
-    if (core_idx == 0) {
-        int64_t end = AscendC::GetSystemCycle();
-        *(__gm__ int64_t *)result_buf = end - start;
-    }
-
     aclshmemx_barrier_all_vec();
 }
 
 // ===== Host-side launchers =====
 extern "C" void launch_mte_bw(uint32_t bdim, void *stream, uint8_t *gva,
-                               int64_t msg_size, int64_t iters, uint8_t *result_buf)
+                               int64_t msg_size, int64_t iters)
 {
-    mte_bw_kernel<<<bdim, nullptr, stream>>>(gva, msg_size, iters, (int64_t)bdim, result_buf);
+    mte_bw_kernel<<<bdim, nullptr, stream>>>(gva, msg_size, iters, (int64_t)bdim);
 }
 
 extern "C" void launch_sdma_bw(uint32_t bdim, void *stream, uint8_t *gva,
-                                int64_t msg_size, int64_t iters, uint8_t *result_buf)
+                                int64_t msg_size, int64_t iters)
 {
-    sdma_bw_kernel<<<bdim, nullptr, stream>>>(gva, msg_size, iters, (int64_t)bdim, result_buf);
+    sdma_bw_kernel<<<bdim, nullptr, stream>>>(gva, msg_size, iters, (int64_t)bdim);
 }
