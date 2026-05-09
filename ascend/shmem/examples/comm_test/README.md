@@ -16,7 +16,25 @@
 
 ## 测试方法
 
-### 带宽测试流程
+### 两轮独立测试
+
+```
+第一轮：MTE 测试
+  ┌─ shmem_init(ACLSHMEM_DATA_OP_MTE) ─┐  用 MTE 引擎初始化
+  ├─ aclshmem_malloc                   ├  分配对称内存
+  ├─ verify + sweep                    ├  MTE 带宽测试
+  ├─ aclshmem_free + finalize          ├  释放资源
+  └─────────────────────────────────────┘
+
+第二轮：SDMA 测试
+  ┌─ shmem_init(ACLSHMEM_DATA_OP_SDMA) ─┐  用 SDMA 引擎初始化
+  ├─ aclshmem_malloc                   ├  分配对称内存
+  ├─ verify + sweep                    ├  SDMA 带宽测试
+  ├─ aclshmem_free + finalize          ├  释放资源
+  └─────────────────────────────────────┘
+```
+
+### 单轮带宽测试流程
 
 ```
 Rank 0 (发送方)                      Rank 1 (接收方)
@@ -72,7 +90,6 @@ MsgSize(B)    Iters         Time/iter(us)     BW(GB/s)
 4096          1000          12.34             0.33
 16384         1000          45.67             0.36
 ...
-16384         100           15234.56          1.07
 
 [verify][SDMA] PASS — PE1.gva == 0xAA (数据传输成功)
 
@@ -101,7 +118,7 @@ mte_bw_kernel():
 sdma_bw_kernel():
   1. Rank 0 发送，Rank 1 等待
   2. 每个 Core 处理数据切片
-  3. 循环调用 aclshmemx_sdma_put_nbi
+  3. 循环调用 aclshmemx_sdma_put_nbi（UB 大小 64B）
   4. sdma_quiet 等待 DMA 完成
   5. barrier_all_vec 结束
 ```
@@ -111,16 +128,31 @@ sdma_bw_kernel():
 ```
 main():
   1. 解析参数：pe_id, device_id, ipport
-  2. ACL 初始化
-  3. 启用 P2P 访问
-  4. SHMEM 初始化
-  5. 分配对称内存
-  6. verify(): 数据正确性验证
-  7. sweep(): 扫描不同消息大小，测试带宽
-  8. 输出结果
+  2. ACL 初始化 + P2P 访问设置
+  
+  第一轮（MTE）:
+    3. shmem_init(engine_type=MTE)
+    4. 分配对称内存
+    5. verify() + sweep() 测试 MTE
+    6. 释放资源
+  
+  第二轮（SDMA）:
+    7. shmem_init(engine_type=SDMA)
+    8. 分配对称内存
+    9. verify() + sweep() 测试 SDMA
+    10. 释放资源
 ```
 
 ## 关键 API
+
+### 初始化引擎类型
+
+```cpp
+shmem_init(pe, n_pes, ipport, engine_type)
+  // engine_type:
+  //   ACLSHMEM_DATA_OP_MTE  - MTE 引擎
+  //   ACLSHMEM_DATA_OP_SDMA - SDMA 引擎
+```
 
 ### MTE API
 
@@ -130,7 +162,7 @@ aclshmemx_mte_put_nbi(dst_gm, src_gm, ub_buf, ub_size, count, peer_pe, event_id)
 - `dst_gm`: 目标地址（对端 NPU 的 GM）
 - `src_gm`: 源地址（本 NPU 的 GM）
 - `ub_buf`: UB 缓冲区地址（数据中转站）
-- `ub_size`: UB 大小（通常 16KB）
+- `ub_size`: UB 大小（从 device_state 获取，通常 16KB）
 - `count`: 传输字节数
 - `peer_pe`: 目标 PE 编号
 - `event_id`: 同步事件 ID
@@ -141,6 +173,7 @@ aclshmemx_mte_put_nbi(dst_gm, src_gm, ub_buf, ub_size, count, peer_pe, event_id)
 aclshmemx_sdma_put_nbi(dst_gm, src_gm, ub_buf, ub_size, count, peer_pe, event_id)
 aclshmemx_sdma_quiet(ub_buf, ub_size, event_id)
 ```
+- `ub_size`: 64B（仅用于状态管理，不用于数据中转）
 
 ### 对称内存 API
 
@@ -156,3 +189,4 @@ aclshmem_barrier_all()  // 全局屏障同步
 2. **IP 地址必须相同**：两个进程使用相同的 ipport 进行通信
 3. **P2P 访问**：测试前会检查并启用 NPU 之间的 P2P 访问
 4. **计时方式**：使用 Host 端 chrono 计时，避免 Device profiling 的 overflow 问题
+5. **两轮独立测试**：MTE 和 SDMA 分别初始化、测试、释放，确保测试环境独立
