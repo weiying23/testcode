@@ -62,8 +62,11 @@ static bool shmem_init(int pe, int n_pes, const char *ipport, int engine_type)
     attr.n_pes          = n_pes;
     attr.local_mem_size = 512UL * 1024 * 1024;
 
-    attr.option_attr    = {ver, engine_type,
-                           DEFAULT_TIMEOUT, DEFAULT_TIMEOUT, DEFAULT_TIMEOUT};
+    attr.option_attr.version = ver;
+    attr.option_attr.data_op_engine_type = (data_op_engine_type_t)engine_type;
+    attr.option_attr.shm_init_timeout = DEFAULT_TIMEOUT;
+    attr.option_attr.shm_create_timeout = DEFAULT_TIMEOUT;
+    attr.option_attr.control_operation_timeout = DEFAULT_TIMEOUT;
 
     g_uid.my_pe    = pe;
     g_uid.n_pes    = n_pes;
