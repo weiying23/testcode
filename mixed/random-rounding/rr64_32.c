@@ -57,9 +57,8 @@ void solve_pde_64bit_direct(double* u, int n, double alpha, double dx, double dt
             temp[i] = u[i] + factor * (u[i+1] - 2*u[i] + u[i-1]);
         }
         
-        double* swap = u;
-        u = temp;
-        temp = swap;
+        // 复制回 u，避免局部指针交换导致的结果丢失/释放
+        memcpy(u, temp, n * sizeof(double));
     }
     
     free(temp);
@@ -99,12 +98,8 @@ void solve_pde_64bit_to_32bit(RandomRoundSystem *sys, float* u, int n,
             - 2*random_round_value(sys, u[i]) + random_round_value(sys, u[i-1]));
         }
         
-        //double* swap = u;
-        //u = temp;
-        //temp = swap;
-        float* swap = u;
-        u = temp;
-        temp = swap;
+        // 复制回 u，避免局部指针交换导致的结果丢失/释放
+        memcpy(u, temp, n * sizeof(float));
     }
     
     free(temp);
@@ -176,7 +171,7 @@ void copy_array32(float* dest, double* src, int n) {
     }
 }
 
-void calculate_errors(double* ref, double* test, int n, 
+void calculate_errors(double* ref, float* test, int n, 
                      double* max_abs_error, double* avg_abs_error,
                      double* max_rel_error, double* avg_rel_error) {
     *max_abs_error = 0.0;
