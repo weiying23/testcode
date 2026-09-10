@@ -1,1 +1,44 @@
+# Node
 node_modules/
+
+# macOS
+.DS_Store
+._*
+.DS_Store/
+
+# C/C++ compiled objects & binaries
+*.o
+*.o.d
+*.so
+*.a
+*.dylib
+*.dSYM/
+
+# CMake build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+*.flag
+
+# Ninja build
+.ninja/
+.ninja_log
+.ninja_deps
+
+# Linker map / misc build outputs
+*.map
+*.bin
+*.backup
+*.bak
+
+# Python
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.vscode/
+.idea/
