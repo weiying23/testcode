@@ -1,6 +1,8 @@
 # testcode
 
-HPC 高性能计算研究与实验仓库，聚焦并行编程模型（MPI/OpenMP/pthreads）、数值线性代数求解器、ARM SIMD/SVE/SME（Apple Silicon）、昇腾 NPU 通信库、stencil 缓存分块优化、混合精度随机舍入、以及 Docker 跨容器 MPI 等方向的性能探索与基准测试。
+HPC 高性能计算研究与实验仓库，聚焦并行编程模型（MPI/OpenMP/pthreads）、数值线性代数求解器、ARM SIMD/SVE/SME（Apple Silicon）、stencil 缓存分块优化、以及混合精度随机舍入等方向的性能探索与基准测试。
+
+> 注：`ascend/`、`twin_docker/`、`XLSDFT/` 等目录为本地实验内容，刻意不纳入版本管理。
 
 ## 目录结构
 
@@ -38,18 +40,6 @@ HPC 高性能计算研究与实验仓库，聚焦并行编程模型（MPI/OpenMP
 | [`12order-scheme`](12order-scheme) | C | 3D 12 阶有限差分 stencil 性能优化（融合/分块/OpenMP，2.35x 加速） |
 | [`test_stencil_tiling`](test_stencil_tiling) | C | 5 阶 stencil 缓存分块实验与 cache 分析 |
 
-### 昇腾 NPU 生态
-
-| 目录 | 语言 | 用途 |
-| --- | --- | --- |
-| [`ascend`](ascend) | C/C++/Py | 昇腾 NPU 相关项目集合：hcomm/shmem 通信库、MatterSim/LAMMPS 分子模拟、MatRIS 训练 |
-
-### Docker 跨容器 MPI
-
-| 目录 | 语言 | 用途 |
-| --- | --- | --- |
-| [`twin_docker`](twin_docker) | C/Docker | 双 Docker 容器隔离网络运行 MPI，含 passwordless SSH 与数据校验 |
-
 ## 构建与运行
 
 原生 C/C++ 项目通用编译模式：
@@ -59,7 +49,7 @@ clang[-++] -O3 -mcpu=apple-m4 -pthread/-fopenmp ... -o <bin>
 mpirun -np <N> ./<bin>
 ```
 
-各子目录多提供 `run.sh` 一键编译运行脚本；`ascend/` 与 `testsme/` 下为 vendored CMake 项目，按各自子目录 README 构建。
+各子目录多提供 `run.sh` 一键编译运行脚本；`testsme/` 下为 vendored CMake 项目，按各自子目录 README 构建。
 
 ## 环境依赖
 
@@ -67,5 +57,3 @@ mpirun -np <N> ./<bin>
 - OpenMPI（`mpicc`/`mpirun`）
 - libomp（Homebrew：`brew install libomp`）
 - Apple Accelerate framework（LAPACK/BLAS）
-- Docker（仅 `twin_docker` 需要）
-- CANN / 昇腾 NPU 工具链（仅 `ascend/` 需要）

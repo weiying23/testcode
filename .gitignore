@@ -43,6 +43,11 @@ __pycache__/
 .vscode/
 .idea/
 
+# Projects intentionally kept local (not version-controlled)
+/ascend/
+/twin_docker/
+/XLSDFT/
+
 # Previously committed binaries (no standard extension, kept on disk)
 /12order-scheme/high-order-dissipation-dispersion-test/test
 /12order-scheme/optimized
