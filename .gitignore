@@ -47,6 +47,7 @@ __pycache__/
 /ascend/
 /twin_docker/
 /XLSDFT/
+/testsme/hellosme/libxsmm/
 
 # Previously committed binaries (no standard extension, kept on disk)
 /12order-scheme/high-order-dissipation-dispersion-test/test
