@@ -72,8 +72,8 @@ do_build() {
     echo "=== 编译 packing.o  (-O2, NEON only, no SVE) ==="
     $CXX -c -O2 $PACK_FLAGS packing.cpp -o packing.o
 
-    echo "=== 编译 matrix_multiply.o  (-O0, SME+SVE2) ==="
-    $CXX -c -O0 $SME_FLAGS matrix_multiply.cpp -o matrix_multiply.o
+    echo "=== 编译 matrix_multiply.o  (-O1, SME+SVE2) ==="
+    $CXX -c -O1 $SME_FLAGS matrix_multiply.cpp -o matrix_multiply.o
 
     echo "=== 编译 matrix.o  (-O0, SME+SVE2) ==="
     $CXX -c -O0 $SME_FLAGS matrix.cpp -o matrix.o

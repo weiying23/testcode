@@ -85,3 +85,5 @@ __pycache__/
 /mixed/random-rounding/bench_sr_cost
 /mixed/random-rounding/test32
 /mixed/random-rounding/test64_old
+/testsme/sme_demo/sme_matrix/single_bench
+/testsme/sme_demo/sme_matrix/sme_peak

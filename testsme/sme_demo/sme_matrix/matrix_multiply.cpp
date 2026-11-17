@@ -232,74 +232,96 @@ void sme_micro_kernel(double *mata, double *matb, double *matc,
              * 这样 A 的每一列只读一次，却驱动 6 次 fmopa（每次 64 FMA），
              * 总 FMA / A读取 = 6 × 64 = 384，远高于 naive 实现。
              */
+            const bool full_k = ((K & 7) == 0);
+            const bool full_m = ((M & 7) == 0);
+
+            if (full_k && full_m) {
+                uintptr_t A0 = (uintptr_t)(mata + (int64_t)(i + 0) * lda);
+                uintptr_t A1 = (uintptr_t)(mata + (int64_t)(i + 1) * lda);
+                uintptr_t A2 = (uintptr_t)(mata + (int64_t)(i + 2) * lda);
+                uintptr_t A3 = (uintptr_t)(mata + (int64_t)(i + 3) * lda);
+                uintptr_t A4 = (uintptr_t)(mata + (int64_t)(i + 4) * lda);
+                uintptr_t A5 = (uintptr_t)(mata + (int64_t)(i + 5) * lda);
+                uintptr_t A6 = (uintptr_t)(mata + (int64_t)(i + 6) * lda);
+                uintptr_t A7 = (uintptr_t)(mata + (int64_t)(i + 7) * lda);
+                uintptr_t Bp = (uintptr_t)(matb + j);
+                int64_t cnt = K / 8;
+                int64_t ldb_bytes = (int64_t)ldb * 8;
+                __asm__ volatile(
+                    "ptrue p2.d\n"
+                    "1:\n"
+                    ".macro A_LOAD T, R\n"
+                    "mov w12, #\\T\n"
+                    "ld1d za6h.d[w12, 0], p2/z, [\\R]\n"
+                    "add \\R, \\R, #64\n"
+                    ".endm\n"
+                    "A_LOAD 0, %[A0]\n"
+                    "A_LOAD 1, %[A1]\n"
+                    "A_LOAD 2, %[A2]\n"
+                    "A_LOAD 3, %[A3]\n"
+                    "A_LOAD 4, %[A4]\n"
+                    "A_LOAD 5, %[A5]\n"
+                    "A_LOAD 6, %[A6]\n"
+                    "A_LOAD 7, %[A7]\n"
+                    ".macro T_STEP T\n"
+                    "mov w12, #\\T\n"
+                    "mov z1.d, p1/m, za6v.d[w12, 0]\n"
+                    "ld1d {z2.d}, p0/z, [%[Bp]]\n"
+                    "fmopa za0.d, p1/m, p0/m, z1.d, z2.d\n"
+                    "ld1d {z2.d}, p3/z, [%[Bp], #1, MUL VL]\n"
+                    "fmopa za1.d, p1/m, p3/m, z1.d, z2.d\n"
+                    "ld1d {z2.d}, p4/z, [%[Bp], #2, MUL VL]\n"
+                    "fmopa za2.d, p1/m, p4/m, z1.d, z2.d\n"
+                    "ld1d {z2.d}, p5/z, [%[Bp], #3, MUL VL]\n"
+                    "fmopa za3.d, p1/m, p5/m, z1.d, z2.d\n"
+                    "ld1d {z2.d}, p6/z, [%[Bp], #4, MUL VL]\n"
+                    "fmopa za4.d, p1/m, p6/m, z1.d, z2.d\n"
+                    "ld1d {z2.d}, p7/z, [%[Bp], #5, MUL VL]\n"
+                    "fmopa za5.d, p1/m, p7/m, z1.d, z2.d\n"
+                    "add %[Bp], %[Bp], %[ldb_bytes]\n"
+                    ".endm\n"
+                    "T_STEP 0\n"
+                    "T_STEP 1\n"
+                    "T_STEP 2\n"
+                    "T_STEP 3\n"
+                    "T_STEP 4\n"
+                    "T_STEP 5\n"
+                    "T_STEP 6\n"
+                    "T_STEP 7\n"
+                    ".purgem A_LOAD\n"
+                    ".purgem T_STEP\n"
+                    "subs %[cnt], %[cnt], #1\n"
+                    "b.ne 1b\n"
+                    : [A0]"+r"(A0), [A1]"+r"(A1), [A2]"+r"(A2), [A3]"+r"(A3),
+                      [A4]"+r"(A4), [A5]"+r"(A5), [A6]"+r"(A6), [A7]"+r"(A7),
+                      [Bp]"+r"(Bp), [cnt]"+r"(cnt)
+                    : [ldb_bytes]"r"(ldb_bytes)
+                    : "w12", "z1", "z2", "p2", "cc", "memory");
+            } else {
             for (int k = 0; k < K; k += 8) {
 
-                /*
-                 * 生成 k 谓词 p2 = whilelt(k, K)。
-                 * 用于 A 加载（ld1d za6h … p2/z）：若 K 不是 8 的整数倍，
-                 * 最后一组不满 8 的 k-lane 被 p2 屏蔽，za6 中对应位置清零。
-                 */
                 sme_k_pred((uint64_t)k, (uint64_t)K);
 
-                /*
-                 * 阶段 2a：将 A[i:i+8, k:k+8] 按行存入 za6
-                 *
-                 * sme_load_a(t, addr) 等价于：
-                 *   ld1d za6h.d[t, 0], p2/z, [addr]
-                 * 把 A 的第 i+t 行、第 k 列起的 8 个 double 写入 za6 的第 t 行。
-                 *
-                 * 执行完后 za6 的布局：
-                 *   za6[t, :] = A_pack[(i+t)*Kc + k .. k+7]
-                 *
-                 * 注意：此时用的是 A_pack，lda = Kc = 256（紧密排列）。
-                 */
                 for (int t = 0; t < 8 && (i + t) < M; t++)
                     sme_load_a((uint32_t)t, mata + (int64_t)(i + t) * lda + k);
 
-                /*
-                 * 阶段 2b：外积累加热点 — 6 路 j-tile 并行 fmopa
-                 *
-                 * 对 k 方向的每一个"k-lane"（共最多 8 个）：
-                 *   1. sme_read_a_col(t)：把 za6 的第 t 列读入 z1
-                 *      即 z1 = A[:, k+t]，这是外积的左操作数（列向量）。
-                 *   2. 软件预取 B_pack 的第 (k+t+2) 行，掩盖 L1/L2 延迟。
-                 *   3. 依次对 6 个 B 列段各做一次 fmopa：
-                 *      za0 += outer(z1, B_pack[k+t, j+0..7])
-                 *      za1 += outer(z1, B_pack[k+t, j+8..15])
-                 *      ...
-                 *      za5 += outer(z1, B_pack[k+t, j+40..47])
-                 */
                 for (int t = 0; t < 8 && (k + t) < K; t++) {
-                    /* z1 ← za6 的第 t 列 = A 子块的第 t 个 k-lane */
                     sme_read_a_col((uint32_t)t);
 
                     const double *b_row = matb + (int64_t)(k + t) * ldb + j;
 
-                    /*
-                     * 软件预取 B_pack 下两行。
-                     * 当前在处理第 (k+t) 行，预取第 (k+t+2) 行。
-                     * B_pack 行间距 = ldb×8 = 768 B，2 行 = 1536 B，
-                     * 正好覆盖约 350 个时钟周期的 L2 miss 延迟窗口。
-                     */
                     if (k + t + 2 < K)
                         __builtin_prefetch(matb + (int64_t)(k + t + 2) * ldb + j, 0, 3);
 
-                    /* 6 次 fmopa，共用同一个 z1 */
-                    sme_load_fmopa0(b_row +  0);   /* za0 += outer(z1, B[k+t, j+0..7])  */
-                    sme_load_fmopa1(b_row +  8);   /* za1 += outer(z1, B[k+t, j+8..15]) */
-                    sme_load_fmopa2(b_row + 16);   /* za2 += outer(z1, B[k+t, j+16..23])*/
-                    sme_load_fmopa3(b_row + 24);   /* za3 += outer(z1, B[k+t, j+24..31])*/
-                    sme_load_fmopa4(b_row + 32);   /* za4 += outer(z1, B[k+t, j+32..39])*/
-                    sme_load_fmopa5(b_row + 40);   /* za5 += outer(z1, B[k+t, j+40..47])*/
+                    sme_load_fmopa0(b_row +  0);
+                    sme_load_fmopa1(b_row +  8);
+                    sme_load_fmopa2(b_row + 16);
+                    sme_load_fmopa3(b_row + 24);
+                    sme_load_fmopa4(b_row + 32);
+                    sme_load_fmopa5(b_row + 40);
                 }
-            } /* end k loop */
-
-            /*
-             * ── 阶段 3：将 za0–za5 中的累加结果写回 C ────────────────────
-             *
-             * 注意 ldc = N（原始矩阵行跨度），C 不需要连续布局。
-             * st1d 不带 /z，谓词只控制写哪些 lane，不产生"清零写"。
-             */
+            }
+            }
             for (int t = 0; t < 8 && (i + t) < M; t++) {
                 double *c_row = matc + (int64_t)(i + t) * ldc + j;
                 sme_store_c0((uint32_t)t, c_row +  0);
@@ -380,7 +402,7 @@ void sme_micro_kernel(double *mata, double *matb, double *matc,
 void gemmkernel(double *mata, double *matb, double *matc,
                 int M, int N, int K, double alpha)
 {
-    const int Mc = 64, Kc = 256, Nc = 96;
+    const int Mc = 128, Kc = 512, Nc = 192;
 
     /*
      * 计算线程数：取硬件并发线程数与 ic 块数的较小值。
@@ -422,66 +444,29 @@ void gemmkernel(double *mata, double *matb, double *matc,
         for (int kc = 0; kc < K; kc += Kc) {
             int kc_sz = std::min(Kc, K - kc);
 
-            /*
-             * block 循环：线程 tid 负责编号 = tid + n*num_threads 的所有 ic 块。
-             * 步长 num_threads × Mc 实现 round-robin 静态调度。
-             */
-            for (int block = tid; block < total_ic_blocks; block += num_threads) {
-                int ic = block * Mc;
-                int mc_sz = std::min(Mc, M - ic);
+            for (int jc = 0; jc < N; jc += Nc) {
+                int nc_sz = std::min(Nc, N - jc);
 
-                /*
-                 * 打包 A[ic:ic+mc_sz, kc:kc+kc_sz]。
-                 * A_pack 的行跨度固定为 Kc（而非原始 K），使 micro_kernel
-                 * 内部的 A 访问步长从 K×8（可达 64KB）压缩到 Kc×8 = 2 KB。
-                 *
-                 * A_pack 对本线程的所有 jc 复用，只打包一次。
-                 */
-                pack_a(A_pack,
-                       mata + (int64_t)ic * K + kc,
-                       mc_sz, kc_sz, K, Kc);
+                pack_b(B_pack,
+                       matb + (int64_t)kc * N + jc,
+                       kc_sz, nc_sz, N, Nc);
 
-                /*
-                 * 软件预取本线程下一个 ic 块的 A。
-                 * 当前正在 pack_a 和 jc 循环期间，下一个 ic 块的 A 数据
-                 * 可以提前拉进 L2，掩盖大步长（ic×K）的内存延迟。
-                 */
-                if (block + num_threads < total_ic_blocks) {
-                    int next_ic = (block + num_threads) * Mc;
-                    __builtin_prefetch(mata + (int64_t)next_ic * K + kc, 0, 1);
-                }
+                if (jc + Nc < N)
+                    __builtin_prefetch(matb + (int64_t)kc * N + (jc + Nc), 0, 1);
 
-                /* jc 循环：沿 N 方向分块，每次消费一个 B_pack */
-                for (int jc = 0; jc < N; jc += Nc) {
-                    int nc_sz = std::min(Nc, N - jc);
+                for (int block = tid; block < total_ic_blocks; block += num_threads) {
+                    int ic = block * Mc;
+                    int mc_sz = std::min(Mc, M - ic);
 
-                    /*
-                     * 打包 B[kc:kc+kc_sz, jc:jc+nc_sz]。
-                     * B_pack 的行跨度固定为 Nc = 96，micro_kernel 内 B 行间距
-                     * 从 N×8（可达 64 KB）压缩到 Nc×8 = 768 B，B_pack 整体
-                     * 仅 192 KB，驻留 L1/L2。
-                     *
-                     * 注：这里每个 ic 块都重复打包 B（因为 ic 在 jc 外），
-                     * 但 C 局部性更重要（若把 jc 提到外层，C 跨越整个 M，
-                     * 超出 L2，实测退化约 15%）。
-                     */
-                    pack_b(B_pack,
-                           matb + (int64_t)kc * N + jc,
-                           kc_sz, nc_sz, N, Nc);
+                    pack_a(A_pack,
+                           mata + (int64_t)ic * K + kc,
+                           mc_sz, kc_sz, K, Kc);
 
-                    /*
-                     * 软件预取下一个 jc 块的 B（在原始 B 矩阵中）。
-                     * pack_b 即将处理下一 jc 块；若那块数据还在 DRAM，
-                     * 提前发出请求可使延迟与当前 pack_b + micro_kernel 重叠。
-                     */
-                    if (jc + Nc < N)
-                        __builtin_prefetch(matb + (int64_t)kc * N + (jc + Nc), 0, 1);
+                    if (block + num_threads < total_ic_blocks) {
+                        int next_ic = (block + num_threads) * Mc;
+                        __builtin_prefetch(mata + (int64_t)next_ic * K + kc, 0, 1);
+                    }
 
-                    /*
-                     * 调用寄存器级内核，传入打包后的 A_pack/B_pack。
-                     * lda=Kc, ldb=Nc 是打包后的固定行跨度。
-                     * ldc=N 是原始 C 矩阵的行跨度（C 未打包）。
-                     */
                     sme_micro_kernel(
                         A_pack, B_pack,
                         matc + (int64_t)ic * N + jc,
@@ -491,8 +476,6 @@ void gemmkernel(double *mata, double *matb, double *matc,
                 }
             }
         }
-
-        /* 释放本线程的 pack 缓冲区 */
         free(A_pack);
         free(B_pack);
     };
