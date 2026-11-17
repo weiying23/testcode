@@ -79,3 +79,9 @@ __pycache__/
 /testsme/sme_demo/sme_matrix/benchmark
 /testsme/sme_demo/sme_matrix/sme_demo
 /testsme/sme_demo/sme_matrix/test
+
+# Local build outputs (never committed)
+/mixed/random-rounding/bench_fp16
+/mixed/random-rounding/bench_sr_cost
+/mixed/random-rounding/test32
+/mixed/random-rounding/test64_old
