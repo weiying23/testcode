@@ -42,3 +42,34 @@ __pycache__/
 # Editor / IDE
 .vscode/
 .idea/
+
+# Previously committed binaries (no standard extension, kept on disk)
+/12order-scheme/high-order-dissipation-dispersion-test/test
+/12order-scheme/optimized
+/12order-scheme/original
+/12order-scheme/split
+/graphschedule/testgraph
+/mixed/random-rounding/test64
+/multithread_simple_case/sme_sve_test
+/multithread_simple_case/testmpi
+/multithread_simple_case/testomp
+/multithread_simple_case/testpthread
+/solver/29-solver/29-omp-flush/test_lusgs
+/solver/LU-inverse/check_invertible
+/solver/LU-inverse/final_compare
+/solver/LU-inverse/final_compare_orig
+/solver/LU-inverse/invertible_perf
+/solver/gmres/test
+/solver/sstepgmres/sstep_gmres_dist
+/test_allocate_mem_compare/testalloc
+/test_allocate_mem_compare/threadalloc
+/test_stencil_tiling/test_tiling
+/test_thread_sync/testomp
+/test_thread_user_defined_barrier/testomp
+/testblas/testblas
+/testblas/testpthread
+/testsme/sme_demo/a.out
+/testsme/sme_demo/test
+/testsme/sme_demo/sme_matrix/benchmark
+/testsme/sme_demo/sme_matrix/sme_demo
+/testsme/sme_demo/sme_matrix/test
